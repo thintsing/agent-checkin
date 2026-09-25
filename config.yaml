@@ -1,0 +1,56 @@
+# ============================================================
+#  智能体每日签到 · 全局配置
+#  设计原则：所有"站点知识"都写在 recipes/ 里，本文件只放通用运行参数与安全策略。
+# ------------------------------------------------------------
+#  协同说明：本文件由 Qoder 起草（chrome / safety / state / logging），
+#  WorkBuddy(阿拾) 补入 schedule 段（每日随机时刻调度）。
+# ============================================================
+
+schedule:
+  # 每天在这个窗口内随机挑一个时刻执行（不是固定整点）
+  # 计划任务只在窗口开始前唤醒，真正的签到时刻由程序自己采样
+  #
+  # 2026-09-24 调整：07:40–11:20 → 10:05–12:30（用户拍板）。
+  #   原因：Qoder 每日 10:00 才开窗（官方口径），旧起点会让约 1/3 的执行落在
+  #        开窗之前 —— 那时提醒是负价值（用户照做也领不到，还会把"当天一次"
+  #        的提醒额度吃掉）。详见 DESIGN_NOTES.md 站点事实 ⑥。
+  #   代价：随机窗从 3h40m 压到 2h25m（随机性本身是反封堵资产），并且 WorkBuddy
+  #        的签到时刻一并后移 —— 这是用户知情后的全局取舍。
+  #   注：本窗口只约束"随机调度"。手动 `--now` 绕过窗口，此时由配方自己的
+  #       `reminder.not_before` 兜底（见 recipes/qoder.yaml）。
+  window_start: "10:05"
+  window_end: "12:30"
+  distribute: random          # random | earliest | latest
+  skip_weekends: false        # true 则周六日不执行
+  timezone: "Asia/Shanghai"
+
+chrome:
+  # 专用调试浏览器（首次运行需在其中登录一次目标站点，登录态长期复用）
+  remote_debugging_port: 9333
+  # 独立 profile，避免污染日常浏览器；Chrome 136+ 也禁止对默认 profile 开调试端口
+  user_data_dir: "%LOCALAPPDATA%\\AgentCheckIn\\chrome-profile"
+  # 留空则自动探测常见安装路径；也可写死，如 C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe
+  executable: ""
+  # 启动后等待调试端口与页面就绪的秒数
+  startup_timeout_sec: 25
+
+safety:
+  # 触发前随机延迟范围（秒）——让每次点击不像机器心跳
+  pre_delay_range: [1.5, 6.0]
+  # 多站点之间的随机间隔（秒）
+  inter_site_gap_range: [25, 90]
+  # 单站点网络/未知错误时的最大重试次数（指数退避）；401/需登录类不计入、直接熔断
+  max_retries: 2
+  # 连续失败达到该次数则当日熔断该站点，不再尝试
+  circuit_break_after: 3
+  # 幂等：当日已成功/已签的站点默认跳过（true=不重复打接口）
+  skip_when_done_today: true
+
+state:
+  path: "data/state.json"   # 相对项目根；记录每日结果、连续天数、熔断计数（不含任何凭证）
+
+logging:
+  dir: "logs"
+  level: "INFO"             # DEBUG 打开可看到脱敏后的诊断细节
+  # 日志里出现这些关键词的字段值会被打码
+  redact_keys: ["token", "authorization", "cookie", "refreshtoken", "accesstoken"]

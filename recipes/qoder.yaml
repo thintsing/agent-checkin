@@ -1,0 +1,94 @@
+# ============================================================
+#  站点配方 · Qoder CN (QoderWork CN 桌面端)
+#  形态：client —— 把桌面客户端拉起来，用它的 UI 完成领取，领完再关掉。
+#
+#  ---- 2026-09-25 12:xx 全流程实测通过（WorkBuddy/阿拾）----
+#  今日 100 Credits 已由本驱动自动领取成功，双证据闭环：
+#    · 界面：按钮「领取」→「已领取」+ disabled，页面出现「领取成功，Credits 已到账」
+#    · 服务端（main.log）：03:52:12Z forceRefresh 后 claimable: true → false
+#                            （= 北京时间 11:52:12，与点击时刻一致）
+#
+#  ---- 为什么"网页自动化"不通，而"客户端自动化"通 ----
+#  【不通：网页】
+#    1) 领取页 https://openapi.qoder.com.cn/growth-page/activity-iframe 是
+#       **宿主驱动的 iframe**：靠 postMessage 与父窗口通信（protocol="qoder.campaign"），
+#       校验父窗口来源必须属于 qoder.cn / qoder.com / qoder.ai；源码里
+#       `Ne = window.parent === window` ⇒ **独立打开时忽略所有消息**，永远等不到数据。
+#    2) 实测（CDP 打开该页、未登录、抓全量网络）：页面自己发
+#       GET /sash/api/v1/me/campaigns → 401 {"code":"TOKEN_INVALID"}，
+#       请求头**没有**设备指纹也没有登录 cookie。
+#       ⇒ 它要的是 **Authorization token**，来源是桌面端主进程，不是浏览器 cookie。
+#    3) 客户端侧同一接口由 Electron 主进程携带设备指纹
+#       （Cosy-MachineId / Cosy-MachineToken）发出 —— 复刻设备指纹 = 伪造设备身份，
+#       正踩风控红线，**坚决不做**。
+#    ⇒ 结论：不要试图在浏览器里登录后打开领取页，那条路根本不成立。
+#
+#  【通：客户端】
+#    活动页在客户端里就是个 **OOPIF**（独立 target，`type=="iframe"`），
+#    由主进程注入 token 后正常渲染。用 CDP 附着上去、派发一次真实点击即可。
+#    关键是三条（都踩过坑，详见 src/checkin/core/procenv.py 与 drivers/client_claim.py）：
+#      a) **必须清环境启动**：Agent 环境里的 ELECTRON_RUN_AS_NODE=1 会让 Electron
+#         退化成 Node，静默失败（只剩一个 xxx-app-host.cjs，日志目录不产生新 session）。
+#         → 一律走 core.procenv.spawn()。清环境后 Popen 直启，实测 2 秒端口就绪。
+#      b) **要点的是 OOPIF 里的按钮**：父页面 querySelector 只看到 <iframe> 元素，
+#         必须 target_types=["page","iframe"] 直连它自己的 websocket。
+#      c) **点击要用完整事件序列**：该 UI 绑 pointerdown，`el.click()` 无效。
+#
+#  【活动入口由服务端状态驱动 —— 决定了自动化的时序】
+#    · 只在 `claimable=true` 时客户端才**自动打开**活动 Surface（source:"automatic"），
+#      启动后约 3-6 秒出现；
+#    · 领取成功后该 target **整个消失**。
+#    ⇒ 必须"启动后立即抢窗口"（驱动内是轮询等 target，不是固定 sleep）；
+#      且**不能**用"入口在不在"判断今天领没领 —— 要以 main.log 的 claimable 为准。
+#      驱动已实现零打扰预检：先读日志，已领就直接返回，连客户端都不启动。
+#
+#  【不打断用户】
+#    若客户端**已在运行**（用户在写代码），驱动**绝不杀它**，而是降级为发提醒。
+#    只有"客户端没在跑"时才由我们拉起，并在领取后关闭，把环境还原。
+#
+#  【仍然成立的旧结论】客户端主进程轮询 GET /sash/api/v1/me/campaigns，
+#    响应含 {showCampaign, claimable, campaignUrl, campaigns[]}；
+#    领取页 URL 来自响应的 campaignUrl（不是写死在 asar 里的）。
+# ============================================================
+id: qoder
+name: Qoder CN 每日 100 Credits
+enabled: true
+mode: client
+
+client:
+  # 版本目录会滚动累积（0.3.4 / 0.4.1 / 0.4.2 …），所以用 glob 并取版本号最大的那个。
+  # 写死路径会在客户端自更新后静默失效 —— 那是这条路线最大的长期成本。
+  exe_glob: '%LOCALAPPDATA%\Programs\Qoder CN\.qoder-versions\*\Qoder CN.exe'
+  # 兜底：glob 没命中时直接用这个（留空表示不兜底）
+  exe: ''
+  debug_port: 9334
+  # 活动页在 /json 里的 target url 特征串
+  target_match: 'growth-page'
+  # 领取按钮文本 / 视为"已领取"的界面文案
+  claim_button: '领取'
+  claimed_markers: ['已领取', '领取成功']
+  # 定位"客户端是否在跑"用（按命令行匹配，会排除 native-messaging-host 子进程）
+  process_match: 'Qoder CN.exe'
+  # 客户端 userData 目录，用于零打扰预检（读 logs/<session>/main.log 的 claimable）
+  data_dir: '%APPDATA%\com.qodercn.app.stable'
+  launch_timeout_sec: 60
+  target_timeout_sec: 25
+  # 领取后关闭我们拉起的客户端（不留调试端口 = 不留后门）。关掉的只是"我们起的那个"。
+  close_after: true
+
+reminder:
+  # 留空：实测 qoder-cn: 协议在客户端已运行时无任何效果。
+  # 现在的角色变了 —— 它不再是主路径，而是**降级路径**的文案：
+  # 客户端已在运行时（无法接管）驱动会发这条提醒请用户手动领。
+  open_target: ''
+  # 开窗时刻闸门（HH:MM，UTC+8）：早于此刻不动作，且不消耗当天的额度。
+  # 同时被 client 驱动复用为"活动窗口起点"，用来判断日志里的状态是否属于当前窗口。
+  not_before: '10:00'
+  toast_title: 'Qoder CN 每日签到提醒'
+  toast_body: '打开 Qoder CN 桌面端 → 左下角『用量面板』→ 礼物图标 → 领取本轮 100 Credits。每日 10:00 开窗，次日 10:00 前有效，错过不可补领。'
+  note: '官方口径（docs.qoder.cn/events/100credits）：领取渠道仅限 Qoder CN 桌面端；每日 10:00 开新一轮；2026-09-18 10:00 起，结束另行公告。'
+
+schedule_hint:
+  timezone: Asia/Shanghai
+  # 官方开窗时刻 = 每日 10:00（本字段仅供人读，代码未引用；真正生效的是 reminder.not_before）
+  refresh_hour_utc8: 10

@@ -1,0 +1,67 @@
+# ============================================================
+#  站点配方 · WorkBuddy (codebuddy.cn)
+#  形态：auto —— 复用专用 Chrome 里已登录的网页会话，在页面上下文里 fetch 签到接口。
+#  红线：不逆向、不解密桌面端 token、不伪造指纹；token 全程留在浏览器内。
+#
+#  路径前缀的依据（2026-09-24 从 app.asar 的 CloudAccountRepo 取证）：
+#    - Web（Cloud）：billingPrefix = ""      → /billing/meter/...   ← 走浏览器 cookie 认证，我们用这条
+#    - Desktop     ：覆盖为 "/v2"            → /v2/billing/meter/... ← 走 IDE 网关 Bearer token
+#  实测两者在本机浏览器里都返回 200，但既然我们是"浏览器 + cookie"，
+#  就走网页端自己的那条，行为更像正常用户。若哪天它 404，可回退 /v2/ 前缀。
+#
+#  ⚠ 别把 status 换成 /billing/meter/checkin-status：
+#    那是已废弃的僵尸接口，恒返回 active=false / streak_days=0 / code=0，
+#    会伪装成"永远成功"。活的是 checkin-activity-status。
+# ============================================================
+id: workbuddy
+name: WorkBuddy 每日签到
+enabled: true
+mode: auto            # auto | manual | disabled
+
+origin: https://www.codebuddy.cn
+
+session:
+  kind: browser_page
+  start_url: https://www.codebuddy.cn/home/
+  tab_match: ["codebuddy.cn"]
+  # 留空 => 运行时在已登录页面的 localStorage 里自动探测 token 键；
+  # 若用 --probe 看到了确切键名，可填在这里锁定。
+  token_localstorage_key: ""
+
+actions:
+  status:
+    method: POST          # 必须 POST。只接受 POST 的路由遇到 GET 会回 404，
+    path: /billing/meter/checkin-activity-status
+    body: {}              # 看起来像"接口不存在"，极易误判。
+  trigger:
+    method: POST
+    path: /billing/meter/daily-checkin
+    body: {}
+
+# 灵魂：HTTP 状态码不作数，只按响应体的业务 code 判定（接口会返回 HTTP 400 但 code=0 表示成功）
+verdict:
+  transport: body_code
+  rules:
+    - { code: 0,     result: success }
+    - { code: 10001, result: already }
+  http_401_result: need_login     # 网页会话未登录/过期 => 转人工，绝不重试硬刚
+  unknown_result: no_action       # 不认识的 code：只记日志，不重试、不动作
+  # code=0 只代表"请求成功"，不代表"今天领到了"。真正的状态在 data.today_checked_in。
+  # 有它才能区分「我刚领到」与「我今天早就领过了」，也才能在已签时不再多发一次 trigger。
+  checked_in_flag: today_checked_in
+  # 写接口的业务结论在 data.status，取值抄自客户端自己的判别词表 CheckinClaimStatus。
+  # 优先级高于上面的 code 规则：只看 code 会把「活动已结束」误报成「已领取」。
+  result_flag: status
+  result_map:
+    claimed: success
+    already_claimed: already
+    not_eligible: no_action       # 不满足条件（比如非工作日）—— 不重试，不报错
+    event_ended: no_action        # 活动结束 —— 不重试
+    unknown_biz_error: no_action  # 未知业务拒绝 —— 只记日志
+
+safety_overrides:
+  daily_success_limit: 1
+
+schedule_hint:
+  timezone: Asia/Shanghai
+  refresh_hour_utc8: 0
