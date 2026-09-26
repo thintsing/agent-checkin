@@ -85,6 +85,35 @@ _JS_CLICK = r"""
 })()
 """
 
+# 「把活动入口点出来」用的点击脚本。与 _JS_CLICK 只差**找元素的方式**：
+# 活动页里的领取按钮有固定文案，而客户端外壳上的入口只有 aria-label 可依。
+# 事件序列必须与 _JS_CLICK 完全一致 —— 同一个 UI 框架，同样绑 pointerdown。
+_JS_CLICK_ARIA = r"""
+(() => {
+  const label = __LABEL__;
+  const b = [...document.querySelectorAll('[aria-label]')].find(
+    x => ((x.getAttribute('aria-label') || '')).includes(label));
+  if (!b) return 'no-button';
+  b.scrollIntoView({block: 'center'});
+  const r = b.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const base = {bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0, detail: 1};
+  const seq = [
+    ['pointerover',  PointerEvent, {...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['pointerenter', PointerEvent, {...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['mouseover',    MouseEvent,   {...base, buttons: 0}],
+    ['pointerdown',  PointerEvent, {...base, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['mousedown',    MouseEvent,   {...base, buttons: 1}],
+    ['pointerup',    PointerEvent, {...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['mouseup',      MouseEvent,   {...base, buttons: 0}],
+    ['click',        MouseEvent,   {...base, buttons: 0}]
+  ];
+  for (const [type, Ctor, init] of seq) b.dispatchEvent(new Ctor(type, init));
+  return 'dispatched';
+})()
+"""
+
 
 def _read_tail(path: str, limit: int = 300_000) -> str:
     """读文件末尾若干字节。
@@ -172,7 +201,17 @@ class ClientDriver(Driver):
 
         tgt = self._wait_target(port, match, int(c.get("target_timeout_sec", 25)))
         if tgt is None:
-            # 活动入口没出现。最常见的原因就是"本窗口已经领过了"（服务端不再下发入口），
+            # 入口没出现，有两种完全不同的成因，必须分开处理：
+            #   a) 本窗口已领 → 服务端不再下发入口，再等也没用（下面的日志判定会认出来）；
+            #   b) **客户端整天开着** → 入口是否自动打开，由"客户端启动那一刻"的服务端状态
+            #      决定；开窗时进程早就在跑，入口于是永远不会自己出现。这是零打扰路径（②）
+            #      的**结构性缺口** —— 2026-09-26 真踩到：当天没领到，靠手动补领。
+            # 对 b) 主动把入口点出来再给一次机会；点不出来就退回原行为，不劣化。
+            log.info("[%s] 活动入口未自动出现，尝试从客户端 UI 调出", sid)
+            self._open_entry(port, c)
+            tgt = self._wait_target(port, match, int(c.get("entry_timeout_sec", 20)))
+        if tgt is None:
+            # 到这一步是真的取不到了。最常见的原因是"本窗口已经领过了"，
             # 但也可能是活动结束/窗口未到 —— 交给人判断，不要瞎重试。
             lg = self._log_state(c, str((recipe.reminder or {}).get("not_before") or ""))
             if lg and lg.get("claimed_in_window"):
@@ -431,6 +470,61 @@ class ClientDriver(Driver):
                 log.debug("列举 target 失败：%s", e)
             time.sleep(0.7)
         return None
+
+    @staticmethod
+    def _main_target(port: int, hint: str) -> Optional[Dict[str, Any]]:
+        """取客户端**主窗口**（外壳 UI）的 target。
+
+        入口点击必须在主文档里做：活动页自己是 OOPIF，独立上下文里
+        `window.parent === window` ⇒ 它会忽略所有消息（详见 recipes 头注释），
+        所以在活动页里面操作等于白做。
+        """
+        if not hint:
+            return None
+        try:
+            for t in list_targets(port, ["page"]):
+                if hint in (t.get("url") or ""):
+                    return t
+        except Exception as e:                                  # noqa: BLE001
+            log.debug("列举 target 失败：%s", e)
+        return None
+
+    def _open_entry(self, port: int, c: Dict[str, Any]) -> None:
+        """从客户端外壳把活动入口**点出来**（入口平时藏在用量面板后面）。
+
+        为什么必须做：入口是否在启动时自动打开，由**启动那一刻**的服务端状态决定。
+        客户端整天开着（实测 uptime 13 小时）时，开窗后入口不会自己出现 ——
+        驱动干等一轮 timeout 只能报 no_action，**当天就白跑了**。
+
+        要素全部来自配方（`open_entry_labels` / `main_target_match`），
+        代码里不出现产品名 —— 这是本项目的分层约定：站点知识只进 recipes/*.yaml。
+        任何一步失败都只记日志、不抛异常：点不出来就退回原来的 no_action，行为不劣化。
+        """
+        labels = list(c.get("open_entry_labels") or [])
+        if not labels:
+            return
+        main = self._main_target(port, str(c.get("main_target_match") or ""))
+        if main is None:
+            log.debug("找不到客户端主窗口 target，跳过入口点击")
+            return
+        try:
+            delay = float(c.get("entry_delay_sec", 1.5))
+        except (TypeError, ValueError):
+            delay = 1.5
+        page = CDPPage(main["webSocketDebuggerUrl"])
+        try:
+            for label in labels:
+                js = _JS_CLICK_ARIA.replace(
+                    "__LABEL__", json.dumps(str(label), ensure_ascii=False))
+                try:
+                    r = page.evaluate(js, await_promise=False)
+                except Exception as e:                          # noqa: BLE001 —— 点不到不能阻断领取
+                    log.debug("点击入口 %r 失败：%s", label, e)
+                    continue
+                log.info("点击入口 %r → %s", label, r)
+                time.sleep(delay)
+        finally:
+            page.close()
 
     def _shutdown(self, port: int) -> None:
         """用 CDP `Browser.close` 优雅关闭**我们刚启动的**实例。

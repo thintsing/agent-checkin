@@ -36,7 +36,8 @@
 #
 #  【活动入口由服务端状态驱动 —— 决定了自动化的时序】
 #    · 只在 `claimable=true` 时客户端才**自动打开**活动 Surface（source:"automatic"），
-#      启动后约 3-6 秒出现；
+#      启动后约 3-6 秒出现；**判定发生在启动那一刻** —— 所以客户端整天开着时，
+#      次日开窗后入口不会自己冒出来（补救见下面 client.open_entry_labels）；
 #    · 领取成功后该 target **整个消失**。
 #    ⇒ 必须"启动后立即抢窗口"（驱动内是轮询等 target，不是固定 sleep）；
 #      且**不能**用"入口在不在"判断今天领没领 —— 要以 main.log 的 claimable 为准。
@@ -73,6 +74,21 @@ client:
   data_dir: '%APPDATA%\com.qodercn.app.stable'
   launch_timeout_sec: 60
   target_timeout_sec: 25
+  # ---- 客户端"整天常开"场景的补救（2026-09-26 实测新增）----
+  # 活动入口**是否自动打开**由"客户端启动那一刻"的服务端状态决定。
+  # 客户端整天开着（实测 uptime 13h）时，10:00 开窗后入口不会自己出现，
+  # 驱动干等一轮只能报 no_action —— **当天就领不到**（2026-09-26 真发生，
+  # 当天是手动点开用量面板 → 礼物图标才补领成功的）。
+  # 补救：按顺序点击下面这些入口（值 = 目标元素 aria-label 的**子串**），
+  #       把活动 Surface 从用量面板里调出来。点不到会静默退回原行为，不劣化。
+  open_entry_labels:
+    - '查看我的用量'      # 左下角 → 打开用量面板（礼物图标在面板底部）
+    - '打开 Rewards'      # 面板底部礼物图标；有未领时它右上角带一个红点
+  # 客户端主窗口 url 特征 —— 入口点击必须在主文档里做，不能在活动 OOPIF 里
+  main_target_match: 'renderer/index.html'
+  # 每点一个入口后等多久（面板/浮层渲染要时间），以及调出后再给 target 多久
+  entry_delay_sec: 1.5
+  entry_timeout_sec: 20
   # 领取后关闭我们拉起的客户端（不留调试端口 = 不留后门）。关掉的只是"我们起的那个"。
   close_after: true
 

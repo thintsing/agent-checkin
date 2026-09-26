@@ -751,6 +751,53 @@ class TestClientDriverLogic(unittest.TestCase):
         """进程名含单引号时必须双写转义，否则拼出来的 PowerShell 语法直接炸。"""
         self.assertIn("'O''Brien.exe'", self.d._app_running_script("O'Brien.exe"))
 
+    def test_open_entry_scripts_click_by_aria_label(self):
+        """回归：客户端外壳的入口**只有 aria-label 可依**（纯图标、无文案）。
+        实测就是"查看我的用量 → 打开 Rewards"这两步。
+        """
+        from checkin.drivers.client_claim import _JS_CLICK_ARIA
+        self.assertIn("aria-label", _JS_CLICK_ARIA)
+        self.assertIn("includes(label)", _JS_CLICK_ARIA)
+
+    def test_open_entry_uses_full_event_sequence(self):
+        """回归：外壳入口与活动页按钮同属一个 UI 框架、同样绑 pointerdown；
+        只派发 click() 会**静默无效**（与 _JS_CLICK 踩过的是同一个坑）。
+        """
+        from checkin.drivers.client_claim import _JS_CLICK_ARIA
+        for evt in ("pointerdown", "mousedown", "pointerup", "mouseup", "click"):
+            self.assertIn(f"'{evt}'", _JS_CLICK_ARIA)
+        self.assertIn("composed: true", _JS_CLICK_ARIA, "不穿透 shadow DOM 就点不到")
+
+    def test_open_entry_is_noop_without_labels(self):
+        """没配 open_entry_labels 时必须原地返回、**不连 CDP**。
+
+        否则只读诊断会因为一个空配置去连调试端口，客户端没开时把诊断卡住。
+        """
+        self.d._open_entry(9334, {})
+        self.d._open_entry(9334, {"open_entry_labels": []})
+        self.d._open_entry(9334, {"open_entry_labels": None})
+
+    def test_open_entry_needs_main_target_hint(self):
+        """没有 main_target_match 就不猜主窗口 —— 猜错会点到别的页面上去。"""
+        self.assertIsNone(self.d._main_target(9334, ""))
+
+    def test_qoder_recipe_declares_entry_labels(self):
+        """回归（2026-09-26 真踩到，当天没领到）：客户端整天常开时，
+        活动入口**不会随开窗自动出现**（判定发生在启动那一刻）。
+
+        配方必须声明"点哪些入口把它调出来"，否则"常开 + 端口已开"这条
+        最优路径（②分支）永远不会真正领到东西，而且报的是误导性的 no_action。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        from checkin.core.config import load_config
+        _, recipes = load_config(root)
+        r = next((x for x in recipes if x.id == "qoder"), None)
+        self.assertIsNotNone(r, "找不到 qoder 配方")
+        c = r.client or {}
+        self.assertTrue(c.get("open_entry_labels"),
+                        "缺少 open_entry_labels，常开场景无法领取")
+        self.assertTrue(c.get("main_target_match"), "缺少 main_target_match")
+
     def test_driver_for_resolves_client(self):
         from checkin.drivers import driver_for
         drv = driver_for("client")
