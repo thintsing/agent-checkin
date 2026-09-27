@@ -97,6 +97,35 @@ class CDPPage:
     def current_url(self) -> str:
         return str(self.evaluate("location.href", await_promise=False) or "")
 
+    def wake(self) -> None:
+        """把被 Chromium 冻结的后台页恢复为 active。
+
+        为什么必须做（2026-09-27 实测，WorkBuddy 连续两天失败的真凶）：
+
+        Chromium 会把**长时间处于后台/隐藏**的标签页冻结（Page Lifecycle → frozen），
+        页面的 Task Queue 被挂起。此时：
+          - 同步的 `Runtime.evaluate`（如 `1+1`、`document.visibilityState`）**照常返回**；
+          - 但任何 `await` 的 Promise（例如页面里的 `fetch`）**永远不 resolve**。
+        于是 CDP 侧看起来就是"WebSocket 读超时"，极易被误判成网络故障。
+
+        本项目专用浏览器是**长驻**的（为了保住登录态、避免每天弹窗），
+        所以它会一直被后台冻结 —— 只要复用它，签到必然超时。
+        （2026-09-26 10:27 启动的实例，到 09-27 已冻结约 25 小时。）
+
+        `Page.setWebLifecycleState("active")` 能立即解冻；实测解冻后同一个 fetch
+        由"超时"变成 **0.1s 返回 200**。注意：`visibilityState` 仍是 hidden，
+        那是"标签是否可见"，与"生命周期是否冻结"是两回事 —— 别拿它当判据。
+        """
+        try:
+            self._cmd("Page.setWebLifecycleState", {"state": "active"})
+            return
+        except Exception as e:
+            log.debug("setWebLifecycleState 失败，退回 bringToFront: %s", e)
+        try:
+            self._cmd("Page.bringToFront")
+        except Exception as e:
+            log.debug("唤醒页面失败（忽略，由上层超时兜底）: %s", e)
+
     def close(self) -> None:
         try:
             self._ws.close()

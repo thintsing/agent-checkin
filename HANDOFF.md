@@ -7,6 +7,80 @@
 
 ---
 
+## [2026-09-27 13:00] WorkBuddy(阿拾) —— 双站点都没跑成：WorkBuddy 被"后台冻结"坑了两天（已修），Qoder 因启动没带端口走降级
+
+**一句话**：今天两站**都没签到成功**。WorkBuddy 报 `error`（连续 3 次 WebSocket 超时）——
+真凶是**长驻的专用浏览器标签页被 Chromium 冻结**，页面里 `await fetch` 永不 resolve；
+已修（`CDPPage.wake()`）并加 5 条回归。Qoder 走 ③ 降级（客户端在跑但没调试端口），
+当天没领到，活动窗口还剩 21 小时（到 09-28 09:59）。
+
+### 一、今天的双站点结果
+
+| 站点 | 自动跑 | outcome | 真相 |
+|---|---|---|---|
+| workbuddy | 11:21 / 11:22 / 11:24 | `error` | 读侧超时；**服务端实际已签**（`streak_days=12, today_credit=100`） |
+| qoder | 11:20 | `no_action`（③降级） | ❌ **没领到**，`claimable=true` 直到 12:42 仍在 |
+
+⚠️ WorkBuddy 的"已签"**不是本流水线完成的**：注入的 JS 是**严格串行**的
+（`await 状态` → 判 `today_checked_in` → `await 签到`），页面冻结时连第一个 await 都过不去，
+**签到请求根本没发出去**。所以是站点/客户端侧（或本机另一个 `AutoRewarder` 进程）完成的。
+链条上的事实只有一条确凿：**服务端 says 今天已领**。
+
+### 二、根因 A：长驻浏览器的"后台冻结"（WorkBuddy）
+
+Chromium 会把长时间处于后台/隐藏的标签页**冻结**（Page Lifecycle → frozen）。冻结后：
+- 同步 `Runtime.evaluate`（`1+1`、`document.visibilityState`）**照常返回** → 极难发现；
+- 任何 `await` 的 Promise（页面里的 `fetch`）**永远不 resolve** → CDP 侧表现为读超时。
+
+**为什么必然踩到**：专用浏览器是**长驻**的（为保住登录态、避免每天弹窗）。
+2026-09-26 10:27:04 启动的那个实例一直没关，到 09-27 已冻结约 **25 小时**。
+对照取证：09-26 是**新启动**（日志有"启动签到专用 Chrome"）→ 10:27:06 成功；
+09-27 是**复用**（日志无该行）→ 每次必挂。
+
+**分层定位法**（值得复用）：`1+1` 正常 + 页面内 `fetch('/')` 超时 ⇒ 网络层没事、是页面被冻。
+
+**修复**：`CDPPage.wake()` → `Page.setWebLifecycleState("active")`，在 `evaluate` 前调用。
+活体实测：解冻后同一个 `fetch` 从"超时"变成 **0.1s 返回 200**。
+另在启动参数加 `--disable-renderer-backgrounding` / `--disable-backgrounding-occluded-windows`
+（只在**新启动**时生效）。注意 `visibilityState` 仍是 `hidden` —— 那是"标签可见性"，
+与"生命周期冻结"两回事，**别拿它当判据**。
+
+### 三、根因 B：Qoder 那次启动没带调试端口 + 9334 被僵尸 socket 占死
+
+| 事实 | 证据 |
+|---|---|
+| Qoder 主实例 09-27 09:34 启动，**命令行无 `--remote-debugging-port`** | 进程命令行 |
+| 启动器参与了（state.ini `updatedAt` 09:34:24.760Z 紧贴启动时刻） | `%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher\state.ini` |
+| 同一刻 `targetVersion` 由 0.2.5 切到 **0.4.3** | 同上 ⇒ 疑似"启动器做版本切换后自行重启应用、丢掉透传开关" |
+| Run 项 / 启动文件夹 / 计划任务 / 任务栏固定项里**都没有 Qoder** | 已逐一排查 |
+| **9334 被 PID 23500 占着，而 23500 已不存在**（僵尸监听） | `Get-NetTCPConnection`；`Get-Process` 查无此进程 |
+| 该僵尸**会挡住重启时的端口绑定** | 无 `SO_REUSEADDR` → `10048`；带 `SO_REUSEADDR` → **`10013`（独占）** |
+| 9334 **不在**系统保留段（保留段只有 5357） | `netsh` ⇒ 是独占 socket，不是保留端口 |
+
+⇒ **仅重启 Qoder 也拿不到 9334**；要么重启机器清僵尸，要么**把调试端口换到空闲端口**。
+
+### 四、变更清单（本轮）
+
+| 文件 | 改动 |
+|---|---|
+| `src/checkin/browser/cdp.py` | 新增 `CDPPage.wake()`（lifecycle→active；失败退回 `bringToFront`；两路都失败静默） |
+| `src/checkin/browser/launcher.py` | 启动参数新增 2 个"别后台降级"开关 |
+| `src/checkin/drivers/browser_page.py` | `connect` 后、`evaluate` 前调用 `page.wake()` |
+| `tests/test_core.py` | 新增 `TestBrowserPageFreeze` 5 条（含"wake 必须在 evaluate 之前"的顺序守卫） |
+
+验证门：**139 项单测全绿**（原 134 + 5）。已推送。
+
+### 五、给下一轮的两句实话
+
+1. **WorkBuddy 那条链路仍缺一次"真·端到端成功"**：今天服务端已签，所以 driver 只走到
+   `skippedBecauseCheckedIn`，**没验证过"冻结实例被唤醒后真的把签到打成 success"**。
+   明天若它还是复用同一个长驻实例，那才是这条修复的真正首考。
+2. **Qoder 的启动路径仍未定案**：state.ini 强烈暗示是"启动器版本切换后自行重启"，
+   但**没有直接证据**（应用日志里没有 argv 记录）。下次 Qoder 重启时，
+   抓一次子进程的完整命令行即可定案。
+
+---
+
 ## [2026-09-26 12:05] WorkBuddy(阿拾) —— 改造后首次实战：②分支结构性缺口暴露，Qoder 当天没自动领到（已修）
 
 **一句话**：昨天把启动入口改造成"客户端常开也带端口"后，**今天第一次实战就露馅了** ——

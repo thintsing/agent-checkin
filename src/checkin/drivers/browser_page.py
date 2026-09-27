@@ -29,6 +29,9 @@ class BrowserPageDriver(Driver):
 
         launcher.ensure_chrome(cfg, sess.start_url or recipe.origin)
         page = cdp.CDPPage.connect(cfg.chrome.remote_debugging_port, sess.tab_match)
+        # 长驻浏览器里的标签页会被 Chromium 冻结，冻结后页面里的 await fetch 永不返回。
+        # 评估前先解冻，否则复用上一轮留下的实例时必然超时（2026-09-27 修）。
+        page.wake()
         try:
             # 确保落在目标站点页面（fetch 同源、带鉴权）
             if sess.tab_match and not any(m in page.current_url() for m in sess.tab_match):

@@ -806,6 +806,120 @@ class TestClientDriverLogic(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
+# 长驻浏览器的"后台冻结"（2026-09-27 真踩到：WorkBuddy 连报 error 的真凶）
+# ----------------------------------------------------------------------
+
+class TestBrowserPageFreeze(unittest.TestCase):
+    """背景：Chromium 会把长时间处于后台/隐藏的标签页**冻结**（Page Lifecycle → frozen）。
+    冻结后页面的 Task Queue 被挂起：
+      - 同步的 `Runtime.evaluate`（`1+1`、`document.visibilityState`）**照常返回**；
+      - 任何 `await` 的 Promise（页面里的 `fetch`）**永远不 resolve**。
+    CDP 侧看到的就是"WebSocket 读超时"，极易被误判成网络故障 —— 而它其实是
+    环境状态问题，重试一万次也不会好。
+
+    本项目的专用浏览器是**长驻**的（为保住登录态、避免每天弹窗），所以它必然
+    长期待在后台 —— 只要复用它，签到就会超时。2026-09-26 10:27 启动的那个实例，
+    到 09-27 已冻了约 25 小时，当天两次运行（11:21、12:45）全部 error。
+    活体实测：解冻后同一个 fetch 从"超时"变成 **0.1s 返回 200**。
+    """
+
+    def _fake_page(self, recv_side_effect):
+        from checkin.browser.cdp import CDPPage
+        p = object.__new__(CDPPage)          # 不走 __init__，不真连 WebSocket
+        p._id = 0
+        ws = mock.MagicMock()
+        ws.recv.side_effect = recv_side_effect
+        p._ws = ws
+        return p, ws
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _cfg(self, chrome=None):
+        return AppConfig(root=".", chrome=chrome or ChromeConfig(),
+                         safety=SafetyConfig(),
+                         state_path=os.path.join(self.tmp.name, "state.json"),
+                         log_dir=os.path.join(self.tmp.name, "logs"))
+
+    @staticmethod
+    def _sent(ws):
+        return [json.loads(c[0][0]) for c in ws.send.call_args_list]
+
+    def test_wake_sends_lifecycle_active(self):
+        p, ws = self._fake_page([json.dumps({"id": 1, "result": {}})])
+        p.wake()
+        calls = self._sent(ws)
+        self.assertEqual(calls[0]["method"], "Page.setWebLifecycleState")
+        self.assertEqual(calls[0]["params"], {"state": "active"})
+
+    def test_wake_falls_back_to_bring_to_front(self):
+        """`setWebLifecycleState` 不被支持时退回 bringToFront，别让整轮签到就此失败。"""
+        p, ws = self._fake_page([
+            json.dumps({"id": 1, "error": {"message": "not supported"}}),
+            json.dumps({"id": 2, "result": {}}),
+        ])
+        p.wake()
+        self.assertEqual([c["method"] for c in self._sent(ws)],
+                         ["Page.setWebLifecycleState", "Page.bringToFront"])
+
+    def test_wake_never_raises(self):
+        """唤醒只是"尽力而为"：两条路都失败也必须静默返回，
+        由上层超时/重试兜底 —— 绝不能把异常泄进驱动主流程。"""
+        p, ws = self._fake_page(RuntimeError("boom"))
+        p.wake()                              # 不抛即通过
+
+    def test_driver_wakes_before_evaluating(self):
+        """回归守卫（守的是**顺序**）。
+
+        顺序错了照样"能跑"，测试也照样绿 —— 只有真机上复用冻结实例时才会
+        静默复原成"每天超时"。所以必须把调用顺序钉死。
+        """
+        from checkin.core.models import Outcome, Session
+        from checkin.drivers import browser_page
+
+        page = mock.MagicMock()
+        page.current_url.return_value = "https://www.codebuddy.cn/home/"
+        page.evaluate.return_value = {"skippedBecauseCheckedIn": True}
+        r = Recipe(id="wb", name="wb", mode="auto",
+                   session=Session(start_url="https://www.codebuddy.cn/home/",
+                                   tab_match=["codebuddy.cn"]))
+        cfg = self._cfg()
+        with mock.patch.object(browser_page.launcher, "ensure_chrome"), \
+             mock.patch.object(browser_page.cdp.CDPPage, "connect", return_value=page):
+            res = browser_page.BrowserPageDriver().run(r, cfg)
+
+        self.assertEqual([c[0] for c in page.method_calls],
+                         ["wake", "current_url", "evaluate", "close"],
+                         "wake 必须在 evaluate 之前调用")
+        self.assertEqual(res.outcome, Outcome.ALREADY)
+
+    def test_launched_browser_suppresses_backgrounding(self):
+        """新启动的浏览器要带"别把窗口/渲染进程降级到后台"的开关，从源头避免冻结。
+
+        注意：这两个开关**只在启动那一刻**生效；复用已在跑的实例只能靠 wake()。
+        """
+        from checkin.browser import launcher
+
+        seen = {}
+
+        def fake_popen(args, **kw):
+            seen["args"] = list(args)
+            return mock.MagicMock()
+
+        cfg = self._cfg(chrome=ChromeConfig(
+            remote_debugging_port=9333, user_data_dir=self.tmp.name,
+            executable="", startup_timeout_sec=5))
+        with mock.patch.object(launcher, "port_ready", side_effect=[False, True]), \
+             mock.patch.object(launcher, "find_chrome", return_value=r"C:\fake\msedge.exe"), \
+             mock.patch.object(launcher.subprocess, "Popen", side_effect=fake_popen):
+            launcher.ensure_chrome(cfg, "https://www.codebuddy.cn/home/")
+
+        self.assertIn("--disable-renderer-backgrounding", seen["args"])
+        self.assertIn("--disable-backgrounding-occluded-windows", seen["args"])
+
+
+# ----------------------------------------------------------------------
 # 引擎闸门（只读，不碰网络/浏览器）
 # ----------------------------------------------------------------------
 

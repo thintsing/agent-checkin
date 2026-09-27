@@ -67,7 +67,12 @@ def ensure_chrome(cfg, start_url: str) -> bool:
         f"--user-data-dir={cfg.chrome.user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        # 专用浏览器是长驻的，必须压制一切"后台降级"，否则标签页会被冻结，
+        # 页面里的 await fetch 永不 resolve，表现为 CDP 读超时（2026-09-27 踩过）。
+        # 注意：这两个开关只在**新启动**时生效；复用已在跑的实例要靠 CDPPage.wake()。
         "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
         start_url,
     ]
     log.info("启动签到专用 Chrome：%s", os.path.basename(exe))
