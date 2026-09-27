@@ -62,7 +62,17 @@ client:
   exe_glob: '%LOCALAPPDATA%\Programs\Qoder CN\.qoder-versions\*\Qoder CN.exe'
   # 兜底：glob 没命中时直接用这个（留空表示不兜底）
   exe: ''
-  debug_port: 9334
+  # 调试端口 —— **单一事实源**：`tools/win_shortcut_args.py` 写快捷方式时读的就是这里，
+  # 驱动也读这里，不要在任何地方再硬编码一份（三处各写一份必然漂移）。
+  #
+  # 为什么不是 9334（2026-09-27 实测弃用）：
+  #   09-25 那次带端口的实例（PID 23500）在 0.4.3 升级时退出后，它的监听 socket
+  #   被某个**继承了句柄的子进程**继续持有 —— 内核 TCP 表里仍记在已死的 23500 名下，
+  #   表现为「netstat 显示 LISTENING，但连不上、也绑不了」的**僵尸监听**：
+  #   裸 bind 报 10048，带 SO_REUSEADDR 报 10013（独占），而 9334 又不在系统保留段。
+  #   ⇒ 9334 在下次重启机器前**无法再用**，重启 Qoder 也拿不到端口。
+  #   教训：调试端口是"一次性"资源，一旦被僵尸句柄占住就只能换端口（或重启机器）。
+  debug_port: 9335
   # 活动页在 /json 里的 target url 特征串
   target_match: 'growth-page'
   # 领取按钮文本 / 视为"已领取"的界面文案

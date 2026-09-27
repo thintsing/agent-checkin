@@ -7,8 +7,9 @@ r"""Qoder 客户端 CDP 侦察工具（只读为主，--click 时才派发一次
     Start-Process 直接启动会静默失败（主进程在 Chromium 初始化前退出，只剩 native-messaging-host）。
     可行方式 = 计划任务（-LogonType Interactive）：
 
-    $exe = "$env:LOCALAPPDATA\Programs\Qoder CN\.qoder-versions\0.4.2\Qoder CN.exe"
-    $a = New-ScheduledTaskAction -Execute $exe -Argument "--remote-debugging-port=9334"
+    $exe = (Get-ChildItem "$env:LOCALAPPDATA\Programs\Qoder CN\.qoder-versions\*\Qoder CN.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1).FullName
+    $a = New-ScheduledTaskAction -Execute $exe -Argument "--remote-debugging-port=9335"
     $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName QoderCDP -Action $a -Principal $p -Settings (New-ScheduledTaskSettingsSet) -Force
     Start-ScheduledTask -TaskName QoderCDP
@@ -22,12 +23,29 @@ r"""Qoder 客户端 CDP 侦察工具（只读为主，--click 时才派发一次
 """
 import argparse
 import json
+import os
 import time
 import urllib.request
 
 import websocket
 
-PORT = 9334
+
+def _recipe_debug_port(default: int = 9335) -> int:
+    """端口以 recipes/qoder.yaml 的 client.debug_port 为单一事实源（同 win_shortcut_args.py）。"""
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "recipes", "qoder.yaml")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.split("#", 1)[0].strip()
+                if s.startswith("debug_port:"):
+                    return int(s.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    return default
+
+
+PORT = _recipe_debug_port()
 _LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 MAIN_URL_PREFIX = "qoder-cn-app://renderer"

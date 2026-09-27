@@ -31,6 +31,9 @@ Electron 应用的调试端口**只能在启动时绑定**，运行中无法追�
     python tools/win_shortcut_args.py --set "<.lnk>" --arg "--foo=bar"
     python tools/win_shortcut_args.py --qoder          # 给 Qoder CN 全部入口加调试端口
     python tools/win_shortcut_args.py --qoder --revert # 从备份还原
+
+端口不在这里定义 —— `--qoder` 写的端口来自 `recipes/qoder.yaml` 的
+`client.debug_port`（单一事实源）。换端口 = 改配方 → 重跑 `--qoder`。
 """
 from __future__ import annotations
 
@@ -45,7 +48,30 @@ import uuid
 from ctypes import POINTER, WINFUNCTYPE, byref, c_int, c_long, c_void_p, c_wchar_p, wintypes
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QODER_ARG = "--remote-debugging-port=9334"
+RECIPE_FILE = os.path.join(PROJECT_ROOT, "recipes", "qoder.yaml")
+
+
+def recipe_debug_port(default: int = 9335) -> int:
+    """从 `recipes/qoder.yaml` 读 `client.debug_port`。
+
+    端口是**跨进程契约**：快捷方式写进去的、和驱动要连的必须是同一个值。
+    两处各硬编码一份迟早漂移（本项目已因"同一结论两处写法"踩过坑），
+    所以这里以配方为**单一事实源**，本工具不自己定义端口。
+
+    刻意不引 yaml 依赖（本工具的设计目标之一是零依赖），够用的最小解析即可。
+    """
+    try:
+        with open(RECIPE_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.split("#", 1)[0].strip()
+                if s.startswith("debug_port:"):
+                    return int(s.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    return default
+
+
+QODER_ARG = f"--remote-debugging-port={recipe_debug_port()}"
 QODER_LNKS = [
     os.path.expandvars(r"%USERPROFILE%\Desktop\Qoder CN.lnk"),
     os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Qoder CN.lnk"),
@@ -169,21 +195,30 @@ def do_set(lnk: str, arg: str, backup_dir: str, lock: bool = False) -> int:
         return 2
     os.chmod(lnk, stat.S_IWRITE | stat.S_IREAD)      # 只读会挡住写入，先解开
     before = read_args(lnk)
-    if arg in before:
+    if before.strip() == arg:
         if lock:
             os.chmod(lnk, stat.S_IREAD)
-        print(f"  {lnk}\n      已含该参数，跳过{'（已加只读保护）' if lock else ''}")
+        print(f"  {lnk}\n      参数已正确，跳过{'（已加只读保护）' if lock else ''}")
         return 0
+    stale = [t for t in before.split() if t.startswith("--remote-debugging-port")]
+    if stale:
+        print(f"  {lnk}\n      检测到旧参数 {stale} → 替换为 [{arg}]")
     os.makedirs(backup_dir, exist_ok=True)
     tag = os.path.basename(os.path.dirname(lnk)) or "root"
     bk = os.path.join(backup_dir, f"{tag}__{os.path.basename(lnk)}")
-    shutil.copy2(lnk, bk)
+    # 备份**只取最早那份**（= 任何改造之前的原始态）。若每次都覆盖，
+    # "改端口"这类二次操作会把原始备份换成半成品，回滚就回不到真正干净的状态。
+    if os.path.exists(bk):
+        kept = "备份已存在，保留最早的"
+    else:
+        shutil.copy2(lnk, bk)
+        kept = "已备份"
     set_args(lnk, arg)
     after = read_args(lnk)
     if lock:
         os.chmod(lnk, stat.S_IREAD)
     ok = after.strip() == arg
-    print(f"  {lnk}\n      改前 [{before}] → 改后 [{after}]   备份 {bk}"
+    print(f"      改前 [{before}] → 改后 [{after}]   {kept}: {bk}"
           f"{'   已加只读保护' if lock else ''}\n      {'OK' if ok else '校验失败 ✘'}")
     return 0 if ok else 1
 

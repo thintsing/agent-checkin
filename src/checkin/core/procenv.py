@@ -14,7 +14,7 @@ WorkBuddy 以 Electron 运行时启动，会把下面两个变量注入到所有
   * 进程数恒为 1，剩下的是一个 `xxx-app-host.cjs`（那正是被当作 Node 脚本执行的它）
   * 应用日志目录**不产生新 session**
   * `--enable-logging --log-file=` **不生成文件**
-  * stderr 报 `bad option: --remote-debugging-port=9334` —— 这是 **Node 的参数解析器**报的，
+  * stderr 报 `bad option: --remote-debugging-port=9335` —— 这是 **Node 的参数解析器**报的，
     不是应用拒绝该参数
 
 对照实测（同一台机器、同一份 exe）：
