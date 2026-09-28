@@ -65,3 +65,15 @@ safety_overrides:
 schedule_hint:
   timezone: Asia/Shanghai
   refresh_hour_utc8: 0
+
+reminder:
+  # need_login 的主动提醒（2026-09-28 新增）。
+  #
+  # 背景：登录态会**自然失效** —— 实测 `session` / `session_2` 两个 cookie 的有效期
+  # 都是 **168 小时（恰好 7 天）**，到期后只能人工重登（天天访问页面也并不能无限续期）。
+  # 而原先 need_login **只写日志**，界面上毫无动静：2026-09-28 当天 10:51 就已判定
+  # 未登录，用户直到 12:29 自己来问才发现 —— 白白漏了半天。**这才是真正的问题**，
+  # 不是 401 本身（401 意味着会话真过期了，转人工是正确行为）。
+  # 所以补上这条通知，把"静默漏签"变成"看得见的待办"。
+  toast_title: "WorkBuddy 签到需重新登录"
+  toast_body: "签到专用浏览器的登录态已失效。请运行 python -m checkin --login 登录后补签。"

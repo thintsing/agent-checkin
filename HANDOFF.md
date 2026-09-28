@@ -7,6 +7,152 @@
 
 ---
 
+## [2026-09-28 12:45] WorkBuddy(阿拾) —— Qoder `_open_entry()` **首考通过**；WorkBuddy 因**静默 need_login** 漏签（已补签，并补上提醒）。附**一次被证伪的推断与回退**
+
+**一句话**：Qoder 今天**全自动成功**，且昨天登记"未首考"的 `_open_entry()` 通过了；
+WorkBuddy 10:51 判 `need_login`，但**只写日志、没有任何通知** → 漏签，用户 12:29 自己来问才发现。
+12:32 用 `--now` 补签成功（streak 12→13）。真正的问题**不是 401，是"没人告诉你"**。
+
+### 一、今天两站的实况（来自 `logs/checkin-2026-09-28.log`）
+
+```
+10:50:19 [qoder] 调试端口 9335 已就绪，直接接管
+10:50:44 [qoder] 活动入口未自动出现，尝试从客户端 UI 调出
+10:50:44 点击入口 '查看我的用量' → dispatched
+10:50:46 点击入口 '打开 Rewards'  → dispatched
+10:50:50 [qoder] => success | 已点击领取并确认到账
+10:51:58 [workbuddy] => need_login | 需登录 (code=None http=401)
+```
+
+| 站点 | 结果 |
+|---|---|
+| qoder | ✅ **success**（② 分支接管 + **`_open_entry()` 真首考通过**） |
+| workbuddy | ❌ need_login → 12:32 手动补签 ✅（streak 13） |
+
+⚠ 注意：昨天我预判"`activity-iframe` 一直开着、`_open_entry()` 明天也不会被走到"
+—— **被现实推翻**：iframe 在跨天/领取后确实没了，入口没自动出现，
+`_open_entry()` **真的被走到了，并且点通了**。这是它第一次在真实窗口期端到端成功。
+
+### 二、⚠⚠ 一次被证伪的推断（完整登记，别让下一个我再走一遍）
+
+看到"12:30 回 401、12:32 回 200"，且 `Network.getCookies` 显示 `session` / `session_2`
+**距过期还有 168 小时（7 天满值）**，我推断这是**假性 401**（页面冻结/失焦导致 fetch 没带凭据），
+并据此写了 `CDPPage.activate()` + "401 后恢复重试一次"。
+
+**然后做了两个受控实验，两个都把假设否证了**：
+
+| 实验 | 预期（若假设成立） | 实测 |
+|---|---|---|
+| 手动 `setWebLifecycleState("frozen")` → probe | 401 | **200**（`visibilityState` 确实变成 `hidden`） |
+| `bringToFront` 让给别的标签页 → probe | 401 | **200** |
+
+**最后是用户一句话定案的**：「我刚刚重新登录了，之前的确登录状态过期了」。
+⇒ **401 就是真实的会话过期**。12:32 变 200 是因为**用户手动重登了**，
+不是我的 `bringToFront` 起了作用（虽然我把窗口推到了前台、客观上促成了这次重登）。
+
+**处置：把基于错误假设的 3 处改动全部回退**，`git diff` 已确认
+`src/checkin/browser/cdp.py` 与 `src/checkin/browser/page_script.py` **零改动**。
+配方里"401 转人工、绝不重试硬刚"这条**本来就是对的**，不该动。
+
+**教训**：`getCookies` 看到 cookie 没过期，**不等于**服务端还认它
+（服务端 session 记录可能独立失效）。**要下结论，就得先问一句现场的人。**
+
+### 三、真正的修复：`need_login` 必须"出声"（本次唯一落地的代码改动）
+
+问题不在 401，而在**没人通知**。登录态**注定会失效**：
+
+- 实测 `session` / `session_2` cookie 有效期 = **168 小时（恰好 7 天）**；
+- 天天访问页面**也不能无限续期**（否则从 09-24 到 09-28 不该断）⇒
+  **每 7 天左右必然需要一次人工重登**，这是无法自动化的硬成本。
+
+既然这条路径必然被走到，就必须主动出声，而不是等用户来查。
+
+| 文件 | 改动 |
+|---|---|
+| `src/checkin/drivers/browser_page.py` | `import notify`；readonly 与 trigger 两条路径上 `outcome == NEED_LOGIN` 时调 `_remind(recipe)`；新增模块级 `_remind()`（文案走配方，代码里不出现站点名，与 `client_claim` 同约定） |
+| `recipes/workbuddy.yaml` | 新增 `reminder` 段：`toast_title` / `toast_body`（含"运行 `python -m checkin --login` 重登"的指引） |
+| `tests/test_core.py` | 新增 `TestBrowserPageNeedLoginNotify` **5 条**：401 必提醒（trigger / probe 两路）、文案取自配方、配方漏写时走兜底、**already 绝不提醒**（通知的稀缺性 = 通知的有效性） |
+
+**144 项测试全绿**（原 139 + 5）。
+
+**明天起**：若 WorkBuddy 再次登录失效，会**弹一条系统通知**，而不是静默漏签。
+
+### 四、今天的操作记录（可复核）
+- `--probe` 复验 → 401；用户重登后 → `http=200 today_checked_in=False`
+- `--now --only-site workbuddy` → `success | 已领取 (code=0 http=200 streak_days=13)`
+- 三次连跑 probe 稳定 200，`today_checked_in=True`
+- **未做**：没碰用户的浏览器进程、没清 profile（`--login` 由用户自己完成）
+
+---
+
+## [2026-09-27 13:57] WorkBuddy(阿拾) —— Qoder 重启后 **② 分支接管成功，今日 100 Credits 已补领**；并诚实登记"两处修复其实还没首考"
+
+**一句话**：13:45 换到 9335 后，大哥从桌面图标重启 Qoder（13:55:35，PID 3608，9335 立刻 LISTENING）
+→ 驱动走 **②「端口已开 → 直接接管」** → `outcome: success` → 双证据确认到账，**且客户端没被关掉**。
+
+### 一、本轮干了什么
+
+**零代码改动**，纯粹是运行验证 + 证据固定。顺带拿到了两个副产品：
+
+1. **快捷方式改造的真·端到端验证通过**。13:45 那轮只验证了 `.lnk` 里的参数**读回**正确；
+   这次是"用户**双击桌面图标** → 进程真的带着 `--remote-debugging-port=9335` 起来"。
+   ⇒ `tools/win_shortcut_args.py --qoder` 从头到尾真跑通了。
+
+2. **09-26 的根因假设被实锤**。新会话 `20260927-055536.648-3608-ad6ad0e3` 的 `main.log`：
+   ```
+   [2026-09-27T05:55:38.337Z] [Campaign] 活动状态响应解析完成 {...,"claimable":true}
+   [2026-09-27T05:55:38.735Z] [Campaign] 活动 Surface 已打开 {...,"claimable":true,"source":"automatic"}
+   ```
+   `source: "automatic"` —— **入口是客户端自己弹出来的**。而 09-26 客户端整天常开时它永不出现。
+   ⇒ "入口是否自动打开，由**客户端启动那一刻**的服务端状态决定" 从推断**升级为实锤**。
+
+### 二、执行与复核（全部证据）
+
+| 步骤 | 结果 |
+|---|---|
+| `--status`（只读） | `port_alive / target_present / button_found` 全 `True` |
+| `--claim` | ② 分支 → `outcome: success`，`click=js-pointer-sequence`，`confirmed=True` |
+| 界面证据 | 「领取成功，Credits 已到账」+「已领取」 |
+| 日志证据 | `05:56:58.141Z`（`forceRefresh:true`）→ `claimable: **true → false**` |
+| 客户端是否被关 | **没有**。②分支 = `return self._claim(...)`，在 `try/finally` **之外**，不触发 `_shutdown`（`client_claim.py:162-166` vs `192-194`）→ 9335 仍 LISTENING、PID 3608 存活 |
+
+⇒ 「不退出主程序也能自动签到」这条承诺，**Qoder 侧今天在用户自己开的实例上实测兑现**。
+
+### 二·补 顺手做的零风险核对：`open_entry_labels` 在当前 UI 里**真实存在**
+
+趁客户端开着，用 `tools/qoder_cdp_probe.py` + CDP 直接 dump 了主页面**全部** `[aria-label]`（约 160 条）：
+
+| 配方 label | 实际存在？ | 说明 |
+|---|---|---|
+| `查看我的用量` | ✅ 存在且 `offsetParent !== null`（**可见**） | 配方第一个 label 正确，点得到 |
+| `打开 Rewards` | ❌ 用户菜单未展开时**不存在** | **符合设计**：它在用量面板底部，面板展开后才挂载；靠 `entry_delay_sec` 等渲染 |
+
+⚠ **排掉一个会误导人的假结论**：`probe` 的"账号/设置类入口（3）"小节**没有列出** `查看我的用量`
+（那节的筛选条件所限），如果只看那一节，会得出"配方 label 已失效"的**错误结论**。
+**全量 dump 才是可靠判据** —— 这个坑下一个我别再踩。
+
+**另一个改变判断的观察**：`activity-iframe` target 在**领取成功后依然存在**。
+⇒ 明天 10:00 若客户端仍常开，`_wait_target()` 可能**立刻命中**、直接进 `_claim()` 点"领取"，
+`_open_entry()` **依旧不会被走到**。所以"明天必然首考 `_open_entry()`"**不成立** ——
+它只在 iframe 不存在时才需要（例如客户端重启时服务端尚未开窗，或用户手动关掉了活动面板）。
+
+### 三、⚠ 给下一个我（或 Qoder 侧）的诚实登记：**两处修复尚未首考**
+
+这两条很容易被后面的人误读成"已验证"，所以单独列出来：
+
+1. **`_open_entry()` 今天根本没被走到。** 入口是 `automatic` 自己出现的，所以"主动点入口"这条
+   09-26 新加的路径**零覆盖**。它的真首考在 **09-28**：客户端常开 → 10:00 时进程早就在跑
+   → 入口不会自动出现 → 那时才轮到它。**今天这次成功不能算它的验证。**
+2. **WorkBuddy 冻结修复（`CDPPage.wake()`）同样未端到端首考。** 今天 WorkBuddy 服务端已签
+   （`state.json` `last_done: already`），驱动只走到"已签就收手"，没进冻结路径。
+
+### 四、遗留
+- 9334 僵尸监听、0.4.2 残留进程（PID 15688）：**不动**，重启机器即清。
+- Qoder 启动路径仍**未定案**（`state.ini` 的 `updatedAt` 与版本切换同刻只是嫌疑）。
+- 客户端升级后需重跑 `python tools/win_shortcut_args.py --qoder`。
+
+---
+
 ## [2026-09-27 13:45] WorkBuddy(阿拾) —— 选项 A：调试端口 9334 → **9335**（9334 被僵尸监听占死），并把端口收敛为单一事实源
 
 **一句话**：大哥选 A（换端口补领）。原因：9334 被**已死进程 PID 23500 的僵尸监听**占死

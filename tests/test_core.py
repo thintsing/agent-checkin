@@ -919,6 +919,85 @@ class TestBrowserPageFreeze(unittest.TestCase):
         self.assertIn("--disable-backgrounding-occluded-windows", seen["args"])
 
 
+class TestBrowserPageNeedLoginNotify(unittest.TestCase):
+    """背景（2026-09-28 实测，代价是**漏签半天**）：
+
+    `need_login` 原先**只写日志**，界面上毫无动静 —— 当天 10:51 就已判定未登录，
+    用户直到 12:29 自己来问才发现。而登录态是会自然失效的（实测 `session` /
+    `session_2` cookie 有效期都是 168 小时 = 7 天，到期只能人工重登，天天访问
+    页面也不能无限续期），所以这条路径**注定会被走到**。
+
+    这里守两件事：
+      ① need_login 必须发出提醒；
+      ② already / success **绝不能**发 —— 通知一旦天天弹就没人看了，
+         稀缺性本身就是通知有效性的一部分。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _run(self, evaluate_result, probe=False, reminder=None):
+        from checkin.core.models import Action, Recipe, Session
+        from checkin.drivers import browser_page
+
+        page = mock.MagicMock()
+        page.current_url.return_value = "https://www.codebuddy.cn/home/"
+        page.evaluate.return_value = evaluate_result
+        r = Recipe(id="wb", name="wb", mode="auto",
+                   session=Session(start_url="https://www.codebuddy.cn/home/",
+                                   tab_match=["codebuddy.cn"]),
+                   actions={"status": Action("POST", "/x", {}),
+                            "trigger": Action("POST", "/y", {})},
+                   reminder=reminder or {})
+        cfg = AppConfig(root=".", chrome=ChromeConfig(), safety=SafetyConfig(),
+                        state_path=os.path.join(self.tmp.name, "state.json"),
+                        log_dir=os.path.join(self.tmp.name, "logs"))
+        sent = []
+        with mock.patch.object(browser_page.launcher, "ensure_chrome"), \
+             mock.patch.object(browser_page.cdp.CDPPage, "connect", return_value=page), \
+             mock.patch.object(browser_page.notify, "_toast",
+                               side_effect=lambda t, b: sent.append((t, b))):
+            res = browser_page.BrowserPageDriver().run(r, cfg, probe=probe)
+        return res, sent
+
+    def test_trigger_401_notifies(self):
+        res, sent = self._run({"statusCall": {"http": 401, "code": None},
+                               "triggerCall": {"http": 401, "code": None}})
+        self.assertEqual(res.outcome, Outcome.NEED_LOGIN)
+        self.assertEqual(len(sent), 1, "need_login 必须发出一条提醒")
+
+    def test_probe_401_notifies(self):
+        """只读探针也要提醒 —— 它正是"登录态还在不在"的日常体检入口。"""
+        res, sent = self._run({"statusCall": {"http": 401, "code": None}}, probe=True)
+        self.assertEqual(res.outcome, Outcome.NEED_LOGIN)
+        self.assertEqual(len(sent), 1)
+
+    def test_recipe_copy_is_used(self):
+        """文案走配方，代码里不出现站点名（与 client_claim 同约定）。"""
+        _, sent = self._run({"statusCall": {"http": 401, "code": None},
+                             "triggerCall": {"http": 401, "code": None}},
+                            reminder={"toast_title": "标题A", "toast_body": "正文B"})
+        self.assertEqual(sent[0], ("标题A", "正文B"))
+
+    def test_default_copy_when_recipe_silent(self):
+        """配方没写 toast 文案时也要能出声。
+
+        否则新增一个站点、照抄配方却漏了 `reminder` 段，提醒就会静默消失 ——
+        而那正是本次要杜绝的失败模式。兜底文案由代码给（带站点名）。
+        """
+        _, sent = self._run({"statusCall": {"http": 401, "code": None},
+                             "triggerCall": {"http": 401, "code": None}})
+        self.assertEqual(len(sent), 1)
+        self.assertIn("wb", sent[0][0], "兜底文案应带上站点名")
+
+    def test_no_notify_on_already(self):
+        """已签不该弹窗（通知的稀缺性 = 通知的有效性）。"""
+        res, sent = self._run({"skippedBecauseCheckedIn": True})
+        self.assertEqual(res.outcome, Outcome.ALREADY)
+        self.assertEqual(sent, [])
+
+
 # ----------------------------------------------------------------------
 # 引擎闸门（只读，不碰网络/浏览器）
 # ----------------------------------------------------------------------

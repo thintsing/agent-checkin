@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 from ..browser import cdp, launcher, page_script
+from ..core import notify
 from ..core.models import Action, CheckinResult, Outcome, Recipe
 from . import Driver
 
@@ -65,6 +66,8 @@ class BrowserPageDriver(Driver):
                 else:
                     where = "（未探测到 token 键）"
                 label = "探针" if probe else "演练"
+                if mapped == Outcome.NEED_LOGIN:
+                    _remind(recipe)
                 # 只读模式下如实返回映射结果（可能 need_login / already / success），
                 # 但注明未触发签到，避免把"当前状态"误读成"刚签成功"。
                 return CheckinResult(
@@ -89,6 +92,8 @@ class BrowserPageDriver(Driver):
             # 优先按客户端自己的业务词表（data.status）判定；拿不到才退回 code 规则。
             outcome = (recipe.verdict.map_flags(tc.get("flags"))
                        or recipe.verdict.map(tc.get("http"), tc.get("code")))
+            if outcome == Outcome.NEED_LOGIN:
+                _remind(recipe)
             msg = (f"{_zh(outcome)} (code={tc.get('code')} http={tc.get('http')}"
                    f"{_flags_note(tc.get('flags'))})")
             return CheckinResult(recipe.id, outcome, message=msg, detail=diag)
@@ -128,3 +133,19 @@ def _brief(diag) -> dict:
     if diag.get("skippedBecauseCheckedIn"):
         out["skippedBecauseCheckedIn"] = True
     return out
+
+
+def _remind(recipe: Recipe) -> None:
+    """把"需要人工介入"变成用户**看得见**的一条系统通知。
+
+    为什么必须做（2026-09-28 实测，代价是漏签一整天）：
+    `need_login` 原先**只写日志**，界面上没有任何动静 —— 当天 10:51 就判定了未登录，
+    用户直到 12:29 自己来问才发现，中间白白漏了半天。登录态是会自然失效的
+    （实测 `session` cookie 有效期 168 小时 = 7 天，到期只能人工重登），
+    所以这条路径**注定会被走到**，必须主动出声，而不是等人来查。
+
+    文案走配方（`reminder` 段），代码里不出现站点名 —— 与 client_claim 同约定。
+    """
+    rem = recipe.reminder or {}
+    notify._toast(rem.get("toast_title") or f"{recipe.name} 签到需人工处理",
+                  rem.get("toast_body") or "自动签到未能完成，详情见日志。")
