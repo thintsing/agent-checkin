@@ -77,3 +77,53 @@ reminder:
   # 所以补上这条通知，把"静默漏签"变成"看得见的待办"。
   toast_title: "WorkBuddy 签到需重新登录"
   toast_body: "签到专用浏览器的登录态已失效。请运行 python -m checkin --login 登录后补签。"
+
+# ============================================================
+#  client 模式配置（预置，**尚未启用**）
+# ============================================================
+#  背景（2026-10-06）：网页侧的 cookie 会话实测 **168 小时（恰好 7 天）**到期，
+#  到期只能人工重登。09-28 重登 → 10-06 又 401，周期性发生，是结构性成本。
+#
+#  客户端内的签到**不需要我们维护任何登录态** —— 客户端自己持有并续期 token。
+#  实测取证（静态只读，未逆向、未碰加密文件）：
+#    · 客户端内有签到 UI（不是网页，是 workbench 自己的 DOM）：
+#      `.daily-checkin` / `.daily-checkin--bubble` / `.daily-checkin--menu-banner`
+#      （横幅挂在用户菜单里，紧邻 `.user-menu-trigger-wrapper`）
+#    · 客户端内有签到接口（Electron IPC channel）：
+#      `authGetCheckinStatus` / `authClaimDailyCheckin` / `authGetActivityBanner`
+#    · 业务接口与网页端**同一个**：POST `${billingPrefix}/billing/meter/daily-checkin`
+#      ⇒ 同一份奖励，client 模式**不会**提高成功率，价值只在"免维护登录态"。
+#
+#  ⚠ `mode` 仍是 `auto` —— 下面的字段**故意留空等着实测**。
+#    留空 = 安全：`_wait_target` 在 match 为空时永不命中，不会误点任何东西。
+#    首次接管（WorkBuddy 带端口启动后）用 CDP 侦察真实 DOM，再补齐并切 mode。
+#
+#  ⚠ `close_after` 必须保持 false：桌面端是用户全天在用的主力工具，
+#    **绝不能**像 Qoder 那样"领完就关"。这条是硬约束，不是偏好。
+client:
+  # 调试端口 —— **单一事实源**：tools/win_shortcut_args.py 写快捷方式时读的就是这里。
+  # 9333 = 网页侧专用浏览器；9335 = Qoder 客户端；本机 9336 已实测空闲（2026-10-06）。
+  debug_port: 9336
+  # electron-builder 的 per-user 安装，路径固定，没有 Qoder 那种 `.qoder-versions\*\` 滚动目录。
+  exe: '%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe'
+  exe_glob: ''
+  # 按命令行匹配主进程（会排除 --type=* 渲染/GPU 子进程 与 app-host.cjs 助手）
+  process_match: 'WorkBuddy.exe'
+  # VSCode 系客户端启动慢，给足时间（Qoder 是 60s）
+  launch_timeout_sec: 90
+  target_timeout_sec: 30
+  # ---- 待实测：首次接管时侦察后填 ----
+  # 签到横幅在**主窗口**里（没有 Qoder 那种独立活动 OAFIF），
+  # 所以 target_match 与 main_target_match 预计指向同一个主窗口 URL。
+  target_match: ''
+  main_target_match: ''
+  # 按钮文案由**服务端下发**（`claim_button_text`），不能假设固定值；
+  # 实测出真实文案后填这里，或改为按容器 `.daily-checkin` 定位。
+  claim_button: ''
+  claimed_markers: ['已领取', '领取成功']
+  open_entry_labels: []      # 待实测：点开用户菜单的 aria-label 序列
+  entry_delay_sec: 1.5
+  entry_timeout_sec: 20
+  # 日志结构是 `logs\<日期>\*MainThread*.log`，与 Qoder 的 `logs\<session>\main.log`
+  # 不同 ⇒ 分支①的"零打扰预检"会自动跳过（_log_state 返回 None），不影响主流程。
+  data_dir: ''

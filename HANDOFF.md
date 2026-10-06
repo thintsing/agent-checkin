@@ -7,6 +7,81 @@
 
 ---
 
+## [2026-10-06 15:20] WorkBuddy(阿拾) —— 为 WorkBuddy **预置 client 模式**（快捷方式已带 9336）；快捷方式工具从「Qoder 专用」泛化为「按应用配置表」
+
+**一句话**：今天 WorkBuddy **又 401**（09-28 重登 → 10-06 失效，**正好 8 天**，7 天 cookie 周期精确复现）。
+用户要求「像 Qoder 那样在客户端内签到」。本轮完成**前置条件**：快捷方式写入调试端口 +
+配方 `client:` 段骨架 + 工具泛化。**`mode` 仍是 `auto`** —— 真正切换要等客户端带端口重启后实测 DOM。
+
+### 一、今天的实况（`logs/checkin-2026-10-06.log`）
+
+```
+10:45:17 [qoder]     => already | 界面显示本窗口已领取     ← ② 分支接管，用户已手领
+10:46:42 [workbuddy] => need_login | 需登录 (code=None http=401)   ← 漏签
+```
+
+对照历史：09-29 ~ 10-05 **连续 7 天全 success**，10-05 11:12 还是 200，10-06 10:46 就 401。
+09-28 12:29 人工重登 → 10-06 失效 = **约 8 天**。
+⇒ **`session` cookie 168 小时（7 天）周期复现** —— 不是偶发，是结构性成本。这正是改 client 模式的理由。
+
+### 二、为什么 client 模式可行（静态取证，未逆向、未碰加密文件）
+
+- 客户端是 Electron（VSCode 系）：`app.asar` 211 MB，进程有 `--type=renderer/gpu-process`。
+- **客户端内有签到 UI**（不是网页，是 workbench 自己的 DOM）：
+  `.daily-checkin` / `.daily-checkin--bubble` / **`.daily-checkin--menu-banner`** / `.daily-checkin-close`；
+  横幅紧邻 `.user-menu-trigger-wrapper` ⇒ **挂在用户菜单里**，与 Qoder 的「用量 → Rewards」同型。
+- **客户端内有签到接口**（Electron IPC channel）：
+  `authGetCheckinStatus` / `authClaimDailyCheckin` / `authGetActivityBanner`。
+- **业务接口与网页端同一个**：POST `${billingPrefix}/billing/meter/daily-checkin`。
+  ⇒ **同一份奖励，client 模式不会提高成功率**；它的价值**只在免维护登录态**。
+- 客户端当前**没开 CDP**（18488 / 60742 / 60765 返 404、60945 返 401）⇒ 必须改快捷方式 + 重启。
+
+### 三、本轮改动（3 项，`unittest discover -s tests` **144 项全绿**）
+
+| 文件 | 改动 |
+|---|---|
+| `tools/win_shortcut_args.py` | 从「硬编码 Qoder」泛化为 **`APPS` 配置表**（`qoder` / `workbuddy`）。新增 `--app <name>`，`--qoder` 保留兼容。端口按应用从**各自配方**读（单一事实源） |
+| `recipes/workbuddy.yaml` | 新增 `client:` 段（**预置、未启用**）：`debug_port: 9336`、`exe`、`process_match`、`close_after: false`；其余字段**故意留空待实测**（留空 = 安全：`_wait_target` 在 match 为空时永不命中） |
+| 快捷方式 | 桌面 + 开始菜单两个入口均写入 `--remote-debugging-port=9336`，各有备份（`data/shortcut_backup/Desktop__WorkBuddy.lnk`、`Programs__WorkBuddy.lnk`） |
+
+**工具泛化里的一个刻意设计**：`APPS[app]["lock"]` = 「实测会被客户端回写的那一个入口」的下标。
+Qoder 是 `1`（2026-09-25 实测）；WorkBuddy 先填 `None` —— **没有实测依据就不加只读锁**，
+加锁会挡客户端更新器，代价是真实的。
+
+**为什么 `close_after: false` 是硬约束**：WorkBuddy 桌面端是用户**全天在用的主力工具**，
+绝不能像 Qoder 那样领完就关。
+
+### 四、⚠ 重启后的操作清单（给下一个我 —— 用户将**完全退出并重启 WorkBuddy**）
+
+> 前置认知：用户重启后主进程会带 `--remote-debugging-port=9336` 起来，
+> **但触发重启的那次会话会中断**，接手的是新会话。**先读本条，再动手。**
+
+1. **确认端口**：探 `http://127.0.0.1:9336/json/version`（注意 `qoder_cdp_probe.py` 读的是 qoder 配方，用它探 9336 会误导）。
+   **同时读回快捷方式参数**，确认未被客户端启动时回写：
+   `python tools/win_shortcut_args.py --list "%USERPROFILE%\Desktop"`
+   → 若被回写：把 `APPS["workbuddy"]["lock"]` 设为对应下标，重跑 `--app workbuddy`。
+2. **侦察真实 DOM**（**唯一还没做的关键情报**，`client:` 段那几个空字段全靠它）：
+   - `http://127.0.0.1:9336/json` 列全部 target → 定位主窗口 URL → 填 `target_match` / `main_target_match`
+   - 主窗口 dump 全部 `[aria-label]` → 找「打开用户菜单」那个 → 填 `open_entry_labels`
+   - 点开用户菜单 → 找 `.daily-checkin` 容器 → 取**领取按钮的真实文案或选择器** → 填 `claim_button`
+     ⚠ 按钮文案是**服务端下发**的（`claim_button_text`），**不要假设是「领取」**。
+   - 若文本匹配不可靠 → 给驱动加 `claim_button_selector`（按 `.daily-checkin` 容器定位）。
+     这属于 `client_claim.py` 的**通用能力增强**，不涉及产品名，符合分层约定。
+3. **补齐配方 → 切 `mode: client` → 补签今天**：`python -m checkin --now --only-site workbuddy`
+4. **双证据复核**：界面「已领取」/「已签到」+ 状态接口。
+
+### 五、待决点（重启后一并定）
+
+- **分支④的风险**：WorkBuddy 没在跑时驱动会**拉起整个 IDE**（重、几十秒、还弹窗）。
+  Qoder 无所谓（反正领完关掉），但对主力工具很扰人。
+  → 考虑给驱动加 `launch_if_missing: false`（没在跑就只提醒，不拉起）。
+- **分支①用不上**：`_log_state` 写死 `logs/<session>/main.log`，而 WorkBuddy 是
+  `%USERPROFILE%\.workbuddy\logs\<日期>\*MainThread*.log` → 自动返回 `None`，安全降级。
+  要不要适配，看后续值不值得。
+- **auto 模式去留**：client 跑通后，`%LOCALAPPDATA%\AgentCheckIn\chrome-profile` 那套是否留作兜底。
+
+---
+
 ## [2026-09-28 12:45] WorkBuddy(阿拾) —— Qoder `_open_entry()` **首考通过**；WorkBuddy 因**静默 need_login** 漏签（已补签，并补上提醒）。附**一次被证伪的推断与回退**
 
 **一句话**：Qoder 今天**全自动成功**，且昨天登记"未首考"的 `_open_entry()` 通过了；

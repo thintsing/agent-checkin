@@ -29,11 +29,18 @@ Electron 应用的调试端口**只能在启动时绑定**，运行中无法追�
 ----
     python tools/win_shortcut_args.py --list "<目录或 .lnk>"
     python tools/win_shortcut_args.py --set "<.lnk>" --arg "--foo=bar"
-    python tools/win_shortcut_args.py --qoder          # 给 Qoder CN 全部入口加调试端口
-    python tools/win_shortcut_args.py --qoder --revert # 从备份还原
+    python tools/win_shortcut_args.py --app qoder            # 给 Qoder CN 全部入口加调试端口
+    python tools/win_shortcut_args.py --app workbuddy        # 同上，WorkBuddy
+    python tools/win_shortcut_args.py --app qoder --revert   # 从备份还原
+    python tools/win_shortcut_args.py --qoder                # 等价 --app qoder（旧写法保留）
 
-端口不在这里定义 —— `--qoder` 写的端口来自 `recipes/qoder.yaml` 的
-`client.debug_port`（单一事实源）。换端口 = 改配方 → 重跑 `--qoder`。
+端口不在这里定义 —— 每个应用的端口来自**它自己的配方**（单一事实源）：
+`--app qoder` → `recipes/qoder.yaml`，`--app workbuddy` → `recipes/workbuddy.yaml`，
+都取 `client.debug_port`。换端口 = 改配方 → 重跑对应的 `--app`。
+
+为什么端口必须由配方单点定义：端口是**一次性资源**（2026-09-27 的 9334 就被
+已死进程的僵尸句柄占死，只能换）。换端口时若快捷方式与驱动各留一份旧值，
+就会出现"端口写着 A、驱动连 B"的静默失配 —— 实测踩过。
 """
 from __future__ import annotations
 
@@ -48,11 +55,47 @@ import uuid
 from ctypes import POINTER, WINFUNCTYPE, byref, c_int, c_long, c_void_p, c_wchar_p, wintypes
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RECIPE_FILE = os.path.join(PROJECT_ROOT, "recipes", "qoder.yaml")
+RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
+
+DEBUG_ARG_PREFIX = "--remote-debugging-port="
+
+# 每个应用一张表。加新应用 = 加一条表项，逻辑不动。
+#
+# `lock` = **实测**会被客户端自己回写（启动时重置成无参数版本）的那一个入口的下标。
+# 只有它需要只读保护。值为 None 表示"还没观察到回写，先不加锁"——
+# 加锁有代价（客户端更新器可能写不进去），没有实测依据就不要加。
+APPS = {
+    "qoder": {
+        "label": "Qoder CN",
+        "recipe": "qoder.yaml",
+        "lnks": [
+            r"%USERPROFILE%\Desktop\Qoder CN.lnk",
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Qoder CN.lnk",
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Qoder\Qoder CN.lnk",
+        ],
+        # 2026-09-25 实测：Qoder 启动时只回写这一个。
+        "lock": 1,
+    },
+    "workbuddy": {
+        "label": "WorkBuddy",
+        "recipe": "workbuddy.yaml",
+        "lnks": [
+            r"%USERPROFILE%\Desktop\WorkBuddy.lnk",
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\WorkBuddy.lnk",
+        ],
+        # 2026-10-06 实测记录：改完重启后**未被回写**（见 HANDOFF）。
+        "lock": None,
+    },
+}
+BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
 
 
-def recipe_debug_port(default: int = 9335) -> int:
-    """从 `recipes/qoder.yaml` 读 `client.debug_port`。
+def app_lnks(app: str) -> list:
+    return [os.path.expandvars(p) for p in APPS[app]["lnks"]]
+
+
+def recipe_debug_port(app: str, default: int = 9335) -> int:
+    """从该应用的配方读 `client.debug_port`。
 
     端口是**跨进程契约**：快捷方式写进去的、和驱动要连的必须是同一个值。
     两处各硬编码一份迟早漂移（本项目已因"同一结论两处写法"踩过坑），
@@ -60,8 +103,9 @@ def recipe_debug_port(default: int = 9335) -> int:
 
     刻意不引 yaml 依赖（本工具的设计目标之一是零依赖），够用的最小解析即可。
     """
+    path = os.path.join(RECIPES_DIR, APPS[app]["recipe"])
     try:
-        with open(RECIPE_FILE, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             for line in fh:
                 s = line.split("#", 1)[0].strip()
                 if s.startswith("debug_port:"):
@@ -71,17 +115,8 @@ def recipe_debug_port(default: int = 9335) -> int:
     return default
 
 
-QODER_ARG = f"--remote-debugging-port={recipe_debug_port()}"
-QODER_LNKS = [
-    os.path.expandvars(r"%USERPROFILE%\Desktop\Qoder CN.lnk"),
-    os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Qoder CN.lnk"),
-    os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Qoder\Qoder CN.lnk"),
-]
-BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
-
-# 实测（2026-09-25）：Qoder 启动时会把**这一个**回写成"无参数"版本，另两个不会。
-# 只有第一次启动带得上参数，之后就被静默回滚 —— 所以必须给它加只读保护。
-QODER_LOCK = QODER_LNKS[1]
+def app_arg(app: str) -> str:
+    return f"{DEBUG_ARG_PREFIX}{recipe_debug_port(app)}"
 
 
 # --------------------------------------------------------------------- COM
@@ -184,7 +219,7 @@ def do_list(paths) -> int:
         except Exception as e:
             print(f"  (读取失败 {e}) {lnk}")
             continue
-        mark = "  ← 已带调试端口" if QODER_ARG in args else ""
+        mark = "  ← 已带调试端口" if DEBUG_ARG_PREFIX in args else ""
         print(f"  {lnk}\n      Arguments = [{args}]{mark}")
     return 0
 
@@ -238,8 +273,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Windows 快捷方式参数管理")
     ap.add_argument("--list", nargs="*", metavar="PATH", help="列出快捷方式及其参数")
     ap.add_argument("--set", metavar="LNK", help="目标快捷方式")
-    ap.add_argument("--arg", default=QODER_ARG, help=f"要写入的参数（默认 {QODER_ARG}）")
-    ap.add_argument("--qoder", action="store_true", help="处理 Qoder CN 全部启动入口")
+    ap.add_argument("--arg", default=None,
+                    help="要写入的参数（缺省 = 按 --app 从该应用的配方读端口）")
+    ap.add_argument("--app", choices=sorted(APPS), help="处理该应用的全部启动入口")
+    ap.add_argument("--qoder", action="store_true",
+                    help="等价于 --app qoder（旧写法，保留兼容）")
     ap.add_argument("--revert", action="store_true", help="从备份还原")
     ap.add_argument("--backup-dir", default=BACKUP_DIR)
     a = ap.parse_args()
@@ -249,21 +287,27 @@ def main() -> int:
         return 3
     print("自检通过（Load 槽位正确）\n")
 
-    if a.qoder:
-        targets = [p for p in QODER_LNKS if os.path.exists(p)]
-        if not targets:
-            print("未找到 Qoder 快捷方式")
+    app = a.app or ("qoder" if a.qoder else None)
+    if app:
+        lnks = app_lnks(app)
+        arg = a.arg or app_arg(app)
+        lock_idx = APPS[app]["lock"]
+        if not any(os.path.exists(p) for p in lnks):
+            print(f"未找到 {APPS[app]['label']} 快捷方式")
             return 2
-        for t in targets:
+        print(f"应用 {APPS[app]['label']} | 写入参数 {arg}\n")
+        for i, t in enumerate(lnks):
+            if not os.path.exists(t):
+                continue
             if a.revert:
                 do_revert(t, a.backup_dir)
             else:
-                do_set(t, QODER_ARG, a.backup_dir, lock=(t == QODER_LOCK))
+                do_set(t, arg, a.backup_dir, lock=(lock_idx is not None and i == lock_idx))
         return 0
     if a.revert and a.set:
         return do_revert(a.set, a.backup_dir)
     if a.set:
-        return do_set(a.set, a.arg, a.backup_dir)
+        return do_set(a.set, a.arg or app_arg("qoder"), a.backup_dir)
     if a.list is not None:
         return do_list(a.list or [os.path.expandvars(r"%USERPROFILE%\Desktop")])
     ap.print_help()
