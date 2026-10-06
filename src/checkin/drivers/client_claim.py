@@ -197,6 +197,13 @@ class ClientDriver(Driver):
 
     def _claim(self, recipe: Recipe, c: Dict[str, Any], port: int, match: str) -> CheckinResult:
         sid = recipe.id
+        # 两条路可选，由配方决定：
+        #   bridge  —— 在页面上下文里执行配方给的 JS 表达式，**直接调客户端自己的接口**；
+        #   DOM     —— 找 target、找按钮、发事件序列（Qoder 走这条）。
+        # bridge 更稳：不依赖 UI 是否渲染、不受 shadow DOM / 服务端下发文案变化影响。
+        bridge = c.get("bridge")
+        if isinstance(bridge, dict) and bridge.get("status_js"):
+            return self._claim_via_bridge(recipe, c, port, match, bridge)
         find, click, markers = self._js(c)
 
         tgt = self._wait_target(port, match, int(c.get("target_timeout_sec", 25)))
@@ -263,6 +270,145 @@ class ClientDriver(Driver):
                                  detail=detail)
         finally:
             page.close()
+
+    # ------------------------------------------------------------ bridge 路径
+
+    _BRIDGE_SLOT = "__ck_bridge_result"
+
+    def _claim_via_bridge(self, recipe: Recipe, c: Dict[str, Any], port: int,
+                          match: str, bridge: Dict[str, Any]) -> CheckinResult:
+        """在客户端页面上下文里执行配方给的表达式，直接调它自己的接口完成签到。
+
+        为什么不点 UI（2026-10-06 WorkBuddy 实测后的选择）：
+        签到横幅（`.daily-checkin--menu-banner`）是**按需渲染**的 —— 只有服务端下发
+        banner 数据时才挂载。实测当天「今日已签」时它根本没渲染，菜单里只剩两个跳转入口，
+        "找按钮再点"这条路**无从下手**；而客户端自己的 http 通道始终在，且与客户端
+        签到走的是**同一条路**（客户端日志实证：`[TuringSdk] check-in outgoing
+        path=/v2/billing/meter/daily-checkin hasToken=true`）。对它来说 bridge 才是主路径。
+
+        判定**完全复用**配方的 verdict（code 规则 + result_flag 业务词表），
+        驱动不认识任何产品名 —— 表达式内容属于站点知识，写在配方里。
+        """
+        sid = recipe.id
+        timeout = int(c.get("bridge_timeout_sec", 25))
+
+        tgt = self._wait_target(port, match, int(c.get("target_timeout_sec", 25)))
+        if tgt is None:
+            return CheckinResult(sid, Outcome.NO_ACTION,
+                                 message="客户端主窗口未出现（target_match 未命中）",
+                                 detail={"target_match": match})
+        page = CDPPage(tgt["webSocketDebuggerUrl"])
+        try:
+            page.wake()
+            # 1) 先只读取状态 —— 已签就收手，绝不重复调 trigger。
+            st = self._bridge_call(page, str(bridge["status_js"]), timeout)
+            if st is None:
+                return CheckinResult(sid, Outcome.ERROR,
+                                     message="客户端 bridge 无响应（status 超时或表达式异常）")
+            sdata = st.get("data") if isinstance(st.get("data"), dict) else {}
+            if recipe.verdict.already_checked_in(sdata):
+                return CheckinResult(sid, Outcome.ALREADY,
+                                     message="今日已签到（客户端 bridge 状态）",
+                                     detail={"source": "client_bridge",
+                                             "streak_days": sdata.get("streak_days")})
+
+            claim_js = bridge.get("claim_js")
+            if not claim_js:
+                return CheckinResult(sid, recipe.verdict.map(None, st.get("code")),
+                                     message="bridge 仅配置了 status（code=%s）" % st.get("code"),
+                                     detail={"source": "client_bridge"})
+
+            # 2) 领取
+            cl = self._bridge_call(page, str(claim_js), timeout)
+            if cl is None:
+                return CheckinResult(sid, Outcome.ERROR,
+                                     message="客户端 bridge 无响应（claim 超时或表达式异常）")
+            cdata = cl.get("data") if isinstance(cl.get("data"), dict) else {}
+            outcome = (recipe.verdict.map_flags(cdata)
+                       or recipe.verdict.map(None, cl.get("code")))
+
+            # 3) 复核：只有**再读一次 status 确认已签**，才敢把 success 说出口。
+            #    trigger 的响应体格式若将来变了（服务端改字段），这里能兜住 ——
+            #    宁可多一次只读调用，也不要报一个没有证据的"成功"。
+            if outcome == Outcome.SUCCESS:
+                st2 = self._bridge_call(page, str(bridge["status_js"]), timeout)
+                d2 = (st2 or {}).get("data")
+                if not recipe.verdict.already_checked_in(d2 if isinstance(d2, dict) else {}):
+                    log.warning("[%s] claim 报成功但复核未确认已签，降级为 no_action", sid)
+                    outcome = Outcome.NO_ACTION
+
+            detail = {"source": "client_bridge", "claim_code": cl.get("code"),
+                      "claim_status": cdata.get("status")}
+            zh = {Outcome.SUCCESS: "已领取", Outcome.ALREADY: "本窗口已领取"}.get(outcome)
+            msg = ("%s（客户端 bridge）" % zh if zh
+                   else "客户端 bridge 返回未判定结果（code=%s）" % cl.get("code"))
+            return CheckinResult(sid, outcome, message=msg, detail=detail)
+        finally:
+            page.close()
+
+    @classmethod
+    def _bridge_call(cls, page: CDPPage, expr: str, timeout: int) -> Optional[Dict[str, Any]]:
+        """执行配方给的 JS 表达式并取回它 resolve 出来的 JSON。
+
+        为什么不用 `evaluate(..., await_promise=True)`（2026-10-06 实测）：
+        桥上抛出的异常会让 CDP 只回一个 `exceptionDetails.text="Uncaught"`，连原始
+        message 都拿不到；而一旦 Promise 永不 resolve（页面被冻结的经典症状），
+        整条 WebSocket 读会一直卡住。改成"kick + 轮询全局槽位"：
+          · kick 立刻返回，不阻塞；
+          · 表达式自身的异常在页面里被 try/catch 抓住 → 带上真实 message 回传；
+          · 轮询有 deadline，超时可控，不会把连接拖死。
+
+        注意：kick 模板用**字符串拼接**而不是 f-string —— 表达式里天然含 `{}`
+        （如 `post(path, {})`），f-string 会把它们当占位符直接报错。
+        """
+        slot = cls._BRIDGE_SLOT
+        kick = (
+            "window." + slot + " = {pending: true};\n"
+            "(async () => {\n"
+            "  try { window." + slot + " = {value: await (\n"
+            + expr + "\n)}; }\n"
+            "  catch (e) { window." + slot + " = {error: String((e && e.message) || e)}; }\n"
+            "})();\n"
+            "'started'"
+        )
+        try:
+            page.evaluate(kick, await_promise=False)
+        except Exception as e:                                  # noqa: BLE001
+            log.warning("bridge kick 失败：%s", e)
+            return None
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.35)
+            try:
+                raw = page.evaluate("JSON.stringify(window." + slot + ")",
+                                    await_promise=False)
+            except Exception as e:                              # noqa: BLE001
+                log.debug("bridge 轮询失败：%s", e)
+                continue
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(obj, dict) or obj.get("pending"):
+                continue
+            if "error" in obj:
+                log.warning("bridge 表达式异常：%s", obj["error"])
+                return None
+            val = obj.get("value")
+            if isinstance(val, dict):
+                return val
+            if isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                except ValueError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+            return None
+        log.warning("bridge 表达式超时（%ss）", timeout)
+        return None
 
     # ------------------------------------------------------------ 状态探测
 

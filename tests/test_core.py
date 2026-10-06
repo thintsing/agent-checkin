@@ -1355,5 +1355,187 @@ class TestTaskInstall(unittest.TestCase):
         self.assertIn("Unregister-ScheduledTask", s)
 
 
+class TestClientBridge(unittest.TestCase):
+    """client 驱动的 bridge 路径（2026-10-06 新增）。
+
+    背景：客户端内签到有两条件 —— 点 UI 按钮（DOM）或**直接调客户端自己的接口**
+    （bridge）。后者不依赖 UI 渲染，是 WorkBuddy 的主路径（它的签到横幅是按需渲染的，
+    已签时压根不挂载，"找按钮"无从下手）。
+    """
+
+    def _recipe(self, **client_over):
+        from checkin.core.models import Recipe
+        client = {
+            "debug_port": 1,
+            "bridge": {"status_js": "S()", "claim_js": "C()"},
+        }
+        client.update(client_over)
+        return Recipe.from_dict({
+            "id": "t", "name": "T", "mode": "client",
+            "verdict": {
+                "transport": "body_code",
+                "rules": [{"code": 0, "result": "success"},
+                          {"code": 10001, "result": "already"}],
+                "http_401_result": "need_login",
+                "unknown_result": "no_action",
+                "checked_in_flag": "today_checked_in",
+                "result_flag": "status",
+                "result_map": {"claimed": "success", "already_claimed": "already"},
+            },
+            "client": client,
+        })
+
+    def _driver(self):
+        from checkin.drivers.client_claim import ClientDriver
+        return ClientDriver()
+
+    def _patch(self, resolver):
+        """接住 target/页面，把 bridge 的返回交给 resolver(expr)。"""
+        from checkin.drivers.client_claim import ClientDriver
+        calls = []
+        seen = {}
+
+        def fake_call(page, expr, timeout):
+            calls.append(expr)
+            return resolver(expr)
+
+        class FakePage:
+            def wake(self): pass
+            def close(self): pass
+
+        patchers = [
+            mock.patch.object(ClientDriver, "_wait_target",
+                              return_value={"webSocketDebuggerUrl": "ws://x"}),
+            mock.patch.object(ClientDriver, "_bridge_call", side_effect=fake_call),
+            mock.patch("checkin.drivers.client_claim.CDPPage",
+                       side_effect=lambda url: FakePage()),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        return calls, seen
+
+    # ---------------------------------------------------------------- 关键守卫
+
+    def test_already_skips_claim(self):
+        """今日已签 ⇒ **绝不调 claim**。
+
+        这是整条路径最要紧的守卫：签到接口不是幂等查询，多调一次就是"多领一次"
+        的语义风险。先读 status 再决定，就是为了让这条路径在已签时零副作用。
+        """
+        from checkin.core.models import Outcome
+        calls, _ = self._patch(lambda e: {"code": 0, "data": {"today_checked_in": True,
+                                                              "streak_days": 7}})
+        r = self._recipe()
+        res = self._driver()._claim_via_bridge(r, r.client, 1, "m", r.client["bridge"])
+        self.assertEqual(res.outcome, Outcome.ALREADY)
+        self.assertEqual(calls, ["S()"], "已签时只该读 status，不得触碰 claim")
+
+    def test_success_needs_confirmation(self):
+        """claim 报成功、但复核 status 仍显示未签 ⇒ 降级为 no_action。
+
+        trigger 的响应体格式若将来变了（服务端改字段），不能被它牵着报"成功" ——
+        宁可报"没把握"，也不要报一个没有证据的假成功。
+        """
+        from checkin.core.models import Outcome
+        seq = [{"code": 0, "data": {"today_checked_in": False}},   # status：未签
+               {"code": 0, "data": {"status": "claimed"}},         # claim：报成功
+               {"code": 0, "data": {"today_checked_in": False}}]   # 复核：仍未签 → 不信
+        it = iter(seq)
+        self._patch(lambda e: next(it))
+        r = self._recipe()
+        res = self._driver()._claim_via_bridge(r, r.client, 1, "m", r.client["bridge"])
+        self.assertEqual(res.outcome, Outcome.NO_ACTION)
+
+    def test_success_confirmed(self):
+        """claim 报成功 + 复核确认已签 ⇒ success。"""
+        from checkin.core.models import Outcome
+        seq = [{"code": 0, "data": {"today_checked_in": False}},
+               {"code": 0, "data": {"status": "claimed"}},
+               {"code": 0, "data": {"today_checked_in": True}}]
+        it = iter(seq)
+        self._patch(lambda e: next(it))
+        r = self._recipe()
+        res = self._driver()._claim_via_bridge(r, r.client, 1, "m", r.client["bridge"])
+        self.assertEqual(res.outcome, Outcome.SUCCESS)
+
+    def test_status_timeout_is_error_not_success(self):
+        """status 无响应（超时/表达式异常）⇒ ERROR。**绝不能默认成成功。**"""
+        from checkin.core.models import Outcome
+        self._patch(lambda e: None)
+        r = self._recipe()
+        res = self._driver()._claim_via_bridge(r, r.client, 1, "m", r.client["bridge"])
+        self.assertEqual(res.outcome, Outcome.ERROR)
+
+    def test_route_prefers_bridge(self):
+        """配方带 bridge ⇒ `_claim` 走 bridge 分支，不去找 DOM。"""
+        from checkin.drivers.client_claim import ClientDriver
+        r = self._recipe()
+        with mock.patch.object(ClientDriver, "_claim_via_bridge",
+                               return_value="BRIDGE") as m:
+            out = self._driver()._claim(r, r.client, 1, "m")
+        self.assertEqual(out, "BRIDGE")
+        m.assert_called_once()
+
+    def test_route_falls_back_to_dom(self):
+        """配方没有 bridge ⇒ 仍走原来的 DOM 路径（不破坏 Qoder）。"""
+        from checkin.drivers.client_claim import ClientDriver
+        r = self._recipe()
+        r.client.pop("bridge")
+        with mock.patch.object(ClientDriver, "_wait_target", return_value=None), \
+             mock.patch.object(ClientDriver, "_log_state", return_value=None):
+            out = self._driver()._claim(r, r.client, 1, "m")
+        self.assertEqual(out.outcome.value, "no_action")
+
+    # ---------------------------------------------------------------- 执行层
+
+    def test_kick_template_survives_braces(self):
+        """表达式里的 `{}` 必须原样送达页面。
+
+        守住一个真实踩点：kick 模板若用 f-string 拼，`post(path, {})` 里的花括号
+        会被当成占位符 → 直接抛异常，整条路径静默失效。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+        seen = []
+
+        class FakePage:
+            def evaluate(self, expr, await_promise=True):
+                seen.append(expr)
+                return "started"
+
+        ClientDriver._bridge_call(FakePage(), "post('/x', {a: 1})", timeout=0.3)
+        self.assertIn("post('/x', {a: 1})", seen[0])
+
+    def test_bridge_call_unwraps_json_string(self):
+        """页面回传的 value 是 JSON 字符串（returnByValue 最稳的形态），要能解开。"""
+        from checkin.drivers.client_claim import ClientDriver
+        payload = '{"code": 0, "data": {"today_checked_in": true}}'
+        state = {"n": 0}
+
+        class FakePage:
+            def evaluate(self, expr, await_promise=True):
+                state["n"] += 1
+                if state["n"] == 1:
+                    return "started"
+                return json.dumps({"value": payload})
+
+        out = ClientDriver._bridge_call(FakePage(), "S()", timeout=5)
+        self.assertEqual(out, {"code": 0, "data": {"today_checked_in": True}})
+
+    def test_bridge_call_reports_page_error(self):
+        """页面异常要带回**真实 message**，并在驱动侧表现为 None（而不是假数据）。"""
+        from checkin.drivers.client_claim import ClientDriver
+        state = {"n": 0}
+
+        class FakePage:
+            def evaluate(self, expr, await_promise=True):
+                state["n"] += 1
+                if state["n"] == 1:
+                    return "started"
+                return json.dumps({"error": "Cannot read properties of undefined"})
+
+        self.assertIsNone(ClientDriver._bridge_call(FakePage(), "S()", timeout=5))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

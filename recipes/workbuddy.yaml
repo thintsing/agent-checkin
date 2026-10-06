@@ -16,7 +16,7 @@
 id: workbuddy
 name: WorkBuddy 每日签到
 enabled: true
-mode: auto            # auto | manual | disabled
+mode: client          # auto | manual | client | disabled
 
 origin: https://www.codebuddy.cn
 
@@ -112,18 +112,35 @@ client:
   # VSCode 系客户端启动慢，给足时间（Qoder 是 60s）
   launch_timeout_sec: 90
   target_timeout_sec: 30
-  # ---- 待实测：首次接管时侦察后填 ----
-  # 签到横幅在**主窗口**里（没有 Qoder 那种独立活动 OAFIF），
-  # 所以 target_match 与 main_target_match 预计指向同一个主窗口 URL。
-  target_match: ''
-  main_target_match: ''
-  # 按钮文案由**服务端下发**（`claim_button_text`），不能假设固定值；
-  # 实测出真实文案后填这里，或改为按容器 `.daily-checkin` 定位。
+  # 主窗口 URL 实测为 `.../app.asar/renderer/index.html?locale=zh-CN&accountSnapshot=...`
+  # （2026-10-06 挂上 9336 后读到）。跟 Qoder 一样是 `renderer/index.html` ——
+  # 这台机器上两个客户端同壳，纯属巧合，但匹配串要保持宽松（只认文件名部分）。
+  target_match: 'renderer/index.html'
+  main_target_match: 'renderer/index.html'
+  # 按钮文案由**服务端下发**（实测字段 `claim_button_text`，当前值「立即领取」），
+  # 但下面走 bridge 直接调接口，不依赖 UI 渲染 —— 这几个 DOM 字段只是保留给
+  # "bridge 不可用时回退点 UI"的将来用，当前为空无妨。
   claim_button: ''
   claimed_markers: ['已领取', '领取成功']
-  open_entry_labels: []      # 待实测：点开用户菜单的 aria-label 序列
+  open_entry_labels: []      # 入口按钮实测**无 aria-label**（是 button.user-menu-trigger），故留空
   entry_delay_sec: 1.5
   entry_timeout_sec: 20
   # 日志结构是 `logs\<日期>\*MainThread*.log`，与 Qoder 的 `logs\<session>\main.log`
   # 不同 ⇒ 分支①的"零打扰预检"会自动跳过（_log_state 返回 None），不影响主流程。
   data_dir: ''
+  # ---- bridge：不点 DOM，直接用客户端自己的 http 通道调接口 ----
+  # 这是 2026-10-06 实测确定的主路径（证据见 HANDOFF 当日条目）：
+  #   · 客户端内部有 `window.wb.http`（get/post/put/patch/delete），
+  #     每次请求由主进程注入 Bearer token（客户端日志：`hasToken=true tokenLength=1034`）。
+  #   · 走 `/v2` 前缀 = 桌面端路径（Desktop 覆盖了 billingPrefix），**与客户端自己签到
+  #     用的是同一条路** —— 客户端日志实证：
+  #       `[AuthService] [TuringSdk] check-in outgoing path=/v2/billing/meter/daily-checkin`
+  #     ⇒ 同一个接口、同一份奖励，不存在"绕过"或"伪造"。
+  #   · 不依赖 UI 是否渲染、不受 shadow DOM 与服务端下发文案变化影响，比点按钮稳。
+  # 表达式**必须返回 JSON 字符串**（跨 CDP 边界用 returnByValue，字符串最稳），
+  # 且抛错要能被 CDP 侧看见真实 message —— 驱动用"kick + 轮询"执行，详见
+  # `ClientDriver._bridge_call`。
+  # 脚本内容属于**站点知识**（含产品名），所以放配方；驱动侧不含任何产品名。
+  bridge:
+    status_js: "(async () => JSON.stringify(await window.wb.http.post('/v2/billing/meter/checkin-activity-status', {})))()"
+    claim_js: "(async () => JSON.stringify(await window.wb.http.post('/v2/billing/meter/daily-checkin', {})))()"

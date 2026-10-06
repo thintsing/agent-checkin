@@ -7,6 +7,105 @@
 
 ---
 
+## [2026-10-06 15:25] WorkBuddy(阿拾) —— WorkBuddy **已切 client 模式并首考通过**；找到真正的主路径 `window.wb.http`（**不点 DOM，直接调客户端接口**）
+
+**一句话**：用户重启 WorkBuddy 后 9336 就绪。实测推翻了上一轮的假设 —— 正确接法**不是"点签到按钮"**
+（横幅按需渲染，已签时压根不挂载），而是**在页面上下文调客户端自己的 `window.wb.http`**。
+`mode` 已切 `client`，首次真实运行 2 秒返回 `already`，153 项测试全绿。
+
+### 一、今天的实况：**客户端自己把签到做了**
+
+用户 15:13 报"重启了"。客户端主日志
+（`%USERPROFILE%\.workbuddy\logs\2026-10-06\workbuddyMainThread__*.log`）：
+
+```
+14:57:48 [AuthService] [TuringSdk] check-in outgoing path=/v2/billing/meter/checkin-activity-status hasToken=true tokenLength=1034
+14:59:23 [AuthService] [TuringSdk] check-in outgoing path=/v2/billing/meter/daily-checkin     hasToken=true tokenLength=1034
+14:59:24 [AuthService] [TuringSdk] check-in outgoing path=/v2/billing/meter/checkin-activity-status hasToken=true
+```
+
+⇒ **10:46 网页端 401 漏签的那次，被客户端在 14:59 补上了**（启动即签）。
+bridge 只读复核（今天实测原始响应）：
+
+```
+code=0  active=true  today_checked_in=true  streak_days=7  today_credit=100  total_credits=700
+checkin_dates=[2026-10-06, ..., 2026-09-30]   season=10   theme_name=Buddy加油站
+claim_button_text="立即领取"   end_time="2026-10-15 23:59:59"
+```
+
+### 二、⚠ 推翻我上一轮的假设：**不是"点按钮"，是"调接口"**
+
+上一轮我按 asar 里的 `.daily-checkin--menu-banner` 推断"横幅挂在用户菜单里，去点它"。挂上 9336 后实测：
+
+- 用户菜单能开（`button.user-menu-trigger--workbuddy`，**无 aria-label**），但菜单里**没有签到横幅**，
+  只有两个跳转入口：`.wb-slot--menu-signin` → "Buddy加油站" / "去邀约"；
+  `.wb-slot--menu-growth-content` → "成长计划 / 连登抽取 Buddy 周边"。
+- 两个 slot 的内容都在 **shadow DOM** 里 —— `document.querySelectorAll('.daily-checkin*')` **恒为空**，
+  必须穿透 `shadowRoot` 才拿得到。
+- 横幅不渲染的原因：**今天已签** ⇒ 服务端不下发 banner ⇒ 组件不挂载。
+  ⇒ **"找按钮再点"在已签时无从下手、只有首签那一次存在 —— 属于不可依赖的路径。**
+
+**真正的通路**：渲染进程暴露了 `window.wb`（bridge），其中有
+
+```js
+window.wb.http = {get, post, put, patch, delete, upload, download}   // async post(e,n,r)
+```
+
+由主进程注入 Bearer token；配 `/v2` 前缀（桌面端 billingPrefix）—— 与客户端自己签到**同一条路**。
+
+> 这不叫"绕过"：同一个接口、同一份奖励、同一个 token 来源，我们只是**借客户端的手**。
+> 红线（不读 `auth.*`、不复制设备身份）一条未碰。
+
+### 三、本轮改动（3 处，`unittest discover -s tests` **153 项全绿**）
+
+| 文件 | 改动 |
+|---|---|
+| `src/checkin/drivers/client_claim.py` | 新增 `_claim_via_bridge()` + `_bridge_call()`；`_claim()` 入口按配方分流（有 `bridge` 走 bridge，无则原 DOM 路径） |
+| `recipes/workbuddy.yaml` | `mode: auto → client`；`target_match` / `main_target_match` = `renderer/index.html`；新增 `bridge` 段（`status_js` / `claim_js`） |
+| `tests/test_core.py` | 新增 `TestClientBridge` 9 条 |
+
+**两个设计要点（都不是随手写的）**：
+
+1. **`_bridge_call` 用"kick + 轮询全局槽位"，**不用** `await_promise=True`。**
+   实测后者：① 页面异常被 CDP 压成 `exceptionDetails.text="Uncaught"`，拿不到真实 message；
+   ② Promise 若不 resolve（页面冻结的经典症状），整条 WebSocket 读会卡死。
+   ⚠ kick 模板**必须字符串拼接**，不能 f-string —— 表达式里天然含 `{}`（如 `post(p, {})`），
+   f-string 会把它们当占位符直接抛错。`test_kick_template_survives_braces` 守这条。
+2. **已签时绝不调 claim；claim 报成功必须复核。**
+   先读 status，`today_checked_in: true` 就收手（零副作用）；claim 之后再读一次 status 确认，
+   才敢把 success 说出口 —— trigger 响应格式将来变了也能兜住。
+   `test_already_skips_claim` / `test_success_needs_confirmation` 守这两条。
+
+### 四、首考结果
+
+```
+15:17:38 [workbuddy] 调试端口 9336 已就绪，直接接管
+15:17:39 [workbuddy] => already | 今日已签到（客户端 bridge 状态）
+```
+
+走 ② 分支 → bridge → status → `already`，**全程未调 claim，零副作用**。
+（今天已签，故 `claim_js` 这段**仍未验证过** —— 明天开窗后首次走它。）
+
+### 五、待决点
+
+- **`claim_js` 响应格式未知**：今天的 100 积分是客户端自己签的，没机会真跑一次 trigger。
+  驱动已 fail-safe（不认识 → `no_action` + 复核兜底），仍建议明天看一次日志。
+- **auto 模式去留**：workbuddy 已切 client，网页侧专用浏览器（9333 + `%LOCALAPPDATA%\AgentCheckIn\chrome-profile`）
+  现在**没有站点在用**。保留作兜底还是停用，等观察几天再定（**不删**）。
+- **分支③的隐患**：WorkBuddy 常开但**没带端口**时（用户从别处启动 / 客户端自更新丢了参数），
+  驱动会降级为提醒 —— 这是"重启后才生效"的代价，属已知。
+- **客户端自更新会重置快捷方式参数**：升级后需重跑 `python tools/win_shortcut_args.py --app workbuddy`。
+
+### 六、给下一个我（侦察姿势）
+
+- **`document.querySelectorAll` 看不到 shadow DOM**：`wb-slot--menu-signin` / `wb-slot--menu-growth-content`
+  的内容必须穿透 `shadowRoot` 才拿得到。
+- 用户菜单入口 `button.user-menu-trigger--workbuddy` **没有 aria-label**，且是 **toggle**
+  （点一次开、再点关）—— 要再打开必须先判断当前是否已开。
+- `tools/qoder_cdp_probe.py` 只认 Qoder 配方，探 WorkBuddy 别用它，直接打 `http://127.0.0.1:9336/json`。
+
+---
+
 ## [2026-10-06 15:20] WorkBuddy(阿拾) —— 为 WorkBuddy **预置 client 模式**（快捷方式已带 9336）；快捷方式工具从「Qoder 专用」泛化为「按应用配置表」
 
 **一句话**：今天 WorkBuddy **又 401**（09-28 重登 → 10-06 失效，**正好 8 天**，7 天 cookie 周期精确复现）。
