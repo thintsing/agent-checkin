@@ -1537,5 +1537,180 @@ class TestClientBridge(unittest.TestCase):
         self.assertIsNone(ClientDriver._bridge_call(FakePage(), "S()", timeout=5))
 
 
+class TestClientStaleSnapshot(unittest.TestCase):
+    """活动页**快照陈旧**造成的静默漏签（2026-10-06 新增）。
+
+    背景：客户端的活动 Surface 一旦被打开就会一直留着 —— 驱动只断 WebSocket
+    （`page.close()`），从不关闭那个 UI。于是它的 DOM 停在**打开那一刻**。
+    跨天后服务端已刷新到新窗口，页面却不会自动重载，于是
+    "找不到按钮 + 页面含『已领取』"这条判定把「今天其实可领」误判成「今天已领」，
+    记为 ALREADY —— 不报错、不提醒，**静默漏签一整天**。
+
+    铁证：当日 10:45:17 驱动报 already（"端口就绪 → 出结论"只隔 **34 毫秒**，
+    说明命中的是**早已存在**的 iframe），而客户端日志 02:44:51Z 起 `claimable`
+    一直是 `true`，直到 15:31 手动领取后才转 `false`。
+    """
+
+    def _driver(self):
+        from checkin.drivers.client_claim import ClientDriver
+        return ClientDriver()
+
+    def _recipe(self):
+        from checkin.core.models import Recipe
+        return Recipe.from_dict({
+            "id": "t", "name": "T", "mode": "client",
+            "client": {"debug_port": 1, "claim_button": "领取",
+                       "claimed_markers": ["已领取", "领取成功"],
+                       "target_match": "activity-iframe"},
+        })
+
+    def _patch(self, snaps, reload_ok=True):
+        """把 `evaluate(find)` 依次接到 snaps 上（用尽后重复最后一个）。
+
+        返回 state：记录 reload 次数、点击次数，以及驱动是否真的走到了领取。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+        state = {"i": 0, "reloads": 0, "clicks": 0, "reads": 0}
+
+        class FakePage:
+            def wake(self): pass
+            def close(self): pass
+            def reload(self, wait_sec=0.0):
+                state["reloads"] += 1
+                return reload_ok
+            def evaluate(self, expr, await_promise=True):
+                if "pointerdown" in expr:          # 领取用的点击脚本
+                    state["clicks"] += 1
+                    return "dispatched"
+                state["reads"] += 1
+                i = min(state["i"], len(snaps) - 1)
+                state["i"] += 1
+                return snaps[i]
+
+        patchers = [
+            mock.patch.object(ClientDriver, "_wait_target",
+                              return_value={"webSocketDebuggerUrl": "ws://x"}),
+            mock.patch.object(ClientDriver, "_STALE_RECHECK_SEC", 0.05),
+            mock.patch.object(ClientDriver, "_STALE_RELOAD_WAIT", 0.0),
+            mock.patch("checkin.drivers.client_claim.time.sleep"),
+            mock.patch("checkin.drivers.client_claim.CDPPage",
+                       side_effect=lambda url: FakePage()),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        return state
+
+    def _run(self):
+        from checkin.drivers.client_claim import ClientDriver
+        r = self._recipe()
+        return ClientDriver()._claim(r, r.client, 1, "activity-iframe")
+
+    # ------------------------------------------------------------- 判据本身
+
+    def test_claimable_truth_table(self):
+        """「能领」只取决于**按钮本身**；页面文本不参与。
+
+        页面文本是渲染快照，可能跨天陈旧 —— 拿它当判据正是本次事故的成因。
+        """
+        from checkin.drivers.client_claim import _claimable
+        self.assertTrue(_claimable({"found": True, "disabled": False}))
+        self.assertFalse(_claimable({"found": True, "disabled": True}))
+        self.assertFalse(_claimable({"found": False, "disabled": None}))
+        self.assertFalse(_claimable({}))
+
+    # ------------------------------------------------------------- 核心回归
+
+    def test_stale_snapshot_is_reloaded_then_claimed(self):
+        """陈旧快照（写着"已领取"）重载后露出按钮 ⇒ 必须继续领取，**不能报 already**。
+
+        这是本次修复的主守卫：漏签一整天，代价是 100 Credits。
+        """
+        from checkin.core.models import Outcome
+        snaps = [
+            {"found": False, "body": "专属活动权益\n已领取\n"},          # 昨天的残留 DOM
+            {"found": True, "disabled": False, "body": "领取\n"},        # 重载后：可领
+            {"found": False, "body": "领取成功，Credits 已到账\n已领取"},  # 点击后
+        ]
+        state = self._patch(snaps)
+        self.assertEqual(self._run().outcome, Outcome.SUCCESS)
+        self.assertEqual(state["reloads"], 1, "陈旧候选必须触发一次重载复核")
+        self.assertEqual(state["clicks"], 1, "复核通过后必须真的点下去")
+
+    def test_genuinely_claimed_stays_already_and_never_clicks(self):
+        """真已领取：重载后依旧没有按钮 ⇒ ALREADY，且**绝不点击**。
+
+        复核不能把"已领取"变成"重复领取" —— 签到接口不是幂等查询。
+        """
+        from checkin.core.models import Outcome
+        stale = {"found": False, "ready": True, "body": "专属活动权益\n已领取\n"}
+        state = self._patch([stale])          # 重载后仍是这一份
+        self.assertEqual(self._run().outcome, Outcome.ALREADY)
+        self.assertEqual(state["clicks"], 0, "已领取时绝不能点")
+        self.assertGreaterEqual(state["reloads"], 1)
+
+    def test_ready_without_button_stops_immediately(self):
+        """重载后页面**已加载完**（readyState=complete）却没有按钮 ⇒ 立刻收手。
+
+        少了这条判据，"今天确实已领"这种**常态**每天都要白等满 `_STALE_RECHECK_SEC`。
+        用"读取次数"而非墙钟计时来断言 —— 测试里 sleep 是被 patch 掉的。
+        """
+        from checkin.core.models import Outcome
+        state = self._patch([{"found": False, "ready": True, "body": "已领取"}])
+        self.assertEqual(self._run().outcome, Outcome.ALREADY)
+        self.assertEqual(state["reads"], 2, "初次 1 次 + 重载后 1 次，之后应立刻收手")
+
+    def test_not_ready_keeps_polling_until_button_appears(self):
+        """页面**还没加载完**时必须继续轮询 —— 提前收手会把"慢"误判成"已领"。"""
+        from checkin.core.models import Outcome
+        snaps = [
+            {"found": False, "ready": False, "body": ""},              # 初次：页面在白屏
+            {"found": False, "ready": False, "body": "加载中"},         # 重载后：仍未就绪
+            {"found": True, "disabled": False, "body": "领取"},         # 就绪后露出按钮
+            {"found": False, "body": "领取成功，Credits 已到账"},
+        ]
+        state = self._patch(snaps)
+        self.assertEqual(self._run().outcome, Outcome.SUCCESS)
+        self.assertEqual(state["clicks"], 1)
+
+    def test_reload_failure_keeps_original_verdict(self):
+        """重载失败 ⇒ 沿用原判定，不抛异常、不误报成功（复核是尽力而为）。"""
+        from checkin.core.models import Outcome
+        state = self._patch([{"found": False, "body": "已领取"}], reload_ok=False)
+        self.assertEqual(self._run().outcome, Outcome.ALREADY)
+        self.assertEqual(state["clicks"], 0)
+
+    def test_fresh_claimable_skips_reload(self):
+        """按钮本来就在 ⇒ **不做重载**。
+
+        重载不是免费的（页面要重新加载，实测 ~0.8s），正常路径上不该付这个成本。
+        """
+        from checkin.core.models import Outcome
+        snaps = [
+            {"found": True, "disabled": False, "body": "领取\n"},
+            {"found": False, "body": "领取成功，Credits 已到账\n"},
+        ]
+        state = self._patch(snaps)
+        self.assertEqual(self._run().outcome, Outcome.SUCCESS)
+        self.assertEqual(state["reloads"], 0, "能领时不该重载")
+        self.assertEqual(state["clicks"], 1)
+
+    def test_disabled_button_is_also_rechecked(self):
+        """按钮置灰也属"可能是陈旧快照"，同样要复核一次。
+
+        不同客户端版本领取后的表现不同：有的把按钮删掉，有的把它置灰。
+        """
+        from checkin.core.models import Outcome
+        snaps = [
+            {"found": True, "disabled": True, "body": "已领取\n"},     # 陈旧：置灰
+            {"found": True, "disabled": False, "body": "领取\n"},      # 重载后可领
+            {"found": False, "body": "领取成功，Credits 已到账\n"},
+        ]
+        state = self._patch(snaps)
+        self.assertEqual(self._run().outcome, Outcome.SUCCESS)
+        self.assertEqual(state["reloads"], 1)
+        self.assertEqual(state["clicks"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -125,6 +126,37 @@ class CDPPage:
             self._cmd("Page.bringToFront")
         except Exception as e:
             log.debug("唤醒页面失败（忽略，由上层超时兜底）: %s", e)
+
+    def reload(self, wait_sec: float = 3.0) -> bool:
+        """重新加载当前页面（让页面重新向服务端要一次状态）。
+
+        为什么需要（2026-10-06 实测，代价是**漏签一整天**）：
+
+        客户端里的活动 Surface **一旦被打开就会一直留着** —— 我们只断 WebSocket
+        （`close()`），从不关闭那个 UI。于是它的 DOM 停在**打开那一刻**的状态。
+        跨天后服务端已刷新到新窗口，页面却不会自动重载 ⇒ 靠读 DOM 判
+        "是否已领取"会拿到**陈旧快照**，把"今天能领"误判成"今天已领"
+        （实测：当日 10:45 报 already，而客户端日志同日 10:44 起 `claimable`
+         一直为 true，直到 15:31 手动领取后才转 false）。
+
+        重载是让快照重新新鲜的**最直接**手段：它把"服务端当下的答案"重新下发一遍，
+        既不需要额外的接口，也不依赖日志结构。
+
+        ⚠ 走页面内的 `location.reload()`，**不是** `Page.reload` ——
+        后者实测在 OOPIF 上直接报错：`Command can only be executed on top-level
+        targets`（活动页恰恰是 OOPIF，2026-10-06 踩到）。而 `location.reload()`
+        是在该 iframe 自己的上下文里执行，不受 top-level 限制，
+        也不会波及宿主应用（不可能去重载整个 IDE 外壳 —— 那会打断用户）。
+
+        失败只返回 False（调用方沿用原判定），不抛异常 —— 复核失败不该劣化主流程。
+        """
+        try:
+            self.evaluate("location.reload()", await_promise=False)
+        except Exception as e:
+            log.debug("页面重载失败（忽略，调用方沿用原判定）: %s", e)
+            return False
+        time.sleep(wait_sec)
+        return True
 
     def close(self) -> None:
         try:

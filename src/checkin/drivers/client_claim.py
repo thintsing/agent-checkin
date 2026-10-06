@@ -47,15 +47,19 @@ log = logging.getLogger("checkin.driver.client")
 
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# 在目标 iframe 内查找按钮。返回 {found, disabled, claimed, body}
+# 在目标 iframe 内查找按钮。返回 {found, ready, disabled, body}
+#
+# `ready`（readyState === 'complete'）是给「陈旧快照复核」用的：
+# 重载后页面若已加载完却仍没有按钮，那就是服务端的最终答案，可以立刻收手 ——
+# 否则"今天确实已领"这种**常态**每天都要白等满复核超时。
 _JS_PROBE = r"""
 (() => {
   const btns = [...document.querySelectorAll('button')];
   const b = btns.find(x => ((x.innerText||'').trim() === __LABEL__));
   const body = (document.body ? document.body.innerText : '');
-  if (!b) return {found: false, body: body.slice(0, 800)};
-  return {found: true, disabled: b.disabled === true ||
-          b.getAttribute('aria-disabled') === 'true', body: body.slice(0, 800)};
+  return {found: !!b, ready: document.readyState === 'complete',
+          disabled: b ? (b.disabled === true || b.getAttribute('aria-disabled') === 'true') : null,
+          body: body.slice(0, 800)};
 })()
 """
 
@@ -128,6 +132,16 @@ def _read_tail(path: str, limit: int = 300_000) -> str:
             fh.seek(size - limit)
             fh.readline()          # 丢掉可能被字节截断的半行
         return fh.read()
+
+
+def _claimable(snapshot: Dict[str, Any]) -> bool:
+    """快照是否表示"现在就能点领取"：按钮**存在**且**未置灰**。
+
+    刻意只看按钮本身，不把页面文本（"已领取" / "领取成功"）当作"能领"的判据 ——
+    那是**渲染快照**，可能是跨天陈旧的。为什么这件事代价很大、
+    以及为什么必须先复核再判 already，见 `ClientDriver._recheck_stale`。
+    """
+    return bool(snapshot.get("found")) and not snapshot.get("disabled")
 
 
 class ClientDriver(Driver):
@@ -234,6 +248,16 @@ class ClientDriver(Driver):
             pre = page.evaluate(find, await_promise=False) or {}
             body = str(pre.get("body") or "")
 
+            # 「能不能领」只看**按钮本身**。不行就先做一次「陈旧快照」复核再下结论 ——
+            # 活动 Surface 打开后会一直留着（我们只断 WebSocket，从不关它），
+            # 里面的 DOM 停在打开那一刻；跨天后它还写着"已领取"，而服务端早已
+            # 刷新到新窗口。不复核就会把"今天能领"误判成"今天已领"，
+            # 且记为 ALREADY、不触发任何提醒（2026-10-06 真漏签一整天）。
+            if not _claimable(pre):
+                fresh = self._recheck_stale(page, find)
+                if fresh is not None:
+                    pre, body = fresh, str(fresh.get("body") or "")
+
             if not pre.get("found"):
                 if any(m in body for m in markers):
                     return CheckinResult(sid, Outcome.ALREADY, message="界面显示本窗口已领取",
@@ -270,6 +294,54 @@ class ClientDriver(Driver):
                                  detail=detail)
         finally:
             page.close()
+
+    # ------------------------------------------------------ 陈旧快照复核
+
+    # 重载后等待「按钮出现」的上限。活动页实测加载 ~0.8s
+    # （客户端日志 `活动 Surface 加载完成 durationMs: 730~833`），给足余量。
+    _STALE_RECHECK_SEC = 8.0
+    # 发起重载后先静等这么久再开始读，避免在 loading 期空转。
+    _STALE_RELOAD_WAIT = 1.5
+
+    def _recheck_stale(self, page: CDPPage, find: str) -> Optional[Dict[str, Any]]:
+        """重载活动页，确认"已领取"不是**跨天陈旧快照**造成的误判。
+
+        背景（2026-10-06 实测，代价是漏签一整天）：
+
+        客户端里的活动 Surface **一旦打开就一直留着** —— 驱动只断 WebSocket
+        （`page.close()`），从不关闭那个 UI。于是它的 DOM 停在**打开那一刻**：
+        昨天领过 → 页面写着"已领取"、按钮消失 → `_JS_PROBE` 返回 `found=False`。
+
+        跨天后服务端已刷新到新窗口，**页面却不会自动重载**。此时"找不到按钮 +
+        页面含『已领取』"这条判定就把「今天其实可领」误判成「今天已领」，
+        结果记为 ALREADY —— 不报错、不提醒，**静默漏签**。
+
+        铁证：当日 10:45:17 驱动报 already，而"端口就绪 → 出结论"只隔了 **34 毫秒**，
+        说明 `_wait_target` 命中的是一个**早已存在**的 iframe；同时客户端日志显示
+        02:44:51Z 起 `claimable` 一直是 `true`，直到 15:31 手动领取后才转 `false`。
+
+        返回：重载后**出现领取按钮**的快照；重载失败或按钮始终不出现 → None
+        （None = 复核没能推翻原判定，调用方沿用原来的 already / no_action）。
+        """
+        if not page.reload(self._STALE_RELOAD_WAIT):
+            return None
+        deadline = time.time() + self._STALE_RECHECK_SEC
+        while time.time() < deadline:
+            try:
+                pre = page.evaluate(find, await_promise=False) or {}
+            except Exception as e:         # noqa: BLE001 —— 重载期间读取失败属正常
+                log.debug("重载后读取失败（页面可能仍在加载，继续等）: %s", e)
+                pre = {}
+            if pre.get("found"):
+                log.info("重载后出现领取按钮 —— 原快照陈旧，继续领取")
+                return pre
+            # 页面**已加载完成**却仍没有按钮 ⇒ 这就是服务端的最终答案，立刻收手。
+            # 少了这一步，"今天确实已领"（常态）每天都要白等满超时才出结论。
+            if pre.get("ready"):
+                log.debug("重载完成但仍无领取按钮 —— 原判定成立")
+                return None
+            time.sleep(0.4)
+        return None
 
     # ------------------------------------------------------------ bridge 路径
 

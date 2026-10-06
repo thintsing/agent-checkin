@@ -75,8 +75,12 @@ client:
   debug_port: 9335
   # 活动页在 /json 里的 target url 特征串
   target_match: 'growth-page'
-  # 领取按钮文本 / 视为"已领取"的界面文案
+  # 领取按钮文本
   claim_button: '领取'
+  # 视为"已领取"的界面文案。⚠ **只用于"找不到按钮时"的辅助判定**，
+  # 且判之前会先做一次「陈旧快照复核」（重载页面重新取状态，见
+  # client_claim._recheck_stale）。原因：这些文案会留在**跨天未关闭**的
+  # 活动 Surface 里 —— 单凭它判 already 会在次日静默漏签一整天（2026-10-06 真发生）。
   claimed_markers: ['已领取', '领取成功']
   # 定位"客户端是否在跑"用（按命令行匹配，会排除 native-messaging-host 子进程）
   process_match: 'Qoder CN.exe'

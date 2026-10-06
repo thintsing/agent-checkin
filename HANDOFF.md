@@ -7,6 +7,102 @@
 
 ---
 
+## [2026-10-06 15:40] WorkBuddy(阿拾) —— Qoder 今天**真没领到**：活动页是**跨天陈旧快照**；修「不核实就判 already」
+
+**一句话**：用户问"qoder 今天为什么没领取成功" —— **属实**。驱动 10:45:17 报 `already`，
+但那是**昨天遗留的**活动 Surface（DOM 停在"已领取"、按钮早已消失），驱动 34 毫秒就下了结论。
+已手动补领今天的 100 Credits，并修掉这条**静默漏签**路径。161 项测试全绿。
+
+### 一、铁证：DOM 说"已领"，服务端说"可领"
+
+客户端日志（`%APPDATA%\com.qodercn.app.stable\logs\20260930-094348.125-21864-4ee11b3f\main.log`）：
+
+| 时刻(北京) | `claimable` | 说明 |
+|---|---|---|
+| 08:44 / 09:44 | `false` | 昨天（10-05）已领 |
+| **10:44:51** | **`true`** | **新窗口开放** |
+| 10:45:17 | — | 驱动接管，报 `already`（**与上一行只差 26 秒**） |
+| 11:44 ~ 15:29 | `true` | 一直可领，**始终没被领走** |
+
+另外两条旁证：
+
+- **主窗口入口 aria = `查看我的用量，有权益活动待领取`** —— 服务端自己说"有待领取"
+  （领取后立刻变成 `查看我的用量`，已复验）。
+- 驱动日志里 `调试端口 9335 已就绪` → `=> already` 只隔 **34 毫秒** ⇒ `_wait_target`
+  命中的是**早已存在**的 iframe，根本没走 `_open_entry`。
+
+**手动补领已成功**（CDP 点按钮），三重证据：界面 `领取成功，Credits 已到账` + `已领取`；
+日志 `07:31:31Z`（北京 15:31）`claimable: true → false`；页面内 `fetch('/sash/api/v1/me/campaigns')`
+返回 `{"claimable": false, "campaigns": [{"claimStatus": "CLAIMED", "benefit": {"kind":"CREDITS","amount":100}}]}`。
+
+### 二、根因：活动 Surface 会**跨天存活**，DOM 停在打开那一刻
+
+驱动 `_claim()` 里这条判定（`client_claim.py`，原第 237-240 行）：
+
+```python
+if not pre.get("found"):                       # 找不到「领取」
+    if any(m in body for m in markers):        # 页面文本含「已领取」/「领取成功」
+        return ALREADY                          # ← 就此收手
+```
+
+**逻辑本身没错，错在它读到的是昨天的页面。** 链条：
+
+1. 活动 Surface 一旦被打开就**一直留着** —— 驱动只断 WebSocket（`page.close()`），
+   从不关闭那个 UI（关闭按钮在宿主外壳上，不在 iframe 里）。
+2. 昨天领完 → 页面渲染成"已领取"、**按钮从 DOM 消失** → 页面就停在这个状态过夜。
+3. 次日 10:00 服务端刷新到新窗口，**页面却不会自动重载**。
+4. 驱动挂上去，读到"找不到按钮 + 文本含『已领取』" ⇒ 误判"今天已领"。
+
+代价是**静默漏签**：不报错、不弹提醒（结果记为 ALREADY，比 no_action 还"正常"）。
+⚠ 这也解释了为什么 09-29~10-05 都 success、唯独今天翻车 —— 那些天 Surface 恰好被关过。
+
+### 三、改动：判 already 之前**先重载复核**
+
+- `client_claim.py` 新增模块级 `_claimable(snapshot)` —— **"能领"只看按钮本身**
+  （`found and not disabled`），页面文本不参与。文本是渲染快照，可能跨天陈旧。
+- 新增 `ClientDriver._recheck_stale(page, find)`：`_claimable` 为假时，**重载活动页**
+  重新取一次服务端状态；重载后若按钮出现 ⇒ 原快照陈旧，照常领取；否则沿用原判定。
+- `cdp.py` 新增 `CDPPage.reload()`。⚠ **必须用页面内 `location.reload()`，不能用 `Page.reload`** ——
+  实测后者在 OOPIF 上直接报 `Command can only be executed on top-level targets`
+  （活动页恰恰是 OOPIF）。前者在该 iframe 自己的上下文里执行，不受限制，
+  也不会波及宿主（**绝不能去重载整个 IDE 外壳**，那会打断用户）。
+- `_JS_PROBE` 增加 `ready: document.readyState === 'complete'`：重载后页面**已加载完却仍无按钮**
+  ⇒ 这就是服务端最终答案，**立刻收手**，不必等满超时（否则"今天确实已领"这个常态
+  每天都要白等 8 秒）。实测真已领场景耗时 **1.5 秒**、零点击。
+- `recipes/qoder.yaml`：给 `claimed_markers` 补注释，说明它**只用于辅助判定**且必须经复核。
+
+### 四、实测验证（不是纸面推理）
+
+1. **`location.reload()` 在 OOPIF 上确实生效**：重载后 `readyState=complete`、
+   页面重新渲染（倒计时 `18:27:58` → `18:24:25`），WebSocket 连接未坏。
+2. **重载确实会重新向服务端要状态**（用 CDP `Network` 域监听）：
+   ```
+   200 https://openapi.qoder.com.cn/sash/api/v1/me/campaigns   ← 重新拉活动状态
+   ```
+   ⇒ 这是本修复成立的**前提**，不是假设。
+3. **真已领场景零误伤**：`_claim()` 实测返回 `ALREADY | 界面显示本窗口已领取`，耗时 1.5s，未点击。
+
+### 五、⚠ 未首考 + 观察项
+
+- **"陈旧快照 → 重载后露出按钮 → 领取成功"这条完整路径今天跑不了**（服务端已领，
+  重载后也没按钮）。单测已覆盖，真机首考在**明天**。若明天仍报 `already` 而日志
+  `claimable: true`，说明重载这条路还不够，改走下面的计划 B。
+- **计划 B（备选）**：实测发现**页面上下文里能直接 `fetch('/sash/api/v1/me/campaigns')`**
+  （带 cookie），返回 `claimable` / `claimStatus` —— 与 WorkBuddy 的 `window.wb.http` 同型。
+  真跑不通就把 Qoder 也 bridge 化，彻底不依赖 DOM 渲染。
+- 另：用 Network 域监听时看到一条 `/sash/api/v1/me/campaigns/<id>/claim` 请求出现在 reload 之后，
+  但服务端状态正常（`CLAIMED`、`claimable:false`），**未造成重复领取**。成因未深究，
+  记此备查（怀疑是页面的领取确认重试）。
+
+### 六、今天的最终战果
+
+| 站点 | 结果 |
+|---|---|
+| Qoder | 10:45 误判 `already` → **15:31 手动补领成功** |
+| WorkBuddy | 客户端 14:59 启动即签（见下一条交接） |
+
+---
+
 ## [2026-10-06 15:25] WorkBuddy(阿拾) —— WorkBuddy **已切 client 模式并首考通过**；找到真正的主路径 `window.wb.http`（**不点 DOM，直接调客户端接口**）
 
 **一句话**：用户重启 WorkBuddy 后 9336 就绪。实测推翻了上一轮的假设 —— 正确接法**不是"点签到按钮"**
