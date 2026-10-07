@@ -1,11 +1,11 @@
 # 智能体签到 · Agent Check-In
 
-> 让 AI 编程助手的每日签到自动化 —— **站点知识全部外置为数据，凭证永不离开浏览器。**
+> 让 AI 编程助手的每日签到自动化 —— **站点知识全部外置为数据，凭证永不离开浏览器 / 客户端。**
 >
-> *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser.*
+> *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-129%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-161%20passing-brightgreen)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
 
@@ -38,15 +38,15 @@
 ```text
   站点            模式      连续    今日失败    今日
   --------------------------------------------------------
-  qoder           client    1       0          已完成
-  workbuddy       auto      2       0          已完成
+  qoder           client    10      0          已完成
+  workbuddy       client    14      0          已完成
 ```
 
 ---
 
-## 三个技术硬骨头
+## 四个技术硬骨头
 
-这个项目里真正的难点不是"发个 HTTP 请求"，而是下面三件事。它们的排查过程和结论都写进了 `DESIGN_NOTES.md`。
+这个项目里真正的难点不是"发个 HTTP 请求"，而是下面四件事。它们的排查过程和结论都写进了 `DESIGN_NOTES.md`。
 
 ### ① Qoder 的领取页不是网页，是"宿主驱动的 iframe"
 
@@ -71,7 +71,7 @@
 
 **解法**：**改造日常启动入口**，让客户端启动时就带上 `--remote-debugging-port`。实测 Qoder 的 Launcher 会**透传未知开关**，于是把三个快捷方式入口都加上参数（工具：`tools/win_shortcut_args.py`，含备份与 `--revert`）。
 
-端口值**不写死在工具里** —— 以 `recipes/qoder.yaml` 的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--qoder`）。原始 `.lnk` 的备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。
+端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy`，旧的 `--qoder` 仍兼容）。原始 `.lnk` 的备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。
 
 驱动随之采用**四分支决策**，核心原则是 **绝不杀掉用户正在用的客户端**：
 
@@ -101,16 +101,31 @@
 
 > **A/B 实测对照**：不清 → 40 秒端口未就绪；清了 → **2 秒就绪**。
 
+### ④ WorkBuddy 的网页登录态只有 7 天 —— 于是也搬进了客户端
+
+WorkBuddy 原本走 `auto`（在浏览器页面上下文里 `fetch`），但网页侧的 `session` cookie 实测有效期
+**168 小时（恰好 7 天）**，到期只能人工重登，天天访问也**并不能**无限续期。
+实测 **09-28 重登 → 10-06 又过期**，是周期性发生的结构性成本 —— 每次过期都靠"主动提醒"才不至于静默漏签。
+
+**解法**：改走 `mode: client`，用客户端自己的 http 通道（`window.wb.http`）调**同一个**接口
+（客户端日志实证 `check-in outgoing path=/v2/billing/meter/daily-checkin hasToken=true`）——
+token 由客户端主进程注入并**自行续期**，我们不再需要维护任何登录态。
+这条路**不点 UI** 而是直接调接口（签到横幅是**按需渲染**的，今天已签时根本不挂载），
+不受 shadow DOM 与服务端下发文案变化影响，比点按钮稳；判定仍**完全复用配方的 `verdict` 业务词表**。
+
 ---
 
 ## 支持的平台
 
 | 平台 | 模式 | 做法 | 为什么 |
 |---|---|---|---|
-| **WorkBuddy** (`codebuddy.cn`) | `auto` | 在**已登录的真实浏览器**页面上下文里 `fetch` 调接口 | 接口幂等、单账号、走真实浏览器 TLS/HTTP2 指纹 |
+| **WorkBuddy** (`codebuddy.cn`) | `client` | **CDP bridge**：在客户端页面上下文里调用它自己的 http 通道（`window.wb.http`），走 `/v2` 桌面端前缀 | 免维护登录态 —— **客户端自己持有并续期 token**；网页侧 cookie 只有 **168 小时（7 天）** 就会过期，周期性要求人工重登 |
 | **Qoder CN** | `client` | **CDP 驱动桌面客户端**点它自己的按钮 | 网页入口不存在（见上文 ①）；且不伪造设备指纹 |
 
 新增站点**不需要改一行代码** —— 在 `recipes/` 放一个 YAML 即可。
+
+> `auto`（在已登录浏览器页面上下文里 `fetch`）与 `manual`（只发提醒）两种模式**仍然保留、可用**；
+> 只是**当前两个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
 
 ---
 
@@ -210,8 +225,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 ├─ run_checkin.bat            # 日常入口（自动建 venv、装依赖、跑主程序）
 ├─ config.yaml                # 全局运行参数 + 安全策略（端口、随机窗口、延迟、熔断阈值…）
 ├─ recipes/                   # ★ 站点配方：站点知识全部是数据，不是代码
-│   ├─ workbuddy.yaml         #   mode: auto（接口 + verdict.rules 业务码判定）
-│   └─ qoder.yaml             #   mode: client（CDP 驱动桌面客户端自己领）
+│   ├─ workbuddy.yaml         #   mode: client（客户端 bridge 调接口 + verdict.rules 业务码判定）
+│   └─ qoder.yaml             #   mode: client（CDP 驱动桌面客户端自己点按钮领）
 ├─ tools/
 │   ├─ qoder_cdp_probe.py     # 只读侦察（定位活动入口，不点击）
 │   ├─ qoder_cdp_claim.py     # client 驱动的薄封装（launch / status / claim / close）
@@ -259,7 +274,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**129 项，全部离线**（不联网、不开浏览器），约 3 秒跑完：
+**161 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥、配置加载、引擎各闸门分支。
@@ -273,21 +288,24 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 
 这个项目在文档里保留了**被推翻的中间结论**和**未验证项** —— 我认为这比粉饰更有价值。
 
-1. **`daily-checkin` 的真实响应尚未观测过**：首次运行时当日积分已通过其它途径领到，
-   程序按幂等策略收手，**没有为了"验证"而额外发一次写请求**（多发一次就多一分风险）。
-   配方已做双保险（业务词表 + code 规则）。
+1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在两个站点都走 `client`，
+   网页侧浏览器当前没有站点在用。`client` 路径下的写响应**已实测观测**
+   （2026-10-06 起 WorkBuddy bridge 路线跑通，`data.status` 业务词表已在真机验证）；
+   `auto` 侧仍保留双保险（业务词表 + code 规则），首次真跑前不做额外"验证性"写请求
+   （多发一次就多一分风险）。
 2. **Qoder 客户端升级可能改版**：若按钮文案 / DOM 变化，驱动返回 `no_action` 并提示人工查看，
-   **不会静默假成功**。`0.4.2` 之后的版本需要重新验证。
+   **不会静默假成功**。当前 `0.4.3` 已复验通过，后续每次升级都需重新确认。
 3. **客户端升级会同时动两处**（2026-09-27 实测 `0.4.2 → 0.4.3`，当天因此没领到）：
    - **快捷方式参数**可能被重置：`开始菜单` 那个入口会被应用**回写成无参数版**
      （已加只读保护挡住；升级时它若重建失败属正常，`data/shortcut_backup/` 有原始备份）。
    - **更难查的一种**：升级时启动器会**自己把应用重启一遍**（`state.ini` 的 `updatedAt`
      与应用的启动时刻重合，且同一刻 `targetVersion` 发生切换），这一次重启**不带**
      透传的调试开关 ⇒ 端口没开，驱动只能走 ③ 降级提醒。
-   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --qoder`，**再从快捷方式重新启动客户端**。
+   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder`，**再从快捷方式重新启动客户端**。
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，
-   重启客户端也拿不回。所以端口值以 `recipes/qoder.yaml` 为单一事实源，换端口是改一行的事。
+   重启客户端也拿不回。所以端口值以各站点配方的 `client.debug_port` 为单一事实源
+   （Qoder=9335 / WorkBuddy=9336），换端口是改一行的事。
 5. **计划任务只在有登录会话时运行**（锁屏算、未登录不算）—— 开浏览器需要桌面会话。
 
 ---

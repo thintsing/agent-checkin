@@ -22,7 +22,7 @@ def driver_for(mode: str) -> Optional[Driver]:
     table = {
         "auto": BrowserPageDriver,     # 走 HTTP 接口
         "manual": ReminderDriver,      # 只提醒
-        "client": ClientDriver,        # 驱动桌面客户端自己点（Qoder）
+        "client": ClientDriver,        # 驱动桌面客户端自己完成签到（Qoder 点 UI / WorkBuddy 走 bridge）
     }
     cls = table.get(mode)
     return cls() if cls else None

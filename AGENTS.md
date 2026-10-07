@@ -52,7 +52,8 @@ StateStore.record_prompt(site_id) -> None      # 只写 last_prompt_date；不�
 
 # src/checkin/drivers/__init__.py —— 驱动协议（新增 mode 只加一行表项）
 Driver.run(recipe, cfg, dry_run=False, probe=False) -> CheckinResult
-driver_for(mode: str) -> Optional[Driver]      # 表：auto -> BrowserPageDriver, manual -> ReminderDriver
+driver_for(mode: str) -> Optional[Driver]      # 表：auto -> BrowserPageDriver, manual -> ReminderDriver,
+                                               #     client -> ClientDriver
 
 # src/checkin/core/engine.py —— 执行核心
 Engine.run(only=None, dry_run=False, probe=False, now=False) -> List[CheckinResult]
@@ -63,8 +64,10 @@ Engine.run(only=None, dry_run=False, probe=False, now=False) -> List[CheckinResu
 
 **配方 schema（`recipes/*.yaml`）：** `id / name / enabled / mode` + `session{kind,start_url,tab_match,token_localstorage_key}`
 + `actions{status,trigger}` + `verdict{transport,rules,http_401_result,unknown_result,checked_in_flag,result_flag,result_map}`
-+ `reminder`
-（`mode: auto|manual|disabled`；`manual` 只发提醒，**不做自动化**——理由见 `DESIGN_NOTES.md` 决策 B）。
++ `reminder` + `client{…}`（仅 `mode: client` 用到）
+（`mode: auto|manual|client|disabled`；`manual` 只发提醒，**不做自动化**——理由见 `DESIGN_NOTES.md` 决策 B。
+`client` = **驱动桌面客户端自己完成签到**：配方**有** `bridge` 段就在客户端页面里调它自己的 http 通道
+（WorkBuddy 走这条，免维护登录态），**无** `bridge` 段就点它自己的按钮（Qoder 走这条）。）
 
 `reminder` 是**自由字典**（引擎只按 key 取值，不认识就忽略），当前认这三个：
 
