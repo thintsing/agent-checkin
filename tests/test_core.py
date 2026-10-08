@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
@@ -28,12 +29,16 @@ if str(SRC) not in sys.path:
 
 from checkin.__main__ import (                                # noqa: E402
     _install_script,
+    _ps_timespan,
     _psq,
+    _task_command,
     _uninstall_script,
-    _wake_hint,
+    _window_minutes,
 )
 from checkin.browser import page_script                       # noqa: E402
 from checkin.core import jitter, notify, scheduler           # noqa: E402
+from checkin.core import log as log_mod                       # noqa: E402
+from checkin.core import procenv                              # noqa: E402
 from checkin.core.config import (                            # noqa: E402
     AppConfig,
     ChromeConfig,
@@ -253,13 +258,17 @@ class TestScheduler(unittest.TestCase):
         scheduler.wait_until(before - timedelta(seconds=5))
         self.assertLess((datetime.now() - before).total_seconds(), 2.0)
 
-    def test_wake_hint_is_ten_minutes_before_window(self):
-        """唤醒时刻 = 窗口开始前 10 分钟（纯算术，与配置值无关）。"""
-        from checkin.__main__ import _wake_hint
-        self.assertEqual(_wake_hint("10:05"), "09:55")   # 当前实际配置
-        self.assertEqual(_wake_hint("07:40"), "07:30")
-        self.assertEqual(_wake_hint("00:05"), "00:00")   # 不产生负时刻
-        self.assertEqual(_wake_hint("13:00"), "12:50")
+    def test_window_minutes_is_end_minus_start(self):
+        """窗口长度 = 两个 HH:MM 相减（计划任务拿它当 RandomDelay 上界）。"""
+        self.assertEqual(_window_minutes(_cfg("10:05", "12:30")), 145)   # 当前实际配置
+        self.assertEqual(_window_minutes(_cfg("07:40", "11:20")), 220)
+        self.assertEqual(_window_minutes(_cfg("10:05", "10:05")), 0)     # 空窗口不产生负值
+        self.assertEqual(_window_minutes(_cfg("12:30", "10:05")), 0)     # 反序也退化为 0
+
+    def test_ps_timespan_splits_hours_and_minutes(self):
+        self.assertEqual(_ps_timespan(145), "(New-TimeSpan -Hours 2 -Minutes 25)")
+        self.assertEqual(_ps_timespan(60), "(New-TimeSpan -Hours 1 -Minutes 0)")
+        self.assertEqual(_ps_timespan(0), "(New-TimeSpan -Hours 0 -Minutes 0)")
 
 
 # ----------------------------------------------------------------------
@@ -751,6 +760,23 @@ class TestClientDriverLogic(unittest.TestCase):
         """进程名含单引号时必须双写转义，否则拼出来的 PowerShell 语法直接炸。"""
         self.assertIn("'O''Brien.exe'", self.d._app_running_script("O'Brien.exe"))
 
+    def test_app_running_query_hides_its_console(self):
+        """进程查询派生 powershell.exe 时必须带 `CREATE_NO_WINDOW`。
+
+        计划任务用 pythonw（无控制台）运行；不声明这个 flag，Windows 会为这个
+        控制台子进程**新建一个可见窗口** —— 一次闪屏就能让"不弹黑框"白做。
+        """
+        from checkin.core import procenv
+        seen = {}
+
+        def fake_run(*a, **kw):
+            seen.update(kw)
+            return mock.Mock(stdout="", returncode=0)
+
+        with mock.patch("checkin.drivers.client_claim.subprocess.run", side_effect=fake_run):
+            self.d._app_running({"process_match": "Qoder CN.exe"})
+        self.assertEqual(seen.get("creationflags"), procenv.NO_WINDOW)
+
     def test_open_entry_scripts_click_by_aria_label(self):
         """回归：客户端外壳的入口**只有 aria-label 可依**（纯图标、无文案）。
         实测就是"查看我的用量 → 打开 Rewards"这两步。
@@ -1053,6 +1079,32 @@ class TestEngineGates(unittest.TestCase):
                 self.assertEqual(sampled.call_count, expected,
                                  f"{kwargs} 下延迟采样次数应为 {expected}")
 
+    def test_now_skips_the_window_wait(self):
+        """`--now`（手动补跑 / 计划任务唤醒）不得再等窗口内的随机时刻。
+
+        2026-10-08 起计划任务以 `--now` 唤醒（随机性交给 Task Scheduler 的
+        RandomDelay），这里的断言就是"等待真的被移走了"的机器版。
+        """
+        with mock.patch("checkin.core.engine.scheduler.plan_today") as plan, \
+                mock.patch("checkin.core.engine.scheduler.wait_until") as wait:
+            Engine(self.cfg, [self._manual()]).run(now=True)
+        plan.assert_not_called()
+        wait.assert_not_called()
+
+    def test_day_skip_applies_even_when_now(self):
+        """今日跳过策略（周末等）与"等不等窗口"无关 —— `--now` 也拦。
+
+        这条是**防回归**：原先 `should_skip_today` 被关在 `if not now` 里面，
+        而计划任务改为 `--now` 之后，`skip_weekends` 就会被静默绕过 ——
+        "配了却不起作用"的隐形故障，本项目最忌讳的那类。
+        """
+        with mock.patch("checkin.core.engine.scheduler.should_skip_today",
+                        return_value="周末不执行（skip_weekends=true）"):
+            res = Engine(self.cfg, [self._manual()]).run(now=True)
+        self.assertIs(res[0].outcome, Outcome.SKIPPED)
+        self.assertIn("周末不执行", res[0].message)   # 跳过原因要带出来，不能只报"跳过了"
+        self.toast.assert_not_called()          # 跳过了就不该再提醒
+
     def test_dry_run_does_not_record_state(self):
         Engine(self.cfg, [self._manual()]).run(dry_run=True)
         self.assertFalse(StateStore(self.state_path).done_today("q"))
@@ -1332,9 +1384,43 @@ class TestTaskInstall(unittest.TestCase):
         self.assertIn("-WorkingDirectory", s)
         self.assertIn(_ROOT, s)
 
-    def test_wakes_before_the_window(self):
-        hint = _wake_hint(self.cfg.schedule.window_start)
-        self.assertIn(f"-At {hint}", _install_script(self.cfg))
+    def test_trigger_starts_at_window_start_with_random_delay(self):
+        """触发 = `-At <窗口开始>` + `-RandomDelay <窗口长度>`。
+
+        2026-10-08 改：随机化从"进程内睡到某时刻"挪到计划任务的 RandomDelay。
+        老写法（提前唤醒 + 内部等待）会留一个进程（原先还是黑框）驻留两小时。
+        """
+        s = _install_script(self.cfg)
+        self.assertIn(f"-At {_psq(self.cfg.schedule.window_start)}", s)
+        self.assertIn("-RandomDelay", s)
+        self.assertIn(_ps_timespan(_window_minutes(self.cfg)), s)
+
+    def test_random_delay_span_matches_window(self):
+        """RandomDelay 的上界必须**真的**等于窗口长度，不是写死的常量 ——
+        否则改了 config.yaml 的窗口，任务会静默地只覆盖其中一段（或溢出窗口）。"""
+        for start, end in (("10:05", "12:30"), ("07:40", "11:20"), ("09:00", "09:30")):
+            with self.subTest(window=f"{start}-{end}"):
+                cfg = _cfg(start, end)
+                self.assertIn(_ps_timespan(_window_minutes(cfg)), _install_script(cfg))
+
+    def test_uses_pythonw_to_avoid_console_window(self):
+        """解释器必须优先 `pythonw.exe`。
+
+        `python.exe` 是控制台子系统 —— 任务一跑就弹黑框（2026-10-08 用户报障：
+        黑框从 09:55 一直挂到 11:28）。`pythonw.exe` 没有控制台，同等逻辑不露脸。
+        """
+        from checkin.__main__ import _task_python
+        exe = _task_python()
+        self.assertTrue(exe.lower().endswith("pythonw.exe"),
+                        f"计划任务解释器应优先 pythonw.exe，实际是 {exe}")
+        self.assertIn("pythonw.exe", _install_script(self.cfg))
+
+    def test_action_runs_immediately(self):
+        """动作必须带 `--now`：随机时刻已由 RandomDelay 承担，被唤醒就立刻执行，
+        不能再等一遍窗口（否则等待又回来了，只是没人看得见）。"""
+        s = _install_script(self.cfg)
+        self.assertIn("--now", s)
+        self.assertIn("--now", _task_command())
 
     def test_runs_the_entry_file_directly(self):
         """必须直跑 __main__.py（自挂 sys.path），不能写 `-m checkin`：
@@ -1353,6 +1439,76 @@ class TestTaskInstall(unittest.TestCase):
         s = _uninstall_script()
         self.assertIn("SilentlyContinue", s)
         self.assertIn("Unregister-ScheduledTask", s)
+
+
+class TestPythonwHygiene(unittest.TestCase):
+    """计划任务改用 `pythonw.exe`（无控制台）后的两处兜底。
+
+    起因（2026-10-08 用户报障）：任务原先用 `python.exe`，每天弹一个黑框，
+    还要挂到窗口内随机时刻才动手。改成 pythonw 之后，两件原先"被控制台兜住"的
+    事会浮出来，必须显式处理 —— 否则黑框会以另一种方式回来：
+      1. pythonw 下 `sys.stdout/stderr` 是 None → print()/StreamHandler 直接抛异常；
+      2. 无控制台的父进程派生控制台程序（powershell）→ Windows **新建可见控制台窗口**。
+    """
+
+    def test_log_setup_tolerates_missing_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("checkin.core.log.sys.stderr", None):
+                logger = log_mod.setup(tmp, "INFO", [])
+            try:
+                kinds = [type(h) for h in logger.handlers]
+                self.assertIn(logging.FileHandler, kinds, "无控制台时仍必须写文件日志")
+                self.assertNotIn(logging.StreamHandler, kinds,
+                                 "无 stderr 时不该挂 StreamHandler（拿到空流会逐条报错）")
+                logger.info("无控制台也要能记一条")      # 不抛异常即通过
+            finally:
+                # 先 close 再 clear：FileHandler 不 close 会一直占着文件句柄，
+                # TemporaryDirectory 清理时在 Windows 上直接 WinError 32。
+                for h in logger.handlers:
+                    h.close()
+                logger.handlers.clear()
+
+    def test_toast_hides_its_console(self):
+        seen = {}
+
+        def fake_run(*a, **kw):
+            seen.update(kw)
+            return mock.Mock(returncode=0)
+
+        with mock.patch("checkin.core.notify.subprocess.run", side_effect=fake_run):
+            notify._toast("标题", "正文")
+        self.assertEqual(seen.get("creationflags"), procenv.NO_WINDOW,
+                         "派生的 powershell 必须 CREATE_NO_WINDOW，否则闪黑框")
+        self.assertNotEqual(procenv.NO_WINDOW, 0, "Windows 上 CREATE_NO_WINDOW 应可用")
+
+
+class TestRedactFilter(unittest.TestCase):
+    """凭证脱敏过滤器。
+
+    2026-10-08 补测时炸出一个**潜伏 bug**：`redact_keys` 为空列表时，过滤器会拼出
+    一个不含捕获组的退化正则，却仍用 `\\1***` 作替换 —— 每条日志都抛
+    `re.error: invalid group reference 1`。默认配置里 keys 非空，所以一直没暴露。
+    """
+
+    def _record(self, msg):
+        return logging.LogRecord("t", logging.INFO, __file__, 1, msg, None, None)
+
+    def test_empty_keys_does_not_explode(self):
+        f = log_mod.RedactFilter([])
+        self.assertTrue(f.filter(self._record("token=abc123 普通日志")))
+
+    def test_masks_configured_keys(self):
+        f = log_mod.RedactFilter(["token"])
+        rec = self._record('请求头 {"token": "abc123"} 已发出')
+        self.assertTrue(f.filter(rec))
+        self.assertNotIn("abc123", rec.getMessage())
+        self.assertIn("***", rec.getMessage())
+
+    def test_masks_bearer_even_without_keys(self):
+        f = log_mod.RedactFilter(None)
+        rec = self._record("Authorization: Bearer abc.def-ghi")
+        self.assertTrue(f.filter(rec))
+        self.assertNotIn("abc.def-ghi", rec.getMessage())
 
 
 class TestClientBridge(unittest.TestCase):

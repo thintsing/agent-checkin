@@ -632,7 +632,10 @@ class ClientDriver(Driver):
         try:
             out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                                  capture_output=True, text=True, encoding="utf-8",
-                                 errors="replace", timeout=25)
+                                 errors="replace", timeout=25,
+                                 # pythonw（无控制台）下不声明它，powershell 会新建一个
+                                 # 可见控制台窗口闪一下 —— 就是用户报障的那个黑框。
+                                 creationflags=procenv.NO_WINDOW)
         except (OSError, subprocess.SubprocessError) as e:
             log.debug("进程查询失败：%s", e)
             return ""

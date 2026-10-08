@@ -14,6 +14,7 @@ import logging
 import subprocess
 from typing import List
 
+from . import procenv
 from .models import CheckinResult, Outcome
 
 log = logging.getLogger("checkin.notify")
@@ -63,6 +64,9 @@ def _toast(title: str, body: str) -> None:
             ["powershell", "-NoProfile", "-Command", script],
             timeout=15, check=False,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # 计划任务用 pythonw（无控制台）跑；不加这个 flag 的话，powershell.exe
+            # 会**新建一个可见的控制台窗口**闪一下 —— 正是我们要消灭的黑框。
+            creationflags=procenv.NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError) as e:
         log.debug("toast 失败（忽略）：%s", e)

@@ -8,6 +8,16 @@ import subprocess
 import sys
 from datetime import datetime
 
+# pythonw.exe 下没有控制台，`sys.stdout/stderr` 就是 **None** —— 任何 print() 都会
+# 直接 AttributeError。计划任务用的正是 pythonw（为的是不弹黑框，见 `_task_python()`），
+# 所以先给它们兜一个空设备，再统一重配编码。
+if sys.stdout is None or sys.stderr is None:
+    _devnull = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdout is None:
+        sys.stdout = _devnull
+    if sys.stderr is None:
+        sys.stderr = _devnull
+
 # 强制 UTF-8 输出，避免 Windows 控制台 GBK 下中文乱码
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -61,19 +71,28 @@ def _status(cfg, recipes, as_json: bool) -> int:
     return 0
 
 
-def _wake_hint(window_start: str) -> str:
-    """计划任务的唤醒时刻 = 窗口开始前 10 分钟。
+def _window_minutes(cfg) -> int:
+    """随机窗口的总长度（分钟）。计划任务用它作 `-RandomDelay` 的上界。
 
-    在这里自算，而不是调 scheduler：唤醒时刻只是"提前量"的算术，
-    与"窗口内随机采样"是两件事，不该耦合。
+    在这里自算，而不是调 scheduler：窗口长度只是"两个 HH:MM 相减"的算术，
+    与"在窗口内随机采样"是两件事，不该耦合。
     """
-    hh, _, mm = str(window_start).partition(":")
-    try:
-        total = int(hh) * 60 + int(mm or 0) - 10
-    except ValueError:
-        total = 7 * 60 + 30
-    total = max(0, total)
-    return f"{total // 60:02d}:{total % 60:02d}"
+    def _mins(value: str, fallback: int) -> int:
+        hh, _, mm = str(value).partition(":")
+        try:
+            return int(hh) * 60 + int(mm or 0)
+        except ValueError:
+            return fallback
+
+    start = _mins(cfg.schedule.window_start, 10 * 60 + 5)
+    end = _mins(cfg.schedule.window_end, 12 * 60 + 30)
+    return max(0, end - start)
+
+
+def _ps_timespan(total_minutes: int) -> str:
+    """PowerShell TimeSpan 字面量（`New-TimeSpan -Hours H -Minutes M`）。"""
+    hours, minutes = divmod(max(0, int(total_minutes)), 60)
+    return f"(New-TimeSpan -Hours {hours} -Minutes {minutes})"
 
 
 def _plan(cfg) -> int:
@@ -137,9 +156,18 @@ def _ps(script: str):
 
 
 def _task_python() -> str:
-    """计划任务用哪个解释器：优先项目 venv，没有就退回当前解释器。"""
-    python = os.path.join(_ROOT, ".venv", "Scripts", "python.exe")
-    return python if os.path.isfile(python) else sys.executable
+    """计划任务用哪个解释器：优先项目 venv，没有就退回当前解释器。
+
+    **优先 `pythonw.exe`（无控制台子系统）**，而不是 `python.exe`：
+    后者每次运行都会弹一个控制台黑框，而任务过去要"提前唤醒 + 等窗口内随机时刻"
+    —— 于是那个黑框在屏幕上挂了两小时（2026-10-08 用户报障）。`pythonw` 没有控制台，
+    同样的等待（现在已挪到计划任务侧，见 `_install_script`）也不会露脸。
+    """
+    for name in ("pythonw.exe", "python.exe"):
+        python = os.path.join(_ROOT, ".venv", "Scripts", name)
+        if os.path.isfile(python):
+            return python
+    return sys.executable
 
 
 def _task_command() -> str:
@@ -152,15 +180,19 @@ def _task_command() -> str:
 
     改成直接执行 `src/checkin/__main__.py`：它自己会把 `<root>/src` 挂上
     sys.path，于是与 cwd、与 PYTHONPATH 都无关。
+
+    末尾的 `--now` 是 2026-10-08 加的：随机时刻已由计划任务的 `-RandomDelay`
+    承担（任务在窗口内随机被唤醒），被唤醒时就该立刻干，不该再等一遍窗口。
     """
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
-    return f'"{_task_python()}" "{entry}"'
+    return f'"{_task_python()}" "{entry}" --now'
 
 
 def _print_task(cfg) -> int:
-    hint = _wake_hint(cfg.schedule.window_start)
     py = _task_python()
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
+    start = cfg.schedule.window_start
+    span = _window_minutes(cfg)
 
     print("")
     print("  推荐：直接装（自动处理路径与编码）\n")
@@ -168,8 +200,9 @@ def _print_task(cfg) -> int:
     print("")
     print("  等价的手写 PowerShell（可整段粘贴）：\n")
     print(f'    $a = New-ScheduledTaskAction -Execute "{py}" `')
-    print(f"         -Argument '\"{entry}\"' -WorkingDirectory \"{_ROOT}\"")
-    print(f"    $t = New-ScheduledTaskTrigger -Daily -At {hint}")
+    print(f"         -Argument '\"{entry}\" --now' -WorkingDirectory \"{_ROOT}\"")
+    print(f"    $t = New-ScheduledTaskTrigger -Daily -At {start} `")
+    print(f"         -RandomDelay {_ps_timespan(span)}")
     print("    $s = New-ScheduledTaskSettingsSet -StartWhenAvailable `")
     print("         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd")
     print("    $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME `")
@@ -177,13 +210,16 @@ def _print_task(cfg) -> int:
     print(f'    Register-ScheduledTask -TaskName "{_TASK_NAME}" `')
     print("         -Action $a -Trigger $t -Settings $s -Principal $p -Force")
     print("")
-    print(f"  任务在 {hint} 唤醒（窗口开始前 10 分钟），程序内部再随机等待到")
-    print(f"  {cfg.schedule.window_start}–{cfg.schedule.window_end} 之间的某时刻执行，")
-    print("  所以「每天几点签到」在系统层面看不出来。")
+    print(f"  任务在 {start} 起、{span} 分钟内的**随机时刻**触发"
+          f"（窗口 {start}–{cfg.schedule.window_end}），")
+    print("  触发即执行（`--now`），**不驻留等待** —— 所以既没有黑框，也没有长等待，")
+    print("  且「每天几点签到」在系统层面依然看不出来。")
     print("")
-    print("  · 唤醒时刻没开机 → -StartWhenAvailable 会在开机后补跑一次")
+    print("  · 触发时刻没开机 → -StartWhenAvailable 会在开机后补跑一次")
     print("  · 只在有登录会话时运行（锁屏算、未登录不算）—— 开浏览器需要桌面会话")
     print("  · 本机 schtasks.exe 被程序黑名单封了，所以走 PowerShell cmdlet")
+    print("  · 用 pythonw.exe 运行（无控制台），所以不会弹黑框")
+    print("  · 改动触发方式后**必须重跑本命令**才会生效（旧任务仍是老触发）")
     print("")
     print(f'  立刻试跑：Start-ScheduledTask -TaskName "{_TASK_NAME}"')
     print("  卸载    ：run_checkin.bat --uninstall-task")
@@ -196,20 +232,30 @@ def _install_script(cfg) -> str:
 
     抽成纯函数（不执行）是为了**可测**：真跑一次会往系统里塞任务，
     测试不该有这种副作用。测试只断言脚本内容对不对。
+
+    **随机化放在计划任务侧（`-RandomDelay`）而不是进程内**（2026-10-08 改）：
+    进程内等待的写法是"提前唤醒 → 睡到窗口内某时刻"，代价是一个进程（原先还是
+    一个黑框）要在屏幕上驻留最长 2.4 小时。改用 `-RandomDelay` 后，由 Task
+    Scheduler 在 `At` 起、延迟上界内**每次运行时重新随机**一个时刻唤醒我们
+    （MS-TSCH 3.2.5.4.2：服务端须随机选取延迟值），被唤醒就立刻干 ——
+    随机性一分不少，驻留时间归零。
     """
-    hint = _wake_hint(cfg.schedule.window_start)
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
+    start = cfg.schedule.window_start
+    span = _window_minutes(cfg)
     return (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute {_psq(_task_python())} "
-        f"-Argument {_psq(f'\"{entry}\"')} "
+        f"-Argument {_psq(f'\"{entry}\" --now')} "
         f"-WorkingDirectory {_psq(_ROOT)};"
-        f"$t=New-ScheduledTaskTrigger -Daily -At {hint};"
-        # -StartWhenAvailable       错过唤醒时刻（休眠/关机）后，开机自动补跑一次
+        # -RandomDelay <窗口长度>  触发时刻 = At + 每次运行重新随机的 [0, 窗口长度]
+        f"$t=New-ScheduledTaskTrigger -Daily -At {_psq(start)} "
+        f"-RandomDelay {_ps_timespan(span)};"
+        # -StartWhenAvailable       错过触发时刻（休眠/关机）后，开机自动补跑一次
         # -AllowStartIfOnBatteries  笔记本不在电源上也要跑（签到本身极轻）
         # -DontStopIfGoingOnBatteries / -DontStopOnIdleEnd
-        #                           等待窗口内随机时刻期间，不能因拔电源或"空闲结束"被杀
-        # -ExecutionTimeLimit 6h    够容纳"等到窗口末端"，又不至于挂死一整天
+        #                           随机延迟落点在窗口末端时，不能因拔电源或"空闲结束"被杀
+        # -ExecutionTimeLimit 6h    余量：正常几秒就结束，6h 只防挂死
         # -MultipleInstances IgnoreNew  程序自己也有 run.lock，这里是第二道
         "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd "
         "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
@@ -217,12 +263,13 @@ def _install_script(cfg) -> str:
         # 查 `-DontStopOnIdleEnd` 是否生效要看 `Settings.IdleSettings.StopOnIdleEnd`
         # —— 它**不在 Settings 顶层**（顶层没这个属性，去那儿读会得到 $null 并误判成
         # "没生效"，我因此白改了一轮还改坏了注册）。它管的是"任务运行期间系统空闲结束后
-        # 是否被杀"：本任务要等待窗口内随机时刻（最长约 2.5 小时），必须为 False。
+        # 是否被杀"：此随机延迟的落点可能靠窗口末端，必须为 False。
         "$p=New-ScheduledTaskPrincipal -UserId $env:USERNAME "
         "-LogonType Interactive -RunLevel Limited;"
         f"Register-ScheduledTask -TaskName {_psq(_TASK_NAME)} -Action $a -Trigger $t "
         "-Settings $s -Principal $p "
-        f"-Description {_psq('每日签到：' + hint + ' 唤醒，窗口内随机时刻执行')} "
+        f"-Description {_psq('每日签到：' + start + ' 起 ' + str(span)
+                             + ' 分钟内随机触发，触发即执行')} "
         "-Force | Out-Null;"
         f"Write-Output ('OK 已注册，状态=' + "
         f"(Get-ScheduledTask -TaskName {_psq(_TASK_NAME)}).State)"
@@ -242,9 +289,10 @@ def _install_task(cfg) -> int:
 
     用 PowerShell cmdlet 而不是 `schtasks.exe` —— 原因见 `_ps()` 的说明。
     """
-    hint = _wake_hint(cfg.schedule.window_start)
+    start = cfg.schedule.window_start
+    span = _window_minutes(cfg)
     print("\n  注册计划任务：")
-    print(f"    唤醒时刻 {hint}（每日），运行 {_task_command()}\n")
+    print(f"    {start} 起 {span} 分钟内的随机时刻触发（每日），运行 {_task_command()}\n")
     p = _ps(_install_script(cfg))
     out = ((p.stdout or "") + (p.stderr or "")).strip()
     print("  " + (out.replace("\n", "\n  ") or "(无输出)"))
@@ -349,7 +397,8 @@ def main(argv=None) -> int:
     parser.add_argument("--probe", action="store_true", help="诊断模式：查登录态/探测 token 键名，不签到")
     parser.add_argument("--only-site", default="", help="逗号分隔，仅处理指定站点 id")
     parser.add_argument("--config-root", default=_ROOT, help="项目根（含 config.yaml 与 recipes/）")
-    parser.add_argument("--now", action="store_true", help="立刻执行，不等调度窗口内的随机时刻")
+    parser.add_argument("--now", action="store_true",
+                        help="立刻执行，不等调度窗口内的随机时刻（计划任务即以此唤醒后直接执行）")
     parser.add_argument("--status", action="store_true", help="查看各站点状态与连续天数")
     parser.add_argument("--plan", action="store_true", help="查看今天的计划执行时刻")
     parser.add_argument("--print-task", dest="print_task", action="store_true",

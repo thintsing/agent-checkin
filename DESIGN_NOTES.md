@@ -35,6 +35,14 @@
 - **C. 降风险清单** → 单账号单设备；当日幂等；执行前随机延迟 + 站点间随机间隔；失败退避且 401 直接转人工不重试；连败熔断；日志与状态全程脱敏。
 - **D. 架构** → 分层（core / browser / drivers）+ **配方驱动**：站点知识（URL、接口、判定规则、mode）全部写进 `recipes/*.yaml` 数据文件，代码里不出现产品名；停用/扩展只改配方。
 - **E. 判定抽象** → `verdict.rules` 把业务 code 映射到统一 `Outcome` 语义（success/already/need_login/no_action），`unknown_result: no_action` 保证前端改版时不乱枪调用。
+- **F. 随机时刻放在哪一层？** → **放在计划任务侧（`-RandomDelay`），进程内不再等待**（2026-10-08 改）。
+  老做法是"提前唤醒 → 进程内睡到窗口内某时刻"，代价是**有一个进程要在屏幕上驻留最长 2.4 小时**
+  （实测 09:55 起、11:28 才动手，而它还是个 `python.exe` 的黑框 —— 用户直接报障）。
+  Task Scheduler 的 `-RandomDelay` 由服务端**每次运行时重新随机**（MS-TSCH 3.2.5.4.2：
+  "MUST choose a delay value randomly"），于是窗口长度不变、随机性一分不少，驻留时间归零。
+  手动 `run_checkin.bat`（不带 `--now`）仍走进程内 Beta 采样，两套互不冲突。
+  > 附带修掉的一个隐性缺口：`should_skip_today` 原本被关在 `if not now` 里。计划任务改用 `--now`
+  > 之后 `skip_weekends` 就会被静默绕过 —— 已把它提到 `now` 判断之外，并加回归测试锁住。
 
 ## 未决 / 观察点
 - WorkBuddy 网页端登录后 token 的确切 localStorage 键名未知 → 用 `--probe` 首次运行时探测，必要时锁定到配方 `token_localstorage_key`。
@@ -123,7 +131,7 @@ WorkBuddy 协同 Agent 在讨论期间也独立写了一套并行脚手架并做
 - **入口收敛为单文件**：所有 CLI 语义只在 `src/checkin/__main__.py` 定义，不再有 `cli.py` / `run.py` / `runner.py`。
 - **不依赖 `scripts/`**：`--print-task` 只输出一段可直接粘贴的 PowerShell
   （`Register-ScheduledTask`），直接用 venv 里的 python，少一个目录就少一个被删的面；
-  唤醒时刻由 `__main__._wake_hint()` 自算，不依赖 `scheduler`。
+  唤醒后的落点由 `__main__._window_minutes()` 自算（`-RandomDelay` 的上界），不依赖 `scheduler`。
 - **在易被误判的模块 docstring 里写明被引用关系**（见 `core/scheduler.py`）。
 - **API 以文件现主为准，不做对抗**：`core/scheduler.py` 被重写后（去掉 `day`/`rng`/`startup_hint`），
   由 `engine.py`、`__main__.py`、`tests/` 三处适配到新签名，而不是把文件改回去。

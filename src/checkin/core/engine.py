@@ -50,6 +50,12 @@ class Engine:
         now=False（默认）时，先在调度窗口内随机采样一个时刻并等待到点再跑 ——
         "每天同一秒唤醒"本身就是最容易被风控标记的模式，所以随机化放在引擎里，
         而不是各入口各写一遍：无论谁调用 Engine，都自动获得这层保护。
+
+        now=True 表示**调用方已经安排好时机**，不要再内部等待：
+          · 手动补跑（`run_checkin.bat --now`）；
+          · 计划任务唤醒 —— 2026-10-08 起随机化挪到了 Task Scheduler 的
+            `-RandomDelay`（每次运行重新随机），被唤醒即执行。
+        注意 now 只影响"等不等窗口"，**不影响"今天该不该跑"**（见 ② ）。
         """
         targets = [r for r in self.recipes if r.enabled and r.mode != "disabled"]
         if only:
@@ -63,13 +69,18 @@ class Engine:
         if readonly:
             return self._run_all(targets, dry_run, probe)
 
-        # ② 随机时刻：等窗口。放在取锁之前，避免长时间持锁挡住手动补跑。
+        # ② 今日跳过策略（周末等）—— **与"等不等窗口"无关，任何时候都该生效**。
+        #    刻意放在 `if not now` **之外**：计划任务现在用 `--now` 唤醒，若把这条
+        #    关进 `not now`，`skip_weekends` 就会被静默绕过 —— 那正是"配了却不起作用"
+        #    的隐形故障，本项目最忌讳的一类。
+        reason = scheduler.should_skip_today(self.cfg)
+        if reason:
+            log.info("今天不执行：%s", reason)
+            return [CheckinResult(r.id, Outcome.SKIPPED, message=f"今天不执行：{reason}")
+                    for r in targets]
+
+        # ③ 随机时刻：等窗口（now=True 已由调用方安排好，不再等）
         if not now:
-            reason = scheduler.should_skip_today(self.cfg)
-            if reason:
-                log.info("今天不执行：%s", reason)
-                return [CheckinResult(r.id, Outcome.SKIPPED, message=f"今天不执行：{reason}")
-                        for r in targets]
             target = scheduler.plan_today(self.cfg)
             wait = (target - datetime.now()).total_seconds()
             if wait > 0:
@@ -82,7 +93,7 @@ class Engine:
                     on_tick=lambda left: log.info("距执行还有 %.0f 分钟", left / 60)
                     if int(left) % 600 < 60 else None)
 
-        # ③ 单实例闸门
+        # ④ 单实例闸门
         lock = RunLock(os.path.join(os.path.dirname(self.cfg.state_path), "run.lock"))
         if not lock.acquire():
             log.warning("已有签到实例在运行（%s 被占用），本次不再抢跑", lock.path)

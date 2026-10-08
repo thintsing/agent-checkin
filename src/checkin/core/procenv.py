@@ -45,6 +45,15 @@ _BAD_EXACT = frozenset({
 # 前缀匹配：Agent 自身的一整套变量，对被测应用没有意义，删掉更干净
 _BAD_PREFIX = ("CODEBUDDY_", "CLAUDE_", "WORKBUDDY_")
 
+# 派生**控制台子系统**的子进程（powershell.exe 之流）时必须带上它。
+#
+# 计划任务用 `pythonw.exe`（无控制台）运行，目的就是不弹黑框；而 Windows 的规则是：
+# 一个没有控制台的父进程再去启动控制台程序、又没声明 CREATE_NO_WINDOW 时，
+# 系统会**为它新建一个可见的控制台窗口**。于是"消灭黑框"的努力会被一次
+# `subprocess.run(["powershell", ...])` 原样还回来（2026-10-08 排查）。
+# 非 Windows 上该常量不存在，取 0 即可（无此概念）。
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def clean_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """返回一份"去掉 Agent 污染"的环境变量副本。不改动传入的 base。"""

@@ -166,7 +166,7 @@ python -m checkin --dry-run     REM 演练：走完整流程但不触发、不�
 ```bash
 python -m checkin --login              # 打开专用浏览器，人工登录一次
 python -m checkin                      # 执行签到（先等到窗口内的随机时刻）
-python -m checkin --now                # 立刻执行，不等窗口（手动补跑）
+python -m checkin --now                # 立刻执行，不等窗口（手动补跑 / 计划任务唤醒后走的就是这条）
 python -m checkin --only-site workbuddy
 python -m checkin --status [--json]    # 状态报表
 python -m checkin --install-task       # 注册每日计划任务
@@ -177,6 +177,8 @@ python -m checkin --print-task         # 打印等价的手写注册命令
 > **注意**：`run_checkin.bat` 结尾带 `pause`，**不要**直接放进计划任务。用 `--install-task`。
 
 > **必须用 `--install-task` 注册**。计划任务的工作目录是 `C:\Windows\System32`，用 `python -m checkin` 会以 `No module named checkin` **每天准时失败且不弹窗**。现在改为直接执行 `src/checkin/__main__.py`（它自己会挂 `sys.path`），与工作目录无关。
+>
+> 任务用 **`pythonw.exe`（无控制台）** 运行，并带 `--now`；随机时刻由触发器的 `-RandomDelay` 承担 —— 所以运行期间**不会出现黑框，也不会驻留等待**。改动触发方式后必须重跑一次 `--install-task` 才会生效。
 
 ---
 
@@ -208,7 +210,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 | 措施 | 实现 |
 |---|---|
 | **凭证不出浏览器** | 不逆向加密 token、不存账号密码；请求在已登录页面上下文里 `fetch`，浏览器自动带鉴权与真实 TLS/HTTP2 指纹（`browser/page_script.py`） |
-| **随机执行时刻** | 计划任务只在窗口前唤醒；真正时刻由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待，**不是固定整点** |
+| **随机执行时刻** | 计划任务的触发器就是 `-At <窗口开始> -RandomDelay <窗口长度>`：由 Task Scheduler 每次运行时重新随机一个落点，程序被唤醒即执行（`--now`）。手动跑（不带 `--now`）时则由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待。**都不是固定整点** |
+| **不弹窗、不驻留** | 任务用 `pythonw.exe`（无控制台）运行；派生的 `powershell` 子进程一律带 `CREATE_NO_WINDOW`，`sys.stdout/stderr` 为 None 时有兜底 —— 全程无可见窗口 |
 | **单实例运行锁** | `core/lock.py`：系统级文件锁，防"计划任务 + 手动双击"并发导致重复打接口；进程退出自动释放 |
 | **当日幂等** | `core/state.py` + `engine.py`：已成功/已签的站点当天不再打接口 |
 | **拟人节奏** | 触发前随机延迟 1.5–6s、站点间随机间隔 25–90s（`core/jitter.py`） |

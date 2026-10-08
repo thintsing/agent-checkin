@@ -7,6 +7,59 @@
 
 ---
 
+## [2026-10-08 10:45] WorkBuddy(阿拾) —— 用户报障「黑框 + 等太久」：任务改 pythonw + 随机延迟挪到 Task Scheduler；顺带炸出脱敏过滤器潜伏 bug
+
+**一句话**：用户贴了张截图问「这个框能不让它显示么 而且等待时间也太长了」。两个诉求都属实且同源 ——
+老大是**进程内随机等待**：任务 09:55 唤醒，然后在黑框里干等到窗口内某时刻（今天实测 `11:28:32`，**94 分钟**）。
+改法：随机时刻改由**计划任务自己** `-RandomDelay` 承担、解释器换 `pythonw.exe`。173 项测试全绿。
+
+### 一、根因（两条，都是实测）
+
+| # | 症状 | 根因 |
+|---|---|---|
+| ① | 弹黑框，且一挂两小时 | 注册用的是 `.venv\Scripts\python.exe`（**控制台子系统**）；而任务"提前唤醒 + 等到窗口内某时刻" |
+| ② | 等待 94 分钟 | 随机化在**进程内**（`engine.run` → `scheduler.plan_today` + `wait_until`），窗口 10:05–12:30 ⇒ 最长 2h25m |
+
+今天日志（`logs/checkin-2026-10-08.log`）就是铁证：`09:55:01 计划 11:28:32 执行，等待 94 分钟`。
+
+### 二、改法
+
+- **触发**：`-At <window_start>` + `-RandomDelay (New-TimeSpan -Hours 2 -Minutes 25)`（=窗口长度）。
+  Task Scheduler 服务端**每次运行时重新随机**该延迟（MS-TSCH 3.2.5.4.2），所以随机性一分不少，
+  而进程**被唤醒即执行**、驻留时间归零。
+- **动作**：`pythonw.exe "…\__main__.py" --now`。`--now` = 不再内部等窗口。
+- **无窗口**（不用控制台的父进程派生控制台程序，Windows 会**新建可见控制台窗口**，黑框会以另一种方式回来）：
+  `core/procenv.NO_WINDOW`（= `CREATE_NO_WINDOW`）用于 `notify._toast` 与 `client_claim._app_running` 的 powershell；
+  `sys.stdout/stderr` 为 None 时在 `__main__` 兜空设备、`log.setup` 不挂 `StreamHandler`。
+- **归位**：`_wake_hint()`（窗口前 10 分钟）→ `_window_minutes()` + `_ps_timespan()`。
+- **⚠ 顺带修的隐性缺口**：`engine.run` 里 `should_skip_today` 原本被关在 `if not now` 内 ——
+  计划任务改用 `--now` 后 `skip_weekends` 会被**静默绕过**。已提到 `now` 之外，并加回归测试。
+
+### 三、真机验证
+
+- 触发器构造实测：`RandomDelay=PT2H25M`、`MSFT_TaskDailyTrigger`、`StartBoundary=10:05+08:00` ✅
+- 重装：`--install-task` → `OK 已注册`；读回 `Exec=…pythonw.exe`、`Args="…__main__.py" --now`、
+  `ExecLimit=PT6H`、`StopOnIdleEnd=False`、`MultipleInstances=IgnoreNew` ✅
+- **旧实例仍在等**（今天 09:55 起的那两个 `python.exe`，PID 8928→7432）→ `Stop-ScheduledTask` 停掉，无残留。
+- **端到端冒烟**：`Start-ScheduledTask` → 进程为 `pythonw.exe … --now` → 日志正常写入 → 两站幂等跳过
+  （今天已完成），全程 **12 秒内**（老路径此时还在等 50 分钟）。
+- 今天签到本身也已用 `--now` 立刻补跑：**两站真领取**且服务端侧复核 —— Qoder `claimable` 10:17:50 `true`
+  → **10:33:35 `false`**；WorkBuddy bridge `today_checked_in=true`、`checkin_dates[0]="2026-10-08"`。
+
+### 四、顺手炸出的潜伏 bug（非本次诉求，但真会咬人）
+
+`core/log.py` 的 `RedactFilter`：`redact_keys` 为**空列表**时会拼出不含捕获组的 `(?!)`，
+却仍用 `\1***` 做替换 ⇒ **每条日志**抛 `re.error: invalid group reference 1`。
+默认配置 keys 非空所以一直没暴露，是写测试时炸出来的。已改成 `if self.keys:` 才拼那条正则，并补 3 条测试。
+
+### 五、未首考 / 待观察
+
+- **明天 10:00 那次**才是新触发的真首考：应看到"任务在 10:05–12:30 之间的某随机时刻被唤醒 → 立刻执行"，
+  而不是"09:55 唤醒 → 等到某时刻"。观察点：`Get-ScheduledTaskInfo` 的 `NextRunTime` 与日志首行时间。
+- Qoder `_recheck_stale()` 的完整路径**仍未触发过**（连续两天首查即见按钮）。
+
+---
+
 ## [2026-10-07 13:05] WorkBuddy(阿拾) —— 今日两站**真领取**（服务端侧复核）；文档同步：README/AGENTS 落后于代码，已补齐并推送
 
 **一句话**：① 核验今日自动签到 —— **两站都真领到了**，且是**服务端侧**独立复核过的（不是只看驱动日志）；
