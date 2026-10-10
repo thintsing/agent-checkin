@@ -75,6 +75,9 @@ reminder:
   # 未登录，用户直到 12:29 自己来问才发现 —— 白白漏了半天。**这才是真正的问题**，
   # 不是 401 本身（401 意味着会话真过期了，转人工是正确行为）。
   # 所以补上这条通知，把"静默漏签"变成"看得见的待办"。
+  # 开窗时刻闸门（与 Qoder 对齐）：engine 在 10:00 前不执行本站点；
+  # 同时它也是"本窗口已领"判定的窗口起点（见 `ClientDriver._window_start`）。
+  not_before: '10:00'
   toast_title: "WorkBuddy 签到需重新登录"
   toast_body: "签到专用浏览器的登录态已失效。请运行 python -m checkin --login 登录后补签。"
 
@@ -104,6 +107,22 @@ client:
   # 调试端口 —— **单一事实源**：tools/win_shortcut_args.py 写快捷方式时读的就是这里。
   # 9333 = 网页侧专用浏览器；9335 = Qoder 客户端；本机 9336 已实测空闲（2026-10-06）。
   debug_port: 9336
+
+  # ---- 生存期 / 自愈 ----
+  # ⚠ `close_after` 必须显式 false：桌面端是用户全天在用的主力工具，**绝不能**
+  #   像 Qoder 那样"领完就关"。这条注释 2026-10-06 就写了，但**字段一直漏着** ——
+  #   代码默认 `True`，于是"客户端没在跑 → 由我们拉起"那条路一旦走到，就会把
+  #   用户的 WorkBuddy 关掉。2026-10-10 逐项核对配方时发现并补上。
+  close_after: false
+
+  # 无端口守候（2026-10-10 新增）：调试端口只能在**启动时**绑定，而客户端可能
+  #   连续数天不重启 ⇒ 那个实例整个生命周期都接管不了，**每天**静默漏签
+  #   （10-09 13:15 起来的实例一路跑到 10-10，当天就这么漏了）。
+  #   既不杀客户端（会打断用户手头的活），就改为守候：只要用户中途重启了客户端
+  #   （带上 9336），端口一出现立刻接管补领。窗口 10:05–12:30，取 90 分钟覆盖主时段。
+  #   缺省 0 = 不守候，故对 Qoder 等无此场景的站点零影响。
+  wait_port_sec: 5400
+
   # electron-builder 的 per-user 安装，路径固定，没有 Qoder 那种 `.qoder-versions\*\` 滚动目录。
   exe: '%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe'
   exe_glob: ''
@@ -125,9 +144,20 @@ client:
   open_entry_labels: []      # 入口按钮实测**无 aria-label**（是 button.user-menu-trigger），故留空
   entry_delay_sec: 1.5
   entry_timeout_sec: 20
-  # 日志结构是 `logs\<日期>\*MainThread*.log`，与 Qoder 的 `logs\<session>\main.log`
-  # 不同 ⇒ 分支①的"零打扰预检"会自动跳过（_log_state 返回 None），不影响主流程。
+  # `data_dir` 走的是 Qoder 那套"多会话目录"预检（`logs/<session>/main.log`）——
+  #   本客户端不是那个结构，故留空（`_log_state_sessions` 直接返回 None，不影响主流程）。
   data_dir: ''
+  # 真正的日志预检走下面这条**单文件**配置（2026-10-10 新增）。
+  #   价值：**不连端口**就能判断"本窗口是否已领" —— 用户自己手动领过时，驱动直接
+  #   判 already，既省掉一次接管，也不会把它误报成"漏签"；反过来当端口不可用时，
+  #   它就是唯一的第三方旁证。
+  #   判据 `today_checked_in` 来自服务端返回（`[Checkin] fetchCheckinStatus success`），
+  #   比任何 UI 渲染都快而准。日志时间戳是 **UTC**，解析侧会转 CST。
+  log_state:
+    file: '%USERPROFILE%\.workbuddy\logs\main.log'
+    marker: '[Checkin] refreshStatus'
+    claimed_field: today_checked_in
+    claimed_value: true
   # ---- bridge：不点 DOM，直接用客户端自己的 http 通道调接口 ----
   # 这是 2026-10-06 实测确定的主路径（证据见 HANDOFF 当日条目）：
   #   · 客户端内部有 `window.wb.http`（get/post/put/patch/delete），

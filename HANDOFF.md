@@ -7,6 +7,55 @@
 
 ---
 
+## [2026-10-10 16:40] WorkBuddy(阿拾) —— 用户报「WorkBuddy 今天还是没领成功」：查出是**结构性缺口**（无端口实例长跑），补两层自愈 + 修掉 `close_after` 漏配
+
+**一句话**：上一轮补的启动入口**只对"下一次启动"生效**，而客户端从 **10-09 13:15 起连续跑了 27h+ 没重启** ——
+那个实例整个生命周期都没有 9336，于是今天照样只能降级成"提醒"。**不是修复无效，是修复还没机会生效。**
+
+### 证据（全部独立信源，不靠驱动自报）
+
+| # | 信源 | 内容 |
+|---|---|---|
+| ① | `logs/checkin-2026-10-10.log:10,18` | 11:55 / 12:24 两次均 `客户端已在运行且未开调试端口，无法接管，降级为提醒` |
+| ② | **客户端自己的日志** `~/.workbuddy/logs/main.log` | 16:28:14 `today_checked_in:false`、`uiState:"available"`、`streak_days:10` |
+| ③ | 同上（claim 计数） | 今日 `claimDailyCheckin` 出现 **0** 次 |
+| ④ | `AppStartup.log` | `uptimeSec=81304` @11:50 → 进程启动于 **10-09 13:15**，至今未重启 |
+| ⑤ | 端口探测 | 9335(Qoder) LISTENING；**9336(WorkBuddy) 无** |
+| ⑥ | 入口核查 | 桌面 lnk / 开始菜单 lnk / **Run 键** 均已带 `--remote-debugging-port=9336` |
+
+Qoder 当日**正常**（客户端日志 12:15:57 已领，驱动 12:22 判 already）。
+
+### 改了什么
+
+**`src/checkin/drivers/client_claim.py`**
+- **分支③（无端口）从"立刻放弃"改为"按配方守候"**：`wait_port_sec > 0` 时轮询端口，
+  用户中途重启了客户端 → 端口一出现立刻接管补领。`_wait_port` 加 `poll` 参数
+  （0.8s 用于"刚启动客户端"；**10s** 用于分钟~小时级守候，免得两小时发九千次 HTTP 探测）。
+- `_log_state` **按日志形态分流**：新增 `_log_state_from_file`（单文件 JSON，判据 `today_checked_in`）；
+  原逻辑改名 `_log_state_sessions`（多会话目录，判据 `[Campaign]`/`claimable`）。两者返回**同一契约**。
+  抽出 `_window_start` 供两路复用。
+
+**`recipes/workbuddy.yaml`**
+- ⚠ **补上 `close_after: false`** —— 注释 10-06 就写着"必须 false"，**字段却一直漏着**；
+  代码默认 `True` ⇒ 一旦走"客户端没在跑 → 由我们拉起"那条路，领完会**把用户的主力工具关掉**。
+- 加 `wait_port_sec: 5400`（90 分钟守候，覆盖窗口主时段）。
+- 加 `log_state`（单文件日志预检 —— **不连端口**就能判"本窗口是否已领"，用户手动领过时直接判 already）。
+- 加 `reminder.not_before: '10:00'`（与 Qoder 对齐：既是开窗闸门，也是"本窗口已领"判定的窗口起点）。
+
+**`tests/test_core.py`**：+10 项守卫（单文件日志形态 5 项 / 无端口守候 3 项 / 配方完整性 2 项）→ **185 全绿**。
+
+### 本轮的临时设施（不入库：根目录 `_` 前缀）
+
+- `_wb_rescue.py` —— 一次性补领守护：轮询 9336，出现即调 `--only-site workbuddy --now`。
+- `_wb_rescue_install.py` —— 注册成**一次性计划任务 `AgentCheckinRescue`** 并立即启动；
+  由 Task Scheduler 托管 ⇒ **不会**随 WorkBuddy 重启被杀（挂在它下面的子进程会被一起带走）。
+- 日志 `logs/_rescue.log`。⚠ 用完需 `Unregister-ScheduledTask -TaskName AgentCheckinRescue` 清理。
+
+**状态**：等用户重启 WorkBuddy（带 9336）→ 守护自动补领。
+**待首考**：明天 09:55 的守候路径、`_log_state_from_file` 在真机日志上的命中。
+
+---
+
 ## [2026-10-10 16:30] WorkBuddy(阿拾) —— 用户问「今天为什么没自动签到」：查出 **RandomDelay 让任务整块被跳过**，连同两个独立缺陷一并修掉
 
 **一句话**：任务**根本没触发**（不是站点失败）。顺带发现 Qoder 入口时序太紧、WorkBuddy 自启动绕过调试端口。

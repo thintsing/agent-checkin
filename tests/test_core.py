@@ -629,6 +629,42 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(c["close_after"] is True,
                         "领完必须关掉 —— 调试端口是本机任何程序都能接管会话的口子")
 
+    def test_workbuddy_client_recipe_is_complete(self):
+        """WorkBuddy 与 Qoder 的**关键差异**必须钉在配方里。
+
+        2026-10-10 逐项核对时发现两处缺口：
+          · `close_after` 注释写着"必须 false"，**字段却漏了** —— 默认 True 会让
+            "客户端没在跑 → 由我们拉起"那条路在领完后**把用户的主力工具关掉**；
+          · 没有 `wait_port_sec` —— 客户端长期不重启（10-09 13:15 起一直跑到次日）
+            造成的无端口形态，每天只能降级提醒，**天天静默漏签**。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        wb = next(r for r in recipes if r.id == "workbuddy")
+        c = wb.client
+
+        self.assertIs(c.get("close_after"), False,
+                      "WorkBuddy 是用户全天在用的主力工具，领完绝不能关它")
+        self.assertGreater(int(c.get("wait_port_sec") or 0), 0,
+                           "客户端可能多日不重启，必须守候端口才能自愈")
+        self.assertEqual(wb.reminder.get("not_before"), "10:00",
+                         "开窗时刻既是提醒闸门，也是「本窗口已领」判定的窗口起点")
+        # 免端口的日志预检：三项缺一都会静默退回 None，等于白配
+        ls = c.get("log_state") or {}
+        self.assertTrue(str(ls.get("file") or "").endswith("main.log"))
+        self.assertTrue(ls.get("marker"), "缺 marker 会把任意同名字段当判据")
+        self.assertEqual(ls.get("claimed_field"), "today_checked_in")
+        self.assertIs(ls.get("claimed_value"), True)
+        # bridge 仍是主路径（不点 DOM，直接走客户端自己的 http 通道）
+        bridge = c.get("bridge") or {}
+        self.assertTrue(bridge.get("status_js") and bridge.get("claim_js"))
+
+    def test_qoder_is_not_affected_by_the_new_knobs(self):
+        """新增的两个 knob 只服务 WorkBuddy；Qoder 不得被顺手改掉（它没这个场景）。"""
+        _, recipes = load_config(str(PROJECT_ROOT))
+        q = next(r for r in recipes if r.id == "qoder")
+        self.assertNotIn("log_state", q.client or {})
+        self.assertFalse(int((q.client or {}).get("wait_port_sec") or 0))
+
 
 # ----------------------------------------------------------------------
 # 进程环境清洗（client 驱动的地基）
@@ -732,6 +768,119 @@ class TestClientDriverLogic(unittest.TestCase):
         self.assertIsNotNone(st, "空会话把唯一带状态的会话挤出了扫描窗口")
         self.assertFalse(st["claimable"])
         self.assertEqual(st["at"], "2026-09-25 12:52:12", "UTC 04:52 应换算成 CST 12:52")
+
+    # ------------------------------------------ 单文件日志形态（WorkBuddy）
+
+    @staticmethod
+    def _wb_client(log_file, **over):
+        c = {"debug_port": 9336, "process_match": "WorkBuddy.exe", "wait_port_sec": 0,
+             "log_state": {"file": log_file, "marker": "[Checkin] refreshStatus",
+                           "claimed_field": "today_checked_in", "claimed_value": True}}
+        c.update(over)
+        return c
+
+    @staticmethod
+    def _wb_line(flag, minutes_ago=5, marker="[Checkin] refreshStatus"):
+        """一行 WorkBuddy 形态的签到日志（时间戳为 UTC，与真机一致）。"""
+        from datetime import timezone
+        ts = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+        return json.dumps(
+            {"timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "level": "info",
+             "scope": "queue-diag",
+             "message": [marker + " -> active",
+                         {"uiState": "claimed" if flag else "available",
+                          "today_checked_in": flag}]},
+            ensure_ascii=False)
+
+    def _tmp_log(self, content):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "main.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_log_state_from_file_reads_the_workbuddy_shape(self):
+        """单文件 JSON 日志：`today_checked_in=true` 且时刻在本窗口内 ⇒ 判"已领"。
+
+        时间戳是 **UTC**（客户端日志风格），必须先换算再与窗口起点比 ——
+        不换算会整整错 8 小时，把清晨的陈旧记录误当成今天窗口内的。
+        """
+        path = self._tmp_log(self._wb_line(True) + "\n")
+        st = self.d._log_state(self._wb_client(path), "10:00")
+        self.assertIsNotNone(st)
+        self.assertFalse(st["claimable"], "对外契约与 Qoder 分支一致：已领 ⇒ claimable=False")
+        self.assertTrue(st["claimed_in_window"])
+
+    def test_log_state_from_file_not_claimed_when_flag_false(self):
+        """`today_checked_in=false` ⇒ claimable=True / claimed_in_window=False（确实该去领）。"""
+        path = self._tmp_log(self._wb_line(False) + "\n")
+        st = self.d._log_state(self._wb_client(path), "10:00")
+        self.assertIsNotNone(st)
+        self.assertTrue(st["claimable"])
+        self.assertFalse(st["claimed_in_window"])
+
+    def test_log_state_from_file_missing_file_is_none(self):
+        missing = os.path.join(tempfile.gettempdir(), "no_such_wb_log_xyz.log")
+        self.assertIsNone(self.d._log_state(self._wb_client(missing), "10:00"))
+
+    def test_log_state_from_file_requires_the_marker(self):
+        """没命中 marker 的行不许当判据 —— 否则日志里任意同名字段都会污染结论。"""
+        path = self._tmp_log(self._wb_line(True, marker="[Unrelated] noise") + "\n")
+        self.assertIsNone(self.d._log_state(self._wb_client(path), "10:00"))
+
+    def test_log_state_without_spec_keeps_the_old_session_scan(self):
+        """没配 `log_state` 的老站点（Qoder）必须完全维持原行为，不能误走新分支。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.assertIsNone(self.d._log_state({"data_dir": tmp.name}, "10:00"))
+
+    # ------------------------------------------ 无端口守候（10-10 真漏签的解法）
+
+    @staticmethod
+    def _run_recipe(**client_over):
+        client = {"debug_port": 9336, "process_match": "WorkBuddy.exe", "wait_port_sec": 0,
+                  "log_state": {"file": "/no/such/log"}}
+        client.update(client_over)
+        return Recipe.from_dict({"id": "workbuddy", "name": "wb", "enabled": True,
+                                 "mode": "client", "origin": "https://x", "client": client})
+
+    def test_running_without_port_waits_then_claims(self):
+        """回归（2026-10-10 真漏签）：客户端在跑但没有调试端口时**不再立刻放弃** ——
+        按配方守候，端口一出现就接管补领。这就是"客户端长期不重启"的解法。
+        """
+        r = self._run_recipe(wait_port_sec=60)
+        ok = CheckinResult("workbuddy", Outcome.SUCCESS, message="ok")
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value="cmdline"), \
+             mock.patch.object(self.d, "_wait_port", return_value=True) as wp, \
+             mock.patch.object(self.d, "_claim", return_value=ok):
+            res = self.d.run(r, _cfg())
+        self.assertIs(res, ok)
+        wp.assert_called_once()
+        self.assertEqual(wp.call_args[0][1], 60, "守候时长必须取自配方 wait_port_sec")
+
+    def test_running_without_port_degrades_when_wait_expires(self):
+        """守候到点仍没端口 ⇒ 回到"降级提醒"，且绝不误报成功。"""
+        r = self._run_recipe(wait_port_sec=60)
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value="cmdline"), \
+             mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(self.d, "_remind") as rem:
+            res = self.d.run(r, _cfg())
+        self.assertEqual(res.outcome, Outcome.NO_ACTION)
+        rem.assert_called_once()
+
+    def test_zero_wait_keeps_the_old_immediate_give_up(self):
+        """缺省 0 = 不守候，维持老行为（对 Qoder 等无此场景的站点零影响）。"""
+        r = self._run_recipe(wait_port_sec=0)
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value="cmdline"), \
+             mock.patch.object(self.d, "_wait_port") as wp, \
+             mock.patch.object(self.d, "_remind"):
+            res = self.d.run(r, _cfg())
+        wp.assert_not_called()
+        self.assertEqual(res.outcome, Outcome.NO_ACTION)
 
     def test_js_uses_full_event_sequence_not_bare_click(self):
         """回归：该 UI 绑 pointerdown，只派发 click() 会**静默无效**（踩过）。"""

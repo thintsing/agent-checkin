@@ -191,15 +191,32 @@ class ClientDriver(Driver):
             res = self._claim(recipe, c, port, match)
             return res
 
-        # ③ 客户端在运行但没有调试端口 → 不杀（会打断用户），降级提醒
+        # ③ 客户端在运行但没有调试端口 —— **本项目的结构性缺口**。
+        #    调试端口只能在启动时绑定，而客户端是用户全天在用的主力工具，
+        #    可能连续数天不重启 ⇒ 一旦某次它以无端口形态起来，之后**每天**都静默漏签。
+        #    2026-10-10 就是这个成因：10-09 13:15 启动的实例一路跑到次日都没重启，
+        #    当天自动签到只能降级为"提醒"，实际没领到。
+        #
+        #    绝不杀它（那会打断用户手头的活）——改为**按配方守候端口**：
+        #    用户中途自己重启了客户端，端口一出现我们立刻接管补领。
+        #    `wait_port_sec` 缺省 0 = 不守候，保持原行为（对 Qoder 等无此场景的站点无影响）。
         running = self._app_running(c)
         if running:
+            wait_sec = int(_float_cfg(c, "wait_port_sec", 0))
+            if wait_sec > 0:
+                log.warning("[%s] 客户端在运行但未开调试端口（%s）；按配方守候端口最多 %ds",
+                            sid, running[:100], wait_sec)
+                if self._wait_port(port, wait_sec, poll=10):
+                    log.info("[%s] 端口 %s 已出现（客户端已被重启），接管补领", sid, port)
+                    return self._claim(recipe, c, port, match)
+                log.warning("[%s] 守候 %ds 结束，端口始终未出现", sid, wait_sec)
             log.warning("[%s] 客户端已在运行且未开调试端口，无法接管，降级为提醒（%s）",
                         sid, running[:120])
             self._remind(recipe)
             return CheckinResult(sid, Outcome.NO_ACTION,
                                  message="客户端正在运行，无法自动接管，已提醒你手动领取",
-                                 detail={"reason": "already_running_without_debug_port"})
+                                 detail={"reason": "already_running_without_debug_port",
+                                         "waited_sec": wait_sec})
 
         # ④ 客户端没在跑 → 我们拉起来，领完再关掉
         exe = self._resolve_exe(c)
@@ -535,6 +552,21 @@ class ClientDriver(Driver):
                              message="[诊断] " + " · ".join(parts), detail=detail)
 
     def _log_state(self, c: Dict[str, Any], gate: str) -> Optional[Dict[str, Any]]:
+        """读客户端日志，判断"**当前活动窗口**内是否已领取"。
+
+        两种日志形态，由配方分流：
+          · 单文件 —— 配方给了 `client.log_state`（WorkBuddy：
+            `%USERPROFILE%\\.workbuddy\\logs\\main.log`，JSON 行，判据 `today_checked_in`）；
+          · 多会话目录 —— 老形态（Qoder：`logs/<session>/main.log`，判据 `[Campaign]`/`claimable`）。
+        两者返回**同一个契约**：`{claimable, at, claimed_in_window, ...}`，
+        调用方（`run()` 的分支①）据此直接判 already，不需要关心是哪一种。
+        """
+        spec = c.get("log_state")
+        if isinstance(spec, dict) and spec.get("file"):
+            return self._log_state_from_file(spec, gate)
+        return self._log_state_sessions(c, gate)
+
+    def _log_state_sessions(self, c: Dict[str, Any], gate: str) -> Optional[Dict[str, Any]]:
         """从客户端主进程日志里读服务端最近一次下发的 campaign 状态。
 
         为什么值得做：日志是**持久**的，不启动客户端就能判断"本窗口是否已领取"。
@@ -597,16 +629,12 @@ class ClientDriver(Driver):
         return None
 
     @staticmethod
-    def _claimed_in_window(claimable: Optional[bool], at: Optional[datetime],
-                           gate: str) -> bool:
-        """日志这条记录是否足以断定"**当前活动窗口**内已领取"。
+    def _window_start(gate: str) -> datetime:
+        """当前活动窗口的起点时刻。
 
-        光看 `claimable=false` 不够 —— 它可能来自上一个窗口的陈旧记录。
-        必须同时确认记录时刻落在当前窗口内：窗口起点 = 今天的开窗时刻，
-        若现在还没到开窗时刻，则起点回退到昨天。
+        开窗时刻 = 配方给的 `gate`（如 "10:00"）；若现在还没到它，起点回退到昨天 ——
+        因为"本窗口是否已领"在开窗前问的其实是**上一个窗口**。
         """
-        if claimable is not False or at is None:
-            return False
         hh, _, mm = (gate or "10:00").partition(":")
         try:
             g_h, g_m = int(hh), int(mm or 0)
@@ -616,7 +644,78 @@ class ClientDriver(Driver):
         start = now.replace(hour=g_h, minute=g_m, second=0, microsecond=0)
         if now < start:
             start -= timedelta(days=1)
-        return at >= start
+        return start
+
+    @staticmethod
+    def _claimed_in_window(claimable: Optional[bool], at: Optional[datetime],
+                           gate: str) -> bool:
+        """日志这条记录是否足以断定"**当前活动窗口**内已领取"。
+
+        光看 `claimable=false` 不够 —— 它可能来自上一个窗口的陈旧记录。
+        必须同时确认记录时刻落在当前窗口内（窗口起点见 `_window_start`）。
+        """
+        if claimable is not False or at is None:
+            return False
+        return at >= ClientDriver._window_start(gate)
+
+    def _log_state_from_file(self, spec: Dict[str, Any], gate: str
+                             ) -> Optional[Dict[str, Any]]:
+        """单文件日志形态的通用解析（由配方的 `client.log_state` 驱动）。
+
+        WorkBuddy 的签到状态写在**单个** `logs/main.log` 里（不像 Qoder 每次启动
+        新建一个会话子目录），每行一条 JSON，样例（时间戳是 UTC）：
+
+            {"timestamp":"2026-10-10T08:28:14.803Z","level":"info","scope":"queue-diag",
+             "message":["[Checkin] refreshStatus -> active",
+                        {"uiState":"available","today_checked_in":false,"streak_days":10}]}
+
+        配方给出三样东西：`marker`（行标识）、`claimed_field`（字段名）、
+        `claimed_value`（该字段等于什么才算"已领"）。
+
+        刻意用「字段名正则 + 数值比较」而不是解析整行 JSON：客户端日志里有非严格
+        JSON 的行，整行解析会直接抛错；正则只依赖"某个键的值"，抗噪更好，
+        也让新增站点只需改配方、不动代码。
+        """
+        path = expand(str(spec.get("file") or ""))
+        if not path or not os.path.isfile(path):
+            return None
+        marker = str(spec.get("marker") or "")
+        field = str(spec.get("claimed_field") or "")
+        if not field:
+            return None
+        want = bool(spec.get("claimed_value", True))
+        try:
+            text = _read_tail(path)
+        except OSError:
+            return None
+
+        field_pat = re.compile(r'"%s"\s*:\s*(true|false)' % re.escape(field))
+        ts_pat = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+        last = None
+        for ln in text.splitlines():
+            if marker and marker not in ln:
+                continue
+            m = field_pat.search(ln)
+            if not m:
+                continue
+            at = None
+            t = ts_pat.search(ln)
+            if t:
+                try:
+                    at = (datetime.fromisoformat(t.group(1).replace("Z", "+00:00"))
+                          .astimezone(CST))
+                except ValueError:
+                    at = None
+            last = {"claimed_raw": m.group(1) == "true", "_at_dt": at}
+        if not last:
+            return None
+
+        at = last.pop("_at_dt", None)
+        claimed_now = last.pop("claimed_raw") == want
+        # 对外统一成与 Qoder 分支相同的契约：`claimable=False` ≡ "本窗口已领"
+        return {"claimable": not claimed_now,
+                "at": at.strftime("%Y-%m-%d %H:%M:%S") if at else None,
+                "claimed_in_window": self._claimed_in_window(not claimed_now, at, gate)}
 
     # ------------------------------------------------------------ 进程/端口
 
@@ -678,12 +777,19 @@ class ClientDriver(Driver):
         except Exception:
             return False
 
-    def _wait_port(self, port: int, timeout: int) -> bool:
+    def _wait_port(self, port: int, timeout: int, poll: float = 0.8) -> bool:
+        """轮询等端口就绪。
+
+        `poll` 分两档，因为两种用法的时间尺度差三个数量级：
+          · 0.8s —— 我们自己刚启动客户端，等它 bind 端口（十几秒级）；
+          · 10s  —— **守候用户重启客户端**（分钟~小时级，见 `run()` 分支③）。
+            用 0.8s 去守候两小时 = 九千次 HTTP 探测，纯属浪费。
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._port_alive(port):
                 return True
-            time.sleep(0.8)
+            time.sleep(poll)
         return False
 
     @staticmethod
