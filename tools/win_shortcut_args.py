@@ -33,6 +33,8 @@ Electron 应用的调试端口**只能在启动时绑定**，运行中无法追�
     python tools/win_shortcut_args.py --app workbuddy        # 同上，WorkBuddy
     python tools/win_shortcut_args.py --app qoder --revert   # 从备份还原
     python tools/win_shortcut_args.py --qoder                # 等价 --app qoder（旧写法保留）
+    python tools/win_shortcut_args.py --app workbuddy --autostart           # 改 **自启动 Run 键**
+    python tools/win_shortcut_args.py --app workbuddy --autostart --revert  # 还原 Run 键
 
 端口不在这里定义 —— 每个应用的端口来自**它自己的配方**（单一事实源）：
 `--app qoder` → `recipes/qoder.yaml`，`--app workbuddy` → `recipes/workbuddy.yaml`，
@@ -41,17 +43,30 @@ Electron 应用的调试端口**只能在启动时绑定**，运行中无法追�
 为什么端口必须由配方单点定义：端口是**一次性资源**（2026-09-27 的 9334 就被
 已死进程的僵尸句柄占死，只能换）。换端口时若快捷方式与驱动各留一份旧值，
 就会出现"端口写着 A、驱动连 B"的静默失配 —— 实测踩过。
+
+**为什么还要管"自启动 Run 键"（2026-10-10 真漏签后新增）**
+----------------------------------------------------------
+只改 `.lnk` 不够：客户端自己有"开机自启"时，开机后它是**由 Run 键拉起的**，
+根本不经过快捷方式 ⇒ 那个实例没有调试端口 ⇒ 驱动只能降级为提醒、当天领不到。
+实测：WorkBuddy 5.7.7（2026-10-08 升级）带上了
+`HKCU\\...\\Run :: WorkBuddy.WorkBuddy = ...\\WorkBuddy.exe`（无参数），
+10-09 重启后自启的实例就是无端口形态。
+⇒ 凡是有自启动项的应用，必须**同时**改 Run 键；改完重启客户端才生效。
+（Run 键用 Python 的 `winreg` 读写，不经 COM，绕开本机对 COM 宿主的安全拦截。）
 """
 from __future__ import annotations
 
 import argparse
 import ctypes
 import glob
+import json
 import os
+import re
 import shutil
 import stat
 import sys
 import uuid
+import winreg
 from ctypes import POINTER, WINFUNCTYPE, byref, c_int, c_long, c_void_p, c_wchar_p, wintypes
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -59,11 +74,17 @@ RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
 
 DEBUG_ARG_PREFIX = "--remote-debugging-port="
 
+# 自启动（登录时运行）所在的注册表位置。值名见 APPS[*]["run_key"]。
+RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+
 # 每个应用一张表。加新应用 = 加一条表项，逻辑不动。
 #
 # `lock` = **实测**会被客户端自己回写（启动时重置成无参数版本）的那一个入口的下标。
 # 只有它需要只读保护。值为 None 表示"还没观察到回写，先不加锁"——
 # 加锁有代价（客户端更新器可能写不进去），没有实测依据就不要加。
+#
+# `run_key` = 该应用在 `HKCU\...\Run` 里的**值名**；None = 没有这项自启动（无需处理）。
+# 有自启动的应用，`.lnk` 与 Run 键**都要**带端口，否则开机自启的那个实例接管不了。
 APPS = {
     "qoder": {
         "label": "Qoder CN",
@@ -75,6 +96,8 @@ APPS = {
         ],
         # 2026-09-25 实测：Qoder 启动时只回写这一个。
         "lock": 1,
+        # 2026-10-10 实地核查：Run 键里没有 Qoder 的项。
+        "run_key": None,
     },
     "workbuddy": {
         "label": "WorkBuddy",
@@ -85,6 +108,9 @@ APPS = {
         ],
         # 2026-10-06 实测记录：改完重启后**未被回写**（见 HANDOFF）。
         "lock": None,
+        # 2026-10-10 实地核查：WorkBuddy 5.7.7 有自启动项，且**不带端口** ——
+        # 10-09 重启后自启的实例因此接管不了（当天真漏签）。
+        "run_key": "WorkBuddy.WorkBuddy",
     },
 }
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
@@ -258,6 +284,92 @@ def do_set(lnk: str, arg: str, backup_dir: str, lock: bool = False) -> int:
     return 0 if ok else 1
 
 
+def run_entry_name(app: str):
+    """该应用在 Run 键里的值名；没有就返回 None。"""
+    return APPS[app].get("run_key")
+
+
+def read_run_value(app: str):
+    """读 Run 键里该应用的当前值（不存在返回 None）。"""
+    name = run_entry_name(app)
+    if not name:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            value, _ = winreg.QueryValueEx(k, name)
+            return value
+    except FileNotFoundError:
+        return None
+
+
+def _exe_of(value: str) -> str:
+    """从 Run 值里取出 exe 路径：去掉引号，并去掉我们**自己**加过的端口参数。
+
+    之所以要"去掉自己加的"，是因为这个函数会被重复调用（重跑工具是常态）——
+    否则第二次会把 `"...exe" --remote-debugging-port=9336` 当成 exe 路径，
+    拼出 `""...exe" --remote...=9336" --remote...=9336` 这种鬼东西。
+    """
+    v = re.sub(r"\s*" + re.escape(DEBUG_ARG_PREFIX) + r"\d+", "", value.strip()).strip()
+    if v.startswith('"'):
+        end = v.find('"', 1)
+        if end > 0:
+            return v[1:end]
+    return v.split(" ", 1)[0]
+
+
+def do_autostart(app: str, backup_dir: str, revert: bool = False) -> int:
+    """给"开机自启"的 Run 键补上调试端口（或从备份还原）。
+
+    为什么必须做：客户端有自启动时，开机后由 Run 键拉起，**不经过快捷方式** ⇒
+    改 `.lnk` 等于没改。实测 2026-10-09 WorkBuddy 自启实例就因此没有 9336，
+    驱动只能降级为提醒（当天漏签）。
+
+    备份策略与 `.lnk` 一致：**只保留最早一份**（改造前的原始值），JSON 落盘，
+    所以任何一次改造都能 `--revert` 回到真正干净的状态。
+    """
+    name = run_entry_name(app)
+    if not name:
+        print(f"  {APPS[app]['label']} 未登记自启动项，无需处理")
+        return 2
+    cur = read_run_value(app)
+    if cur is None:
+        print(f"  注册表里没有 {name}（该应用当前未开启自启动），跳过")
+        return 2
+
+    bk = os.path.join(backup_dir, f"RunKey__{app}.json")
+    if revert:
+        if not os.path.exists(bk):
+            print(f"  无备份，跳过: {name}")
+            return 2
+        with open(bk, encoding="utf-8") as fh:
+            orig = json.load(fh)["value"]
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, orig)
+        print(f"  已还原 {name}\n      值 = [{orig}]")
+        return 0
+
+    target = f'"{_exe_of(cur)}" {DEBUG_ARG_PREFIX}{recipe_debug_port(app)}'
+    if cur.strip() == target:
+        print(f"  {name} 已是目标值，跳过\n      值 = [{cur}]")
+        return 0
+    os.makedirs(backup_dir, exist_ok=True)
+    if os.path.exists(bk):
+        kept = "备份已存在，保留最早的"
+    else:
+        with open(bk, "w", encoding="utf-8") as fh:
+            json.dump({"name": name, "value": cur}, fh, ensure_ascii=False, indent=2)
+        kept = "已备份"
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                        winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, name, 0, winreg.REG_SZ, target)
+    after = read_run_value(app)
+    ok = (after or "").strip() == target
+    print(f"  {name}\n      改前 [{cur}]\n      改后 [{after}]   {kept}: {bk}"
+          f"\n      {'OK' if ok else '校验失败 ✘'}")
+    return 0 if ok else 1
+
+
 def do_revert(lnk: str, backup_dir: str) -> int:
     tag = os.path.basename(os.path.dirname(lnk)) or "root"
     bk = os.path.join(backup_dir, f"{tag}__{os.path.basename(lnk)}")
@@ -279,8 +391,22 @@ def main() -> int:
     ap.add_argument("--qoder", action="store_true",
                     help="等价于 --app qoder（旧写法，保留兼容）")
     ap.add_argument("--revert", action="store_true", help="从备份还原")
+    ap.add_argument("--autostart", action="store_true",
+                    help="改 **登录自启动的 Run 键**（.lnk 之外的那条启动路径）")
     ap.add_argument("--backup-dir", default=BACKUP_DIR)
     a = ap.parse_args()
+
+    if a.autostart:
+        # 走注册表，不经 COM —— 但仍先自检，避免"没自检就动系统"的不一致行为
+        if not self_check():
+            print("自检失败：IPersistFile 槽位不对，拒绝继续")
+            return 3
+        app = a.app or ("qoder" if a.qoder else None)
+        if not app:
+            print("--autostart 需要配合 --app <name>")
+            return 2
+        print(f"自启动 Run 键 | 应用 {APPS[app]['label']} | 端口 {recipe_debug_port(app)}\n")
+        return do_autostart(app, a.backup_dir, revert=a.revert)
 
     if not self_check():
         print("自检失败：IPersistFile 槽位不对，拒绝继续（防止写坏快捷方式）")

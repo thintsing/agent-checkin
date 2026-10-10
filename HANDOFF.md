@@ -7,6 +7,54 @@
 
 ---
 
+## [2026-10-10 16:30] WorkBuddy(阿拾) —— 用户问「今天为什么没自动签到」：查出 **RandomDelay 让任务整块被跳过**，连同两个独立缺陷一并修掉
+
+**一句话**：任务**根本没触发**（不是站点失败）。顺带发现 Qoder 入口时序太紧、WorkBuddy 自启动绕过调试端口。
+
+### ① 主因：`-RandomDelay` 让当日 occurrence 被静默判为 missed（已回退）
+
+证据链（全实测）：
+
+| 证据 | 值 |
+|---|---|
+| `logs/checkin-2026-10-10.log` | **不存在**（程序从未运行） |
+| `Get-ScheduledTaskInfo`（11:50 读） | `LastRunTime=10/09 10:22:33`、`NextRunTime=10/11`、**`NumberOfMissedRuns=1`** |
+| 16 秒内连读 8 次 `NextRunTime` | **8 个不同值**，**全是 10-11**（11:53:36 / 12:05:59 / 11:18:43 / 11:59:06 / 11:34:59 / 11:03:28 / 11:52:06 / 10:19:31） |
+| 机器 | 10-09 13:14:57 开机后从未关机/休眠（无客观错过理由） |
+| 最终 | 靠 `StartWhenAvailable` 在 **12:22:43** 才补跑（窗口 12:30 结束前 7 分钟） |
+
+微软 KB2956042 标题即「使用 RandomDelay 参数的计划任务不会运行」。
+⇒ **回退**：触发器改回固定 `-At 09:55`（窗口前 10 分钟），**去掉 `-RandomDelay`**，
+动作**去掉 `--now`**，随机时刻回到进程内（`core/scheduler.py` Beta(2,2)）。
+`pythonw`（无黑框）**保留** —— 那条修复与随机化位置无关。
+`_window_minutes()` / `_ps_timespan()` 退役，恢复 `_wake_hint()`；测试守卫同步（**175 全绿**）。
+
+### ② Qoder：入口点击**盲等**导致当天 no_action（已修 + 已补领）
+
+驱动点『查看我的用量』成功后 1 秒就去点『打开 Rewards』→ `no-button`。
+CDP 复现：面板要 **~3 秒**才渲染出礼物图标，而配方是 `entry_delay_sec: 1.5` + "只试一次"。
+⇒ `_open_entry` 改为**轮询到可点为止**（`entry_timeout_sec` 为预算，新增 `_float_cfg` 容错），
+`entry_delay_sec → 3.0`。**当天已手动补领**：界面「领取成功，Credits 已到账」；
+服务端 `main.log` `claimable` **10:15:57 true → 11:57:11 false**。
+
+### ③ WorkBuddy：自启动 Run 键绕过快捷方式（工具已支持，端口已补）
+
+PID 9132 命令行**无 `--remote-debugging-port=9336`**；快捷方式**仍带** 9336，
+但 `HKCU\...\Run :: WorkBuddy.WorkBuddy = ...\WorkBuddy.exe`（**无参数**）——开机自启不走快捷方式。
+佐证：WorkBuddy **10-08 22:32 升级到 5.7.7**，10-09 重启后自启即无端口形态。
+⇒ `tools/win_shortcut_args.py` 新增 **`--autostart`**（winreg，含 `RunKey__<app>.json` 备份 / `--revert`），
+已写入 `["...WorkBuddy.exe" --remote-debugging-port=9336]` 并复跑验证幂等。
+**⚠ 需重启 WorkBuddy 才生效**（本轮刻意不动：重启会打断正在跑的会话）。
+
+### 顺带
+- 计划任务已用新脚本**重装并验证**：`Start=2026-10-10T09:55:00`、`RandomDelay=''`、`Args` 无 `--now`、`NextRunTime=10/11 09:55:00`。
+- 用计划任务的真实形态冒烟（`pythonw` + `System32` 工作目录 + `--dry-run`）：exit 0、日志正常。
+- ⚠ **任务历史日志本机是关闭的且开启需管理员权限** ⇒ 调度器跳过原因无法回溯（已记入 `DESIGN_NOTES.md` 未决点）。
+
+**状态**：Qoder 今日已领 ✅；WorkBuddy 今日**未领**（客户端无端口，需重启客户端或人工在 UI 里领）。
+
+---
+
 ## [2026-10-08 10:45] WorkBuddy(阿拾) —— 用户报障「黑框 + 等太久」：任务改 pythonw + 随机延迟挪到 Task Scheduler；顺带炸出脱敏过滤器潜伏 bug
 
 **一句话**：用户贴了张截图问「这个框能不让它显示么 而且等待时间也太长了」。两个诉求都属实且同源 ——

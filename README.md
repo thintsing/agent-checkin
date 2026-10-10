@@ -71,7 +71,14 @@
 
 **解法**：**改造日常启动入口**，让客户端启动时就带上 `--remote-debugging-port`。实测 Qoder 的 Launcher 会**透传未知开关**，于是把三个快捷方式入口都加上参数（工具：`tools/win_shortcut_args.py`，含备份与 `--revert`）。
 
-端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy`，旧的 `--qoder` 仍兼容）。原始 `.lnk` 的备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。
+⚠ **只改快捷方式不够 —— 还要改"开机自启"那条路**（2026-10-10 真漏签）。客户端自己有自启动项时，开机后它**由注册表 Run 键拉起，根本不经过快捷方式**，于是那个实例没有调试端口，驱动只能降级为提醒。实测 WorkBuddy 5.7.7（10-08 升级）就带上了 `HKCU\...\Run :: WorkBuddy.WorkBuddy`。工具已支持：
+
+```bat
+python tools\win_shortcut_args.py --app workbuddy --autostart            REM 给 Run 键补端口
+python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还原
+```
+
+端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
 
 驱动随之采用**四分支决策**，核心原则是 **绝不杀掉用户正在用的客户端**：
 
@@ -79,7 +86,7 @@
 |---|---|---|
 | ① | 读客户端日志，本窗口已领 | **连客户端都不启动** |
 | ② | 调试端口已就绪 | 直接接管；**入口没自动出现就按配方把入口点出来**，领完**不关闭**客户端 |
-| ③ | 客户端在跑但没开端口 | **绝不杀** → 降级为桌面提醒 |
+| ③ | 客户端在跑但没开端口 | **绝不杀** → 降级为桌面提醒。⚠ **10-10 就栽在这一格**：自启动拉起的实例没端口，当天 WorkBuddy 只能靠人工领 —— 根治办法是改 Run 键（见上） |
 | ④ | 客户端没在跑 | 才由我们拉起 → 领取 → 关掉自己起的那个 |
 
 ② 这一行藏着一个**反直觉的坑**（2026-09-26 实测踩到，当天没能自动领到）：
@@ -166,7 +173,7 @@ python -m checkin --dry-run     REM 演练：走完整流程但不触发、不�
 ```bash
 python -m checkin --login              # 打开专用浏览器，人工登录一次
 python -m checkin                      # 执行签到（先等到窗口内的随机时刻）
-python -m checkin --now                # 立刻执行，不等窗口（手动补跑 / 计划任务唤醒后走的就是这条）
+python -m checkin --now                # 立刻执行，不等窗口（人工补跑用；计划任务不走这条）
 python -m checkin --only-site workbuddy
 python -m checkin --status [--json]    # 状态报表
 python -m checkin --install-task       # 注册每日计划任务
@@ -178,7 +185,9 @@ python -m checkin --print-task         # 打印等价的手写注册命令
 
 > **必须用 `--install-task` 注册**。计划任务的工作目录是 `C:\Windows\System32`，用 `python -m checkin` 会以 `No module named checkin` **每天准时失败且不弹窗**。现在改为直接执行 `src/checkin/__main__.py`（它自己会挂 `sys.path`），与工作目录无关。
 >
-> 任务用 **`pythonw.exe`（无控制台）** 运行，并带 `--now`；随机时刻由触发器的 `-RandomDelay` 承担 —— 所以运行期间**不会出现黑框，也不会驻留等待**。改动触发方式后必须重跑一次 `--install-task` 才会生效。
+> 任务用 **`pythonw.exe`（无控制台）** 运行，随机时刻由**程序自己**在窗口内采样后等待（`core/scheduler.py` 的 Beta(2,2) 采样）—— 所以运行期间**不会出现黑框**。
+>
+> ⚠ **不要给触发器加 `-RandomDelay`**：那会让当日 occurrence 被调度器静默判为 `missed` 后跳次日（2026-10-10 因此真漏签一天，见下）。**随机性必须留在进程内。**
 
 ---
 
@@ -210,8 +219,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 | 措施 | 实现 |
 |---|---|
 | **凭证不出浏览器** | 不逆向加密 token、不存账号密码；请求在已登录页面上下文里 `fetch`，浏览器自动带鉴权与真实 TLS/HTTP2 指纹（`browser/page_script.py`） |
-| **随机执行时刻** | 计划任务的触发器就是 `-At <窗口开始> -RandomDelay <窗口长度>`：由 Task Scheduler 每次运行时重新随机一个落点，程序被唤醒即执行（`--now`）。手动跑（不带 `--now`）时则由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待。**都不是固定整点** |
-| **不弹窗、不驻留** | 任务用 `pythonw.exe`（无控制台）运行；派生的 `powershell` 子进程一律带 `CREATE_NO_WINDOW`，`sys.stdout/stderr` 为 None 时有兜底 —— 全程无可见窗口 |
+| **随机执行时刻** | 计划任务在**固定的 `09:55`**（窗口开始前 10 分钟）唤醒；真正的执行时刻由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待到点。**不是固定整点**。⚠ 刻意**不用**计划任务的 `-RandomDelay` —— 它会让当日 occurrence 被静默跳过（2026-10-10 事故） |
+| **不弹窗** | 任务用 `pythonw.exe`（无控制台）运行；派生的 `powershell` 子进程一律带 `CREATE_NO_WINDOW`，`sys.stdout/stderr` 为 None 时有兜底 —— **全程无可见窗口**（进程会静默等待，但看不见） |
 | **单实例运行锁** | `core/lock.py`：系统级文件锁，防"计划任务 + 手动双击"并发导致重复打接口；进程退出自动释放 |
 | **当日幂等** | `core/state.py` + `engine.py`：已成功/已签的站点当天不再打接口 |
 | **拟人节奏** | 触发前随机延迟 1.5–6s、站点间随机间隔 25–90s（`core/jitter.py`） |
@@ -233,7 +242,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 ├─ tools/
 │   ├─ qoder_cdp_probe.py     # 只读侦察（定位活动入口，不点击）
 │   ├─ qoder_cdp_claim.py     # client 驱动的薄封装（launch / status / claim / close）
-│   └─ win_shortcut_args.py   # 读写 Windows 快捷方式参数：让客户端启动即带调试端口（含备份/回滚）
+│   └─ win_shortcut_args.py   # 读写启动入口参数（.lnk + 自启动 Run 键）：让客户端启动即带调试端口（含备份/回滚）
 ├─ src/checkin/
 │   ├─ __main__.py            # 唯一 CLI 入口
 │   ├─ core/                  # models / config / engine / scheduler / lock / state
@@ -298,13 +307,16 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
    （多发一次就多一分风险）。
 2. **Qoder 客户端升级可能改版**：若按钮文案 / DOM 变化，驱动返回 `no_action` 并提示人工查看，
    **不会静默假成功**。当前 `0.4.3` 已复验通过，后续每次升级都需重新确认。
-3. **客户端升级会同时动两处**（2026-09-27 实测 `0.4.2 → 0.4.3`，当天因此没领到）：
+3. **客户端升级会同时动三处**（2026-09-27 实测 `0.4.2 → 0.4.3`；2026-10-08 `5.7.6 → 5.7.7` 又动了一处）：
    - **快捷方式参数**可能被重置：`开始菜单` 那个入口会被应用**回写成无参数版**
      （已加只读保护挡住；升级时它若重建失败属正常，`data/shortcut_backup/` 有原始备份）。
+   - **新增"自启动 Run 键"**（2026-10-08 WorkBuddy 5.7.7 实测）：升级后应用把自己装进
+     `HKCU\...\Run`，开机自启的实例**绕过快捷方式**、没有调试端口。
    - **更难查的一种**：升级时启动器会**自己把应用重启一遍**（`state.ini` 的 `updatedAt`
      与应用的启动时刻重合，且同一刻 `targetVersion` 发生切换），这一次重启**不带**
      透传的调试开关 ⇒ 端口没开，驱动只能走 ③ 降级提醒。
-   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder`，**再从快捷方式重新启动客户端**。
+   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|workbuddy` **以及**
+     `... --app workbuddy --autostart`，**再从快捷方式重启客户端**。
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，
    重启客户端也拿不回。所以端口值以各站点配方的 `client.debug_port` 为单一事实源

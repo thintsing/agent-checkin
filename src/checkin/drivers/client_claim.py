@@ -134,6 +134,18 @@ def _read_tail(path: str, limit: int = 300_000) -> str:
         return fh.read()
 
 
+def _float_cfg(c: Dict[str, Any], key: str, fallback: float) -> float:
+    """从配方 `client` 段读一个浮点超时/延迟，坏值一律退回默认。
+
+    配方是**人写的 YAML**，写成 `1,5`、`"3s"` 或留空都可能发生；
+    这里绝不让它把整条领取流程炸掉 —— 读不出就用默认值继续。
+    """
+    try:
+        return float(c.get(key, fallback))
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
 def _claimable(snapshot: Dict[str, Any]) -> bool:
     """快照是否表示"现在就能点领取"：按钮**存在**且**未置灰**。
 
@@ -720,6 +732,13 @@ class ClientDriver(Driver):
         要素全部来自配方（`open_entry_labels` / `main_target_match`），
         代码里不出现产品名 —— 这是本项目的分层约定：站点知识只进 recipes/*.yaml。
         任何一步失败都只记日志、不抛异常：点不出来就退回原来的 no_action，行为不劣化。
+
+        **每个入口"轮询到可点为止"，而不是"盲等固定秒数后只试一次"**（2026-10-10 改）：
+        面板/浮层是异步渲染的，渲染耗时随机器负载浮动；盲等会在慢的时候刚好没等到 ——
+        10-10 真实故障：点『查看我的用量』后面板要 **3 秒**才渲染出礼物图标，
+        而配方写的是 `entry_delay_sec: 1.5` ⇒ 第二个入口 `no-button` ⇒ 当天 no_action。
+        轮询版对渲染快慢都自适应，且不引入新的失败面（找不到就一直等到预算耗尽，
+        与原先"等不到就放弃"的终态一致）。
         """
         labels = list(c.get("open_entry_labels") or [])
         if not labels:
@@ -728,22 +747,28 @@ class ClientDriver(Driver):
         if main is None:
             log.debug("找不到客户端主窗口 target，跳过入口点击")
             return
-        try:
-            delay = float(c.get("entry_delay_sec", 1.5))
-        except (TypeError, ValueError):
-            delay = 1.5
+        settle = _float_cfg(c, "entry_delay_sec", 1.5)     # 点中后让下一层渲染的静默期
+        budget = _float_cfg(c, "entry_timeout_sec", 20.0)  # 单个入口"等它出现"的上限
         page = CDPPage(main["webSocketDebuggerUrl"])
         try:
             for label in labels:
                 js = _JS_CLICK_ARIA.replace(
                     "__LABEL__", json.dumps(str(label), ensure_ascii=False))
-                try:
-                    r = page.evaluate(js, await_promise=False)
-                except Exception as e:                          # noqa: BLE001 —— 点不到不能阻断领取
-                    log.debug("点击入口 %r 失败：%s", label, e)
-                    continue
-                log.info("点击入口 %r → %s", label, r)
-                time.sleep(delay)
+                deadline = time.monotonic() + budget
+                while True:
+                    try:
+                        r = page.evaluate(js, await_promise=False)
+                    except Exception as e:                  # noqa: BLE001 —— 点不到不能阻断领取
+                        log.debug("点击入口 %r 失败：%s", label, e)
+                        break
+                    if r == "dispatched":
+                        log.info("点击入口 %r → dispatched", label)
+                        time.sleep(settle)
+                        break
+                    if time.monotonic() >= deadline:
+                        log.info("点击入口 %r → 未出现（已等 %.0fs）", label, budget)
+                        break
+                    time.sleep(0.5)
         finally:
             page.close()
 

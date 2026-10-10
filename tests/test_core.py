@@ -29,11 +29,10 @@ if str(SRC) not in sys.path:
 
 from checkin.__main__ import (                                # noqa: E402
     _install_script,
-    _ps_timespan,
     _psq,
     _task_command,
     _uninstall_script,
-    _window_minutes,
+    _wake_hint,
 )
 from checkin.browser import page_script                       # noqa: E402
 from checkin.core import jitter, notify, scheduler           # noqa: E402
@@ -258,17 +257,16 @@ class TestScheduler(unittest.TestCase):
         scheduler.wait_until(before - timedelta(seconds=5))
         self.assertLess((datetime.now() - before).total_seconds(), 2.0)
 
-    def test_window_minutes_is_end_minus_start(self):
-        """窗口长度 = 两个 HH:MM 相减（计划任务拿它当 RandomDelay 上界）。"""
-        self.assertEqual(_window_minutes(_cfg("10:05", "12:30")), 145)   # 当前实际配置
-        self.assertEqual(_window_minutes(_cfg("07:40", "11:20")), 220)
-        self.assertEqual(_window_minutes(_cfg("10:05", "10:05")), 0)     # 空窗口不产生负值
-        self.assertEqual(_window_minutes(_cfg("12:30", "10:05")), 0)     # 反序也退化为 0
+    def test_wake_hint_is_ten_minutes_before_window(self):
+        """唤醒时刻 = 窗口开始前 10 分钟（纯算术，与配置值无关）。
 
-    def test_ps_timespan_splits_hours_and_minutes(self):
-        self.assertEqual(_ps_timespan(145), "(New-TimeSpan -Hours 2 -Minutes 25)")
-        self.assertEqual(_ps_timespan(60), "(New-TimeSpan -Hours 1 -Minutes 0)")
-        self.assertEqual(_ps_timespan(0), "(New-TimeSpan -Hours 0 -Minutes 0)")
+        这个"提前量"是**固定**的 —— 随机性由程序在窗口内采样，
+        触发器本身**不带** `-RandomDelay`（见下面 test_trigger_* 的回归守卫）。
+        """
+        self.assertEqual(_wake_hint("10:05"), "09:55")   # 当前实际配置
+        self.assertEqual(_wake_hint("07:40"), "07:30")
+        self.assertEqual(_wake_hint("00:05"), "00:00")   # 不产生负时刻
+        self.assertEqual(_wake_hint("13:00"), "12:50")
 
 
 # ----------------------------------------------------------------------
@@ -807,6 +805,61 @@ class TestClientDriverLogic(unittest.TestCase):
         """没有 main_target_match 就不猜主窗口 —— 猜错会点到别的页面上去。"""
         self.assertIsNone(self.d._main_target(9334, ""))
 
+    def test_open_entry_polls_until_label_appears(self):
+        """回归（2026-10-10 真漏签一天）：入口是**异步渲染**的 → 必须轮询到可点为止。
+
+        当天实测：点『查看我的用量』成功后，面板底部的礼物图标要 **3 秒**才渲染出来，
+        而当时实现是"盲等 `entry_delay_sec`(1.5s) 后只试一次" ⇒ 第二个入口 `no-button`
+        ⇒ 整个站点报 `no_action`，**当天 100 Credits 没领到**。
+        这条用假页面复现"前两次 `no-button`、第三次才 `dispatched`"：断言它等到了。
+        """
+        calls = {"n": 0}
+
+        class _Page:
+            def evaluate(self, js, await_promise=False):
+                calls["n"] += 1
+                return "no-button" if calls["n"] < 3 else "dispatched"
+
+            def close(self):
+                pass
+
+        c = {"open_entry_labels": ["A"], "main_target_match": "x",
+             "entry_delay_sec": 0, "entry_timeout_sec": 10}
+        with mock.patch.object(self.d, "_main_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                mock.patch("checkin.drivers.client_claim.CDPPage", return_value=_Page()), \
+                mock.patch("checkin.drivers.client_claim.time.sleep"):
+            self.d._open_entry(9334, c)
+        self.assertGreaterEqual(calls["n"], 3, "入口出现前就放弃了 —— 又回到盲等逻辑")
+
+    def test_open_entry_gives_up_after_budget(self):
+        """入口一直不出现时，按 `entry_timeout_sec` 收手 —— 不能无限轮询把任务挂死。"""
+        calls = {"n": 0}
+
+        class _Page:
+            def evaluate(self, js, await_promise=False):
+                calls["n"] += 1
+                return "no-button"
+
+            def close(self):
+                pass
+
+        c = {"open_entry_labels": ["A", "B"], "main_target_match": "x",
+             "entry_delay_sec": 0, "entry_timeout_sec": 0}      # 预算 0 ⇒ 每个入口试一次
+        with mock.patch.object(self.d, "_main_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                mock.patch("checkin.drivers.client_claim.CDPPage", return_value=_Page()):
+            self.d._open_entry(9334, c)
+        self.assertEqual(calls["n"], 2, "每个入口应各试一次就收手")
+
+    def test_entry_timing_cfg_tolerates_bad_values(self):
+        """配方是人写的 YAML，超时字段写成 `1,5`/`"3s"`/留空都不该炸掉领取流程。"""
+        from checkin.drivers.client_claim import _float_cfg
+        self.assertEqual(_float_cfg({"a": "1,5"}, "a", 2.0), 2.0)
+        self.assertEqual(_float_cfg({"a": "3s"}, "a", 2.0), 2.0)
+        self.assertEqual(_float_cfg({}, "a", 2.0), 2.0)
+        self.assertEqual(_float_cfg({"a": 3}, "a", 2.0), 3.0)
+
     def test_qoder_recipe_declares_entry_labels(self):
         """回归（2026-09-26 真踩到，当天没领到）：客户端整天常开时，
         活动入口**不会随开窗自动出现**（判定发生在启动那一刻）。
@@ -1080,10 +1133,11 @@ class TestEngineGates(unittest.TestCase):
                                  f"{kwargs} 下延迟采样次数应为 {expected}")
 
     def test_now_skips_the_window_wait(self):
-        """`--now`（手动补跑 / 计划任务唤醒）不得再等窗口内的随机时刻。
+        """`--now`（手动补跑）不得再等窗口内的随机时刻。
 
-        2026-10-08 起计划任务以 `--now` 唤醒（随机性交给 Task Scheduler 的
-        RandomDelay），这里的断言就是"等待真的被移走了"的机器版。
+        注意：计划任务**不再**用 `--now`（2026-10-10 回退，见
+        TestTaskInstall.test_action_does_not_pass_now）——
+        它现在只服务"人工立刻补跑"这一种场景。
         """
         with mock.patch("checkin.core.engine.scheduler.plan_today") as plan, \
                 mock.patch("checkin.core.engine.scheduler.wait_until") as wait:
@@ -1095,8 +1149,8 @@ class TestEngineGates(unittest.TestCase):
         """今日跳过策略（周末等）与"等不等窗口"无关 —— `--now` 也拦。
 
         这条是**防回归**：原先 `should_skip_today` 被关在 `if not now` 里面，
-        而计划任务改为 `--now` 之后，`skip_weekends` 就会被静默绕过 ——
-        "配了却不起作用"的隐形故障，本项目最忌讳的那类。
+        一旦有入口以 `--now` 调用（当时是计划任务），`skip_weekends` 就会被
+        静默绕过 —— "配了却不起作用"的隐形故障，本项目最忌讳的那类。
         """
         with mock.patch("checkin.core.engine.scheduler.should_skip_today",
                         return_value="周末不执行（skip_weekends=true）"):
@@ -1384,24 +1438,28 @@ class TestTaskInstall(unittest.TestCase):
         self.assertIn("-WorkingDirectory", s)
         self.assertIn(_ROOT, s)
 
-    def test_trigger_starts_at_window_start_with_random_delay(self):
-        """触发 = `-At <窗口开始>` + `-RandomDelay <窗口长度>`。
+    def test_trigger_wakes_before_window_without_random_delay(self):
+        """触发 = `-At <窗口开始前 10 分钟>`，**绝不带 `-RandomDelay`**。
 
-        2026-10-08 改：随机化从"进程内睡到某时刻"挪到计划任务的 RandomDelay。
-        老写法（提前唤醒 + 内部等待）会留一个进程（原先还是黑框）驻留两小时。
+        **这是 2026-10-10 漏签事故的回归守卫。**
+        10-08 为消灭"长等待"曾改用 `-RandomDelay PT2H25M`，结果 10-10 整整
+        漏签一天：当日 occurrence 被调度器静默判为 `missed` 后跳次日
+        （`NumberOfMissedRuns=1`；16 秒内连读 8 次 `NextRunTime` 得到 8 个
+        不同值且全是次日；当天日志文件根本不存在）。
+        微软 KB2956042 的标题就是「使用 RandomDelay 参数的计划任务不会运行」。
+        ⇒ 对"绝不能静默漏掉"的每日任务，RandomDelay 不可靠，一律不要。
         """
         s = _install_script(self.cfg)
-        self.assertIn(f"-At {_psq(self.cfg.schedule.window_start)}", s)
-        self.assertIn("-RandomDelay", s)
-        self.assertIn(_ps_timespan(_window_minutes(self.cfg)), s)
+        self.assertIn(f"-At {_psq(_wake_hint(self.cfg.schedule.window_start))}", s)
+        self.assertNotIn("-RandomDelay", s)
 
-    def test_random_delay_span_matches_window(self):
-        """RandomDelay 的上界必须**真的**等于窗口长度，不是写死的常量 ——
-        否则改了 config.yaml 的窗口，任务会静默地只覆盖其中一段（或溢出窗口）。"""
+    def test_no_random_delay_for_any_window(self):
+        """换任何窗口配置都不能引入 RandomDelay —— 这条守卫不看具体值。"""
         for start, end in (("10:05", "12:30"), ("07:40", "11:20"), ("09:00", "09:30")):
             with self.subTest(window=f"{start}-{end}"):
                 cfg = _cfg(start, end)
-                self.assertIn(_ps_timespan(_window_minutes(cfg)), _install_script(cfg))
+                self.assertIn(f"-At {_psq(_wake_hint(start))}", _install_script(cfg))
+                self.assertNotIn("-RandomDelay", _install_script(cfg))
 
     def test_uses_pythonw_to_avoid_console_window(self):
         """解释器必须优先 `pythonw.exe`。
@@ -1415,12 +1473,13 @@ class TestTaskInstall(unittest.TestCase):
                         f"计划任务解释器应优先 pythonw.exe，实际是 {exe}")
         self.assertIn("pythonw.exe", _install_script(self.cfg))
 
-    def test_action_runs_immediately(self):
-        """动作必须带 `--now`：随机时刻已由 RandomDelay 承担，被唤醒就立刻执行，
-        不能再等一遍窗口（否则等待又回来了，只是没人看得见）。"""
+    def test_action_does_not_pass_now(self):
+        """动作**不能**带 `--now`：随机时刻由程序自己在窗口内采样后等待，
+        带 `--now` 会跳过采样 ⇒ 每天固定在唤醒那一刻签到，反封堵的随机性归零。
+        （`--now` 本身保留，仍供手动补跑使用，见 CLI 参数集。）"""
         s = _install_script(self.cfg)
-        self.assertIn("--now", s)
-        self.assertIn("--now", _task_command())
+        self.assertNotIn("--now", s)
+        self.assertNotIn("--now", _task_command())
 
     def test_runs_the_entry_file_directly(self):
         """必须直跑 __main__.py（自挂 sys.path），不能写 `-m checkin`：
