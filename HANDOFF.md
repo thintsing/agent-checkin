@@ -7,6 +7,51 @@
 
 ---
 
+## [2026-10-11 14:05] WorkBuddy(阿拾) —— Qoder 当天漏签：**9335 又成了僵尸监听**（同 9334 一模一样的病）+ 守候字段两侧不对称；换端口 **9337**
+
+**一句话**：Qoder 拿不到调试端口 ⇒ 驱动降级提醒 ⇒ 当天漏签。两个独立缺陷叠加：
+① **9335 被僵尸 socket 占死**（占用者 PID 24160 **已不存在**）—— 与 2026-09-27 的 9334 **完全同形**；
+② **「无端口守候」只在 workbuddy 一侧配了**，qoder 缺 `wait_port_sec` ⇒ 连守候的机会都没有。
+WorkBuddy 今天**正常**（9336 由带端口常驻的 PID 34332 持有，11:21:15 成功接管）。
+
+### 证据（不靠驱动自报）
+
+| # | 信源 | 内容 |
+|---|---|---|
+| ① | 驱动日志 `checkin-2026-10-11.log` | 11:20:16 `[qoder] 客户端已在运行且未开调试端口，无法接管，降级为提醒` → `no_action` |
+| ② | 驱动日志 同上 | 11:21:15 `[workbuddy] => success | 已领取（客户端 bridge）`（9336 就绪）|
+| ③ | `Get-NetTCPConnection -LocalPort 9335` | `Listen + 2×CloseWait`，**OwningProcess=24160**；`Get-Process -Id 24160` **查无此进程** ⇒ 僵尸 |
+| ④ | `curl http://127.0.0.1:9335/json/version` | **连不上**（对照 9336 能返回 `WorkBuddy/5.7.7`）|
+| ⑤ | Qoder 会话目录名 | `logs\20261009-051548.662-**24160**-*` 与 `20261010-081757.053-**41524**-*` ⇒ 24160 = 10-09 13:15:48 起的旧实例，10-10 16:17 被 41524 取代时留下 socket |
+| ⑥ | Qoder 会话日志（41524） | 今日 `claimable` **全为 `true`** ⇒ 今天**没领**、现在仍可领（有效期到次日 10:00）|
+| ⑦ | 入口核查 | 三个 `.lnk` 改前**都带** `--remote-debugging-port=9335` ✅；`Run` 键**无 Qoder 项** ⇒ **不是入口问题** |
+| ⑧ | 当前 Qoder 主进程 41524 | 命令行**无** `--remote-debugging-port` |
+
+### ⚠ 判据修正（重要）
+
+**「裸 bind 失败」不能判定僵尸** —— 活跃端口（9336）同样报 `10048`、`SO_REUSEADDR` 报 `13`(WSAEACCES)。
+唯一可靠判据 = **占用 PID 是否还存在** + **`curl /json/version` 是否连得上**。
+
+### 改动（本轮）
+
+| 文件 | 内容 |
+|---|---|
+| `recipes/qoder.yaml` | `client.debug_port: 9335 → **9337**`（9337 实测可绑定）；头注释补 **9335 僵尸始末** + **排查判据**；**新增 `wait_port_sec: 5400`**（与 workbuddy 对齐） |
+| `tests/test_core.py` | **反转**旧守卫 `test_qoder_is_not_affected_by_the_new_knobs`（它锁死了"Qoder 不得有 `wait_port_sec`"，正是缺口来源）→ 新守卫 `test_port_wait_is_symmetric_across_client_recipes`（**两侧都必须 > 0**）；**新增** `test_debug_ports_are_distinct_and_not_recycled` |
+| `tools/win_shortcut_args.py`、`tools/qoder_cdp_probe.py`、`src/checkin/drivers/client_claim.py`、`src/checkin/core/procenv.py` | 兜底默认值 / 文档示例 9335 → 9337 |
+| `README.md`、`recipes/workbuddy.yaml` | 端口表同步为 9337 |
+
+**快捷方式**：三个入口 9335 → **9337**，逐个读回复验通过（备份保留最早一份，可 `--revert`）。
+**验证门**：**186 项全绿**（原 185，改写 +1）。
+
+### 待办
+
+- **Qoder 今天需补领**：用户重启 Qoder（快捷方式已带 9337）→ 驱动守候（`wait_port_sec` 5400s）自动接管。
+- 明天 09:55：**新端口 9337 的首次真机首考**（应出现 `调试端口 9337 已就绪，直接接管`）。
+- 僵尸 9334 / 9335 **要重启机器才清**（不影响 9337 的使用）。
+
+---
+
 ## [2026-10-10 16:40] WorkBuddy(阿拾) —— 用户报「WorkBuddy 今天还是没领成功」：查出是**结构性缺口**（无端口实例长跑），补两层自愈 + 修掉 `close_after` 漏配
 
 **一句话**：上一轮补的启动入口**只对"下一次启动"生效**，而客户端从 **10-09 13:15 起连续跑了 27h+ 没重启** ——

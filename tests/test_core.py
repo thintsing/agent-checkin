@@ -658,12 +658,40 @@ class TestConfig(unittest.TestCase):
         bridge = c.get("bridge") or {}
         self.assertTrue(bridge.get("status_js") and bridge.get("claim_js"))
 
-    def test_qoder_is_not_affected_by_the_new_knobs(self):
-        """新增的两个 knob 只服务 WorkBuddy；Qoder 不得被顺手改掉（它没这个场景）。"""
+    def test_port_wait_is_symmetric_across_client_recipes(self):
+        """「无端口守候」必须在**所有** client 配方上对称配置。
+
+        ⚠ 2026-10-11 反转：此前这里是一条"Qoder 不得有 `wait_port_sec`"的守卫，
+        理由是"它没这个场景"。**当天就被现实推翻** —— Qoder 客户端同样可能连续
+        多天不重启（当时的实例 10-09 13:15:48 起、跑到 10-10 16:17 才被取代），
+        无端口时立刻放弃 ⇒ 当天漏签，而 WorkBuddy（有守候）顺利接管。
+        ⇒ 教训：这类"补救"字段属于**场景共性**，不对称 = 等于没修。
+        （`log_state` 不在此列 —— 它绑定日志**结构**：Qoder 是 `data_dir` 的
+          多会话目录形态，WorkBuddy 是单文件，确实不同，仍不得互相套用。）
+        """
         _, recipes = load_config(str(PROJECT_ROOT))
+        clients = [r for r in recipes if r.id in ("qoder", "workbuddy") and r.client]
+        self.assertEqual(len(clients), 2, "两站都该有 client 段")
+        for r in clients:
+            self.assertGreater(
+                int((r.client or {}).get("wait_port_sec") or 0), 0,
+                f"{r.id}: 客户端可能多日不重启，必须守候端口才能自愈")
+        # log_state 仍然只属于 WorkBuddy（绑定日志结构，不是场景共性）
         q = next(r for r in recipes if r.id == "qoder")
         self.assertNotIn("log_state", q.client or {})
-        self.assertFalse(int((q.client or {}).get("wait_port_sec") or 0))
+
+    def test_debug_ports_are_distinct_and_not_recycled(self):
+        """两个 client 站点不得共用调试端口（共用 = 后启动的那个静默绑不上）。
+
+        端口是**一次性资源**：被僵尸句柄占死的端口只能弃用（9334、9335 均如此）。
+        这里只做"互不相同 + 是合法端口号"的机械校验；具体值随僵尸情况更换，
+        以各自配方的 `client.debug_port` 为准。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        ports = [r.client["debug_port"] for r in recipes if r.client and r.client.get("debug_port")]
+        self.assertEqual(len(ports), len(set(ports)), f"调试端口重复: {ports}")
+        for p in ports:
+            self.assertTrue(1024 < int(p) < 65536, f"端口号越界: {p}")
 
 
 # ----------------------------------------------------------------------

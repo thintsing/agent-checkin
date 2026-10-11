@@ -9,7 +9,7 @@ r"""Qoder 客户端 CDP 侦察工具（只读为主，--click 时才派发一次
 
     $exe = (Get-ChildItem "$env:LOCALAPPDATA\Programs\Qoder CN\.qoder-versions\*\Qoder CN.exe" |
             Sort-Object FullName -Descending | Select-Object -First 1).FullName
-    $a = New-ScheduledTaskAction -Execute $exe -Argument "--remote-debugging-port=9335"
+    $a = New-ScheduledTaskAction -Execute $exe -Argument "--remote-debugging-port=9337"
     $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName QoderCDP -Action $a -Principal $p -Settings (New-ScheduledTaskSettingsSet) -Force
     Start-ScheduledTask -TaskName QoderCDP
@@ -30,7 +30,7 @@ import urllib.request
 import websocket
 
 
-def _recipe_debug_port(default: int = 9335) -> int:
+def _recipe_debug_port(default: int = 9337) -> int:
     """端口以 recipes/qoder.yaml 的 client.debug_port 为单一事实源（同 win_shortcut_args.py）。"""
     p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "recipes", "qoder.yaml")

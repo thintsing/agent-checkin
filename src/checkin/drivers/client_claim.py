@@ -169,7 +169,7 @@ class ClientDriver(Driver):
             return CheckinResult(sid, Outcome.ERROR,
                                  message="mode=client 但配方里没有 client 段")
 
-        port = int(c.get("debug_port", 9335))
+        port = int(c.get("debug_port", 9337))   # 兜底值仅在配方缺字段时生效；真实值一律读配方
         match = str(c.get("target_match") or "")
         gate = str((recipe.reminder or {}).get("not_before") or "")   # 开窗时刻，如 "10:00"
 

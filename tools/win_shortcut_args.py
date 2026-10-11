@@ -120,7 +120,7 @@ def app_lnks(app: str) -> list:
     return [os.path.expandvars(p) for p in APPS[app]["lnks"]]
 
 
-def recipe_debug_port(app: str, default: int = 9335) -> int:
+def recipe_debug_port(app: str, default: int = 9337) -> int:
     """从该应用的配方读 `client.debug_port`。
 
     端口是**跨进程契约**：快捷方式写进去的、和驱动要连的必须是同一个值。
