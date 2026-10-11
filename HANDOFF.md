@@ -7,6 +7,47 @@
 
 ---
 
+## [2026-10-11 14:20] WorkBuddy(阿拾) —— Qoder **补领成功** + 揪出并修掉第二个真短板：**窗口停在设置页 ⇒ 入口一个都找不到**
+
+**一句话**：换端口后 Qoder 今天补领成功（服务端 `claimStatus: CLAIMED`，100 Credits）。
+但过程中发现新短板：**驱动假设"主窗口 = 主工作区"，而新版客户端重启后会落在设置页** ——
+那一层**没有**任何活动入口 ⇒ 两个 `open_entry_labels` 全 `no-button` ⇒ `no_action`。
+已加"先回主工作区"的兜底，并**真机复现 + 验证通过**。
+
+### 证据
+
+| # | 信源 | 内容 |
+|---|---|---|
+| ① | 客户端日志 | 14:10:51 `claimable:false`、`claimStatus:"CLAIMED"`、`benefit:{kind:CREDITS, amount:100}` ⇒ **补领成功** |
+| ② | 驱动日志 | 14:10:53 `[qoder] => success | 已点击领取并确认到账` |
+| ③ | CDP（失败时） | 主窗口 URL = `#/settings?section=profile`；页面里 `hasEntryBtn: False`（无 `查看我的用量`）|
+| ④ | CDP（成功时） | 主窗口 `#/?draft=…`；`aria='查看我的用量，有权益活动待领取'` @ x=190 y=766 ⇒ 入口**只在主工作区存在** |
+| ⑤ | 失败时间线 | 14:06 / 14:07 两次 `活动入口未自动出现` → `点击入口 '查看我的用量' → 未出现（已等 20s）` |
+
+⚠ 附注：新版客户端（Chrome 150 / Electron 43）对 CDP WebSocket 强制 **Origin 校验**，
+裸连报 `403 … --remote-allow-origins=*`；驱动侧早已用 `suppress_origin=True`，**无需改动**。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `src/checkin/drivers/client_claim.py` | 新增 `_JS_CLICK_TEXT`（按 `innerText` **精确**匹配 —— 「返回应用」按钮**只有文本、没有 aria-label**）；新增 `_back_to_home()`；`_open_entry` 在推进入口**之前**先调用它（**幂等**：主工作区无该按钮 ⇒ `no-button` ⇒ 什么都不做） |
+| `recipes/qoder.yaml` | 新增 `home_labels: ['返回应用']`；`open_entry_labels` 补注（新版 aria 为 `查看我的用量，有权益活动待领取`，靠**子串**匹配仍命中） |
+| `tests/test_core.py` | +3 守卫：`test_home_click_script_matches_by_text`、`test_open_entry_returns_home_before_clicking_entry`（断言**调用顺序**）、`test_home_click_is_idempotent_when_already_home`；`test_qoder_client_recipe_is_complete` 补 `home_labels` 断言 |
+
+**真机验证**：把窗口切到设置页（复现 `hasHomeBtn:True` / `hasEntryBtn:False`）→ 调 `_open_entry` →
+`客户端停在子页面，点击 '返回应用' 返回主工作区` → `点击入口 '查看我的用量' → dispatched` →
+`点击入口 '打开 Rewards' → dispatched` ✅
+
+**验证门**：**189 项全绿**（186 + 3）。
+
+### 待办
+
+- 明天 09:55：**9337 首次真机首考**（应出现 `调试端口 9337 已就绪，直接接管`）。
+- 僵尸 9334 / 9335 需**重启机器**才清（不影响 9337）。
+
+---
+
 ## [2026-10-11 14:05] WorkBuddy(阿拾) —— Qoder 当天漏签：**9335 又成了僵尸监听**（同 9334 一模一样的病）+ 守候字段两侧不对称；换端口 **9337**
 
 **一句话**：Qoder 拿不到调试端口 ⇒ 驱动降级提醒 ⇒ 当天漏签。两个独立缺陷叠加：

@@ -628,6 +628,11 @@ class TestConfig(unittest.TestCase):
         self.assertIn("*", c["exe_glob"])
         self.assertTrue(c["close_after"] is True,
                         "领完必须关掉 —— 调试端口是本机任何程序都能接管会话的口子")
+        # ⚠ 2026-10-11 实测真失败：客户端重启后落在**设置页**，那一层没有活动入口
+        #   ⇒ 两个 open_entry_labels 全 no-button ⇒ no_action ⇒ 当天漏签。
+        #   故必须有"回主工作区"的按钮文案（`_open_entry` 推进入口前会先点它，幂等）。
+        self.assertTrue(c.get("home_labels"),
+                        "缺 home_labels 时，窗口一旦停在设置页就整天找不到入口")
 
     def test_workbuddy_client_recipe_is_complete(self):
         """WorkBuddy 与 Qoder 的**关键差异**必须钉在配方里。
@@ -968,6 +973,75 @@ class TestClientDriverLogic(unittest.TestCase):
         for evt in ("pointerdown", "mousedown", "pointerup", "mouseup", "click"):
             self.assertIn(f"'{evt}'", _JS_CLICK_ARIA)
         self.assertIn("composed: true", _JS_CLICK_ARIA, "不穿透 shadow DOM 就点不到")
+
+    def test_home_click_script_matches_by_text(self):
+        """「返回应用」按钮**只有文本、没有 aria-label**（2026-10-11 实测），
+        所以回主工作区必须走"按文本匹配"的实现 —— 用 aria 那版会永远 `no-button`。
+        """
+        from checkin.drivers.client_claim import _JS_CLICK_TEXT
+        self.assertIn("innerText", _JS_CLICK_TEXT)
+        self.assertIn("=== label", _JS_CLICK_TEXT, "必须精确匹配，避免误点同名前缀元素")
+        for evt in ("pointerdown", "mousedown", "pointerup", "mouseup", "click"):
+            self.assertIn(f"'{evt}'", _JS_CLICK_TEXT)
+        self.assertIn("composed: true", _JS_CLICK_TEXT)
+
+    def test_open_entry_returns_home_before_clicking_entry(self):
+        """回归（2026-10-11 真失败）：客户端停在**子页面**（设置页）时，活动入口
+        一个都找不到 ⇒ 两个 label 全 `no-button` ⇒ `no_action` ⇒ **当天漏签**。
+
+        修法：推进入口前先点 `home_labels`（「返回应用」）回到主工作区。
+        这条断言**调用顺序** —— 顺序反了（先找入口再回主工作区）在设置页上照样白跑。
+        """
+        seen = []
+
+        class _Page:
+            def evaluate(self, js, await_promise=False):
+                for tag in ("返回应用", "入口A"):
+                    if f'"{tag}"' in js:
+                        seen.append(tag)
+                        return "dispatched"
+                return "no-button"
+
+            def close(self):
+                pass
+
+        c = {"open_entry_labels": ["入口A"], "home_labels": ["返回应用"],
+             "main_target_match": "x", "entry_delay_sec": 0, "entry_timeout_sec": 5}
+        with mock.patch.object(self.d, "_main_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                mock.patch("checkin.drivers.client_claim.CDPPage", return_value=_Page()), \
+                mock.patch("checkin.drivers.client_claim.time.sleep"):
+            self.d._open_entry(9334, c)
+        self.assertEqual(seen[:2], ["返回应用", "入口A"],
+                         "必须先回主工作区、再点入口 —— 顺序反了在设置页上照样找不到入口")
+
+    def test_home_click_is_idempotent_when_already_home(self):
+        """已经在主工作区时（找不到「返回应用」按钮）不得有任何副作用。
+
+        幂等是这条修复能不能上的前提：主工作区**本来就没有**该按钮，
+        点不到 == 什么都不做。若这里会因"找不到"而中断，正常路径反而会被它拖死。
+        """
+        seen = []
+
+        class _Page:
+            def evaluate(self, js, await_promise=False):
+                if '"返回应用"' in js:
+                    seen.append("home-miss")
+                    return "no-button"      # 主工作区：该按钮不存在
+                seen.append("entry-hit")
+                return "dispatched"
+
+            def close(self):
+                pass
+
+        c = {"open_entry_labels": ["入口A"], "home_labels": ["返回应用"],
+             "main_target_match": "x", "entry_delay_sec": 0, "entry_timeout_sec": 5}
+        with mock.patch.object(self.d, "_main_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                mock.patch("checkin.drivers.client_claim.CDPPage", return_value=_Page()), \
+                mock.patch("checkin.drivers.client_claim.time.sleep"):
+            self.d._open_entry(9334, c)
+        self.assertIn("entry-hit", seen, "回主工作区失败不能阻断入口点击")
 
     def test_open_entry_is_noop_without_labels(self):
         """没配 open_entry_labels 时必须原地返回、**不连 CDP**。

@@ -119,6 +119,37 @@ _JS_CLICK_ARIA = r"""
 """
 
 
+# 「回到主工作区」用的点击脚本：按 innerText **精确**匹配。
+# 与 `_JS_CLICK_ARIA` 的唯一区别是**找元素的方式** —— 客户端的「返回应用」按钮
+# 只有文本、**没有 aria-label**（2026-10-11 实测），aria 那一版够不到它。
+# 事件序列必须与 `_JS_CLICK` 完全一致（同一 UI 框架，同样绑 pointerdown）。
+_JS_CLICK_TEXT = r"""
+(() => {
+  const label = __LABEL__;
+  const b = [...document.querySelectorAll('button,[role="button"],a')].find(
+    x => ((x.innerText || '') + '').trim() === label);
+  if (!b) return 'no-button';
+  b.scrollIntoView({block: 'center'});
+  const r = b.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const base = {bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0, detail: 1};
+  const seq = [
+    ['pointerover',  PointerEvent, {...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['pointerenter', PointerEvent, {...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['mouseover',    MouseEvent,   {...base, buttons: 0}],
+    ['pointerdown',  PointerEvent, {...base, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['mousedown',    MouseEvent,   {...base, buttons: 1}],
+    ['pointerup',    PointerEvent, {...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}],
+    ['mouseup',      MouseEvent,   {...base, buttons: 0}],
+    ['click',        MouseEvent,   {...base, buttons: 0}]
+  ];
+  for (const [type, Ctor, init] of seq) b.dispatchEvent(new Ctor(type, init));
+  return 'dispatched';
+})()
+"""
+
+
 def _read_tail(path: str, limit: int = 300_000) -> str:
     """读文件末尾若干字节。
 
@@ -828,6 +859,28 @@ class ClientDriver(Driver):
             log.debug("列举 target 失败：%s", e)
         return None
 
+    def _back_to_home(self, page, c: Dict[str, Any], settle: float) -> None:
+        """若客户端停在**子页面**（如设置页 `#/settings`），先点「返回」回到主工作区。
+
+        为什么需要（2026-10-11 实测**真失败**）：活动入口**只存在于主工作区**。
+        客户端重启后可能落在设置页，那一层连 `open_entry_labels` 的影子都没有
+        ⇒ 两个入口全 `no-button` ⇒ 等预算耗尽 ⇒ `no_action` ⇒ **当天漏签**。
+        （当天是靠人工把窗口切回主工作区才补上的。）
+
+        **幂等**：主工作区里**不存在** `home_labels` 里的按钮 ⇒ 直接 `no-button`，
+        什么都不做。找不到/点不到都静默返回，绝不因它抛异常而阻断领取。
+        """
+        for label in (c.get("home_labels") or []):
+            js = _JS_CLICK_TEXT.replace(
+                "__LABEL__", json.dumps(str(label), ensure_ascii=False))
+            try:
+                if page.evaluate(js, await_promise=False) == "dispatched":
+                    log.info("客户端停在子页面，点击 %r 返回主工作区", label)
+                    time.sleep(settle)
+                    return
+            except Exception as e:                          # noqa: BLE001
+                log.debug("返回主工作区失败：%s", e)
+
     def _open_entry(self, port: int, c: Dict[str, Any]) -> None:
         """从客户端外壳把活动入口**点出来**（入口平时藏在用量面板后面）。
 
@@ -857,6 +910,9 @@ class ClientDriver(Driver):
         budget = _float_cfg(c, "entry_timeout_sec", 20.0)  # 单个入口"等它出现"的上限
         page = CDPPage(main["webSocketDebuggerUrl"])
         try:
+            # 先确保在主工作区：客户端可能停在设置页等子页面，那一层没有活动入口
+            # （2026-10-11 实测：重启后落在设置页 ⇒ 所有入口 no-button ⇒ 当天漏签）
+            self._back_to_home(page, c, settle)
             for label in labels:
                 js = _JS_CLICK_ARIA.replace(
                     "__LABEL__", json.dumps(str(label), ensure_ascii=False))
