@@ -280,3 +280,69 @@ async postCheckin(path) {              // ← 两个接口都走这里，都是 
 但 `openExternal` 打开的不一定是**独立网页** —— 也可能是个**只能被宿主内嵌**的组件。
 判断一个页面能不能独立自动化，最低成本的判据是：**直接打开它，看它自己发出的请求有没有鉴权、返回什么**。
 
+---
+
+### Trae CN / api.trae.cn（2026-10-12 接入 · 活体实测）
+
+**客户端**：Trae CN 1.107.1（VSCode 1.107 内核，Electron 39.2.7 壳），UI 是 **Solo Lite** 新形态
+（侧栏 task-list + chat panel，**不是**传统 workbench）。
+
+**接口**（`out/main.js` 内定义，主进程 ttnet 网络层发出）：
+
+| 用途 | 路径 |
+|---|---|
+| 状态 | `POST /trae/api/v2/ug/checkin_credits/status` |
+| 领取 | `POST /trae/api/v2/ug/checkin_credits/claim` |
+
+**成功判据**（客户端自己的）：`status===200 && (data.code 不存在 || data.code===0)`。
+**鉴权**：主进程注入 `x-device-id`（`guaranteedDeviceId`）—— **我们不复刻、不直调**。
+
+**★ 走的路（2026-10-12 端到端实测跑通）**：renderer 侧的
+`window.vscode.ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`。
+`window.vscode` 是 Electron preload 经 contextBridge 暴露的桥
+（含 `ipcRenderer.{send,invoke,on,once,removeListener}`），
+也是**客户端自己点签到按钮时走的同一条路**：
+
+```
+workbench.action.icubeClaimCheckinCredits
+  → claimIdeCheckinCredits → claimCheckinCredits()
+  → ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')
+  → 主进程 ttnet → POST /trae/api/v2/ug/checkin_credits/claim
+```
+
+⇒ 配方用 `client.bridge.status_js / claim_js` 两段 JS，**驱动不点任何 DOM、不重载窗口**。
+
+**响应体（实测）**：
+
+```json
+status: {"status":200,"data":{"checked_in":false,"did_checked_in":false,"enable":true,
+                              "code":0,"message":"success","credits":100,"extra_credits":100}}
+claim : {"status":200,"data":{"code":0,"message":"success"}}
+```
+
+⇒ `verdict.checked_in_flag: checked_in` 判"今日已签"；
+   bridge 表达式把 `data.code` 提到**顶层**（驱动只认顶层 `code`），`data` 原样带出供判定。
+
+**端到端证据**：before `checked_in:false` → claim `code:0` → after **`checked_in:true`** ✅
+复跑驱动 → `already`（已签即收手，**未重复调 claim**）。
+
+**被推翻的两个假设（教训，与上文 C 同源）**：
+
+| 当时猜的 | 实测 |
+|---|---|
+| VSCode 内核 ⇒ 主窗口 URL 是 `workbench.html` | Solo Lite 新 UI，真实 URL 是 `vscode-file://vscode-app/...` ⇒ 该串**永不命中** ⇒ 每天静默 `no_action`（不报错、不提醒） |
+| 点左下角账号头像 → 找「每日签到」 | `button.accountTrigger-*`（class 带构建期 hash、无 aria-label）点开的是**付费页**（z=9999「升级权益」全屏面板） |
+
+⇒ **准则：客户端把接口桥在 renderer 里时，先找桥，别猜 UI。** 桥找不到，再谈 DOM。
+   配套守卫 `test_bridge_sites_declare_a_reachable_target`（bridge 站点的 `target_match` 必须非空且为实测值）。
+
+**其它**：
+
+- **日切按北京时间 0 点**（客户端字段 `beijingDayKey`）⇒ `reminder.not_before: '00:00'`，
+  每轮 100 通用积分。
+- **不配 `log_state`**：`logs/<session>/main.log` 只记 `ttnet fetch request <url>` 与响应状态码，
+  **不落响应体** ⇒ 判不出 `checked_in`。没有可靠旁证就不硬凑（同 Trae 配方头注释）。
+- **启动入口**：桌面 `TRAE CN.lnk` 一个；无任务栏固定项、无 Run 自启动键 ⇒ 改这一处即全覆盖。
+- `close_after: true`（用户 2026-10-12 选「自动拉起，签完关掉」）——
+  只作用于**我们拉起的实例**，用户在用的实例永不关。
+

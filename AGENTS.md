@@ -13,8 +13,13 @@
 
 ## 一、这个项目是干什么的
 
-两个平台（WorkBuddy / Qoder CN）的每日签到：用 CDP 接管一个**已登录的专用 Chrome**，在页面上下文里
-调接口领取积分。站点知识全部外置在 `recipes/*.yaml`，代码里不出现产品名。
+三个平台（WorkBuddy / Qoder CN / Trae CN）的每日签到：用 CDP 接管一个**已登录的专用 Chrome**
+（`auto`）或**已运行的桌面客户端**（`client`），驱动它们**自己**完成签到。
+站点知识全部外置在 `recipes/*.yaml`，代码里不出现产品名。
+
+`client` 站点内部有两条路，由配方 `client.bridge` 是否存在决定：
+**有** bridge 段 ⇒ 在客户端页面上下文里调它自己的接口/通道（WorkBuddy 的 http 通道、Trae 的 IPC 通道），
+**不点 DOM**；**无** bridge 段 ⇒ 点它自己的按钮（Qoder 走这条）。
 
 ---
 
@@ -66,8 +71,12 @@ Engine.run(only=None, dry_run=False, probe=False, now=False) -> List[CheckinResu
 + `actions{status,trigger}` + `verdict{transport,rules,http_401_result,unknown_result,checked_in_flag,result_flag,result_map}`
 + `reminder` + `client{…}`（仅 `mode: client` 用到）
 （`mode: auto|manual|client|disabled`；`manual` 只发提醒，**不做自动化**——理由见 `DESIGN_NOTES.md` 决策 B。
-`client` = **驱动桌面客户端自己完成签到**：配方**有** `bridge` 段就在客户端页面里调它自己的 http 通道
-（WorkBuddy 走这条，免维护登录态），**无** `bridge` 段就点它自己的按钮（Qoder 走这条）。）
+`client` = **驱动桌面客户端自己完成签到**：配方**有** `bridge` 段就在客户端页面里调它自己的
+http 通道 / IPC 通道（WorkBuddy 的 `window.wb.http`、Trae 的 `window.vscode.ipcRenderer` 走这两条，
+免维护登录态），**无** `bridge` 段就点它自己的按钮（Qoder 走这条）。
+bridge 两段 JS（`status_js` / `claim_js`）各返回一段 **JSON 字符串**，驱动**只认顶层 `code`**
+（业务码需在 JS 里从 `data.code` 提到顶层），`data` 原样带出供 `verdict.checked_in_flag` 判定；
+判定三段：status 预检 → claim → **再读 status 复核**（防"假成功"降级 `no_action`）。
 
 `reminder` 是**自由字典**（引擎只按 key 取值，不认识就忽略），当前认这三个：
 
