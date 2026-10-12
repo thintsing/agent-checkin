@@ -663,6 +663,63 @@ class TestConfig(unittest.TestCase):
         bridge = c.get("bridge") or {}
         self.assertTrue(bridge.get("status_js") and bridge.get("claim_js"))
 
+    def test_trae_client_recipe_is_complete(self):
+        """Trae CN 的接入契约（2026-10-12 真机端到端跑通）。
+
+        ⚠ 当天曾按"猜"的 DOM 路径写过一版（`workbench.html` + 账号菜单 aria），
+        **两条都是错的**：Trae CN 1.107 跑的是 **Solo Lite 新 UI**，renderer URL 是
+        `vscode-file://...`（`workbench.html` 永不命中 = 每天静默 no_action）；
+        左下角账号触发器点开的是**付费页**、且按钮 class 带构建期 hash。
+        ⇒ 改为 **bridge 主路径**：直接调客户端自己的 IPC 通道（实测链：
+           `icubeClaimCheckinCredits` → `claimIdeCheckinCredits` →
+           `ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`）。
+        下面的守卫把"这次踩坑"钉住，防止有人凭直觉改回 DOM / 改错 target。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        t = next((r for r in recipes if r.id == "trae"), None)
+        self.assertIsNotNone(t, "找不到 trae 配方")
+        c = t.client or {}
+        self.assertEqual(t.mode, "client")
+        for key in ("exe", "process_match", "debug_port", "target_match", "main_target_match"):
+            self.assertTrue(c.get(key), f"client.{key} 不能为空")
+        self.assertIsInstance(c["debug_port"], int)
+        # 签完关掉"我们拉起的那个"（不留调试端口后门）；用户在用的实例永不受影响。
+        # 用户 2026-10-12 选「自动拉起，签完关掉」，与 Qoder 同策略。
+        self.assertIs(c.get("close_after"), True,
+                      "close_after 只作用于'我们拉起的实例'，签完应关掉不留后门")
+        # 无端口守候（IDE 可能连续数天不重启）
+        self.assertGreater(int(c.get("wait_port_sec") or 0), 0)
+
+        # ① 主路径必须是 bridge —— 缺任一条就退回"点 DOM"，而 DOM 这条路这里走不通
+        bridge = c.get("bridge") or {}
+        self.assertTrue(bridge.get("status_js"), "缺 status_js 就无法判「今日已签」，会重复调 claim")
+        self.assertTrue(bridge.get("claim_js"), "缺 claim_js 就领不到积分")
+        # ② target_match 必须是**实测过的** renderer 特征。写死的旧值是 `workbench.html`，
+        #    而真实的 renderer URL 是 `vscode-file://vscode-app/...` ⇒ 永不命中 ⇒ 静默漏签。
+        self.assertIn("vscode-file", str(c["target_match"]),
+                      "Trae 的 renderer 是 vscode-file:// 形态；match 写错 = 永不命中 = 每天 no_action")
+        # ③ 判定"今日已签"的字段名必须配，否则 bridge 会每次都去调 claim（可能被服务端拒绝）
+        self.assertEqual(t.verdict.checked_in_flag, "checked_in",
+                         "缺它就无法在已签时收手，会重复触发领取")
+        # ④ 无可靠日志旁证 ⇒ 不得配 log_state（配了就是把任意同名字段当判据）
+        self.assertNotIn("log_state", c, "Trae 日志不落响应体，log_state 必然是假判据")
+
+    def test_bridge_sites_declare_a_reachable_target(self):
+        """凡是走 bridge 的站点，`target_match` 都必须非空。
+
+        空 match 在 `_wait_target` 里**永不命中**（它只在 `match in url` 为真时返回），
+        结果是每天静默 `no_action` —— 且不报错、不提醒。Trae 接入时正因 match 写成了
+        不存在的特征（`workbench.html`）而差点踩到，故立此守卫。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        sites = [r for r in recipes
+                 if isinstance((r.client or {}).get("bridge"), dict)
+                 and (r.client or {})["bridge"].get("status_js")]
+        self.assertGreaterEqual(len(sites), 2, "至少有 workbuddy / trae 两站走 bridge")
+        for r in sites:
+            self.assertTrue(str((r.client or {}).get("target_match") or "").strip(),
+                            f"{r.id}: bridge 站点必须有可命中的 target_match")
+
     def test_port_wait_is_symmetric_across_client_recipes(self):
         """「无端口守候」必须在**所有** client 配方上对称配置。
 
@@ -675,8 +732,10 @@ class TestConfig(unittest.TestCase):
           多会话目录形态，WorkBuddy 是单文件，确实不同，仍不得互相套用。）
         """
         _, recipes = load_config(str(PROJECT_ROOT))
-        clients = [r for r in recipes if r.id in ("qoder", "workbuddy") and r.client]
-        self.assertEqual(len(clients), 2, "两站都该有 client 段")
+        # 动态取**全部** client 配方，不写死名单 —— 写死的守卫在新增站点时会
+        # 静默漏检，而那恰恰是它要防的事（2026-10-12 新增 Trae 时才发现旧版写死）。
+        clients = [r for r in recipes if r.client]
+        self.assertGreaterEqual(len(clients), 3, "至少有 qoder / workbuddy / trae 三站")
         for r in clients:
             self.assertGreater(
                 int((r.client or {}).get("wait_port_sec") or 0), 0,
@@ -1110,6 +1169,85 @@ class TestClientDriverLogic(unittest.TestCase):
         self.assertEqual(_float_cfg({"a": "3s"}, "a", 2.0), 2.0)
         self.assertEqual(_float_cfg({}, "a", 2.0), 2.0)
         self.assertEqual(_float_cfg({"a": 3}, "a", 2.0), 3.0)
+
+    # -------------------------- 「签到 UI 在主窗口内」的站点（2026-10-12 接入 Trae）
+
+    @staticmethod
+    def _main_ui_recipe(**client_over):
+        client = {"debug_port": 9338, "process_match": "x.exe", "wait_port_sec": 0,
+                  "claim_in_main_window": True, "open_entry_labels": ["账户"],
+                  "main_target_match": "workbench.html", "entry_delay_sec": 0,
+                  "entry_timeout_sec": 0}
+        client.update(client_over)
+        return Recipe.from_dict({"id": "trae", "name": "t", "enabled": True, "mode": "client",
+                                 "origin": "https://x", "client": client})
+
+    def test_main_window_ui_expands_entry_and_never_reloads(self):
+        """回归（2026-10-12 接入 Trae CN）：签到 UI 在**客户端主窗口**里（账号菜单浮层）
+        的站点必须满足两条，缺一条就废：
+
+          · 找按钮**之前**先点入口展开 —— 否则按钮永远藏在浮层后面，`found` 恒为 False，
+            站点会稳定报 no_action（而且看起来"配置都对"）；
+          · **绝不重载**主窗口 —— 主窗口就是用户的工作区，重载会打断手头的活
+            （VSCode 系重载会重建整个 workbench）。这类站点也没有 Qoder 那种
+            「跨天存活的陈旧快照」问题需要靠重载来证伪。
+        """
+        calls = {"entry": 0, "reload": 0}
+
+        class _Page:
+            def evaluate(self, js, await_promise=False):
+                # find 探测：返回"没找到按钮"，逼出复核分支
+                return {"found": False, "ready": True, "body": "菜单里没有签到项"}
+
+            def reload(self, wait):
+                calls["reload"] += 1
+                return True
+
+            def close(self):
+                pass
+
+        r = self._main_ui_recipe()
+        with mock.patch.object(self.d, "_wait_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                mock.patch.object(self.d, "_open_entry",
+                                  side_effect=lambda *a: calls.__setitem__("entry", calls["entry"] + 1)), \
+                mock.patch("checkin.drivers.client_claim.CDPPage", return_value=_Page()), \
+                mock.patch("checkin.drivers.client_claim.time.sleep"):
+            self.d._claim(r, dict(r.client), 9338, "workbench.html")
+
+        self.assertEqual(calls["entry"], 1, "target 已命中也要先展开入口，否则够不到按钮")
+        self.assertEqual(calls["reload"], 0, "绝不重载主窗口 —— 那是用户的工作区")
+
+    def test_non_main_window_site_still_rechecks_stale(self):
+        """对照：**没开** `claim_in_main_window` 的站点（Qoder）必须维持原行为 ——
+        找不到按钮时仍走「重载复核」，不能因为新增开关而丢了这条 2026-10-06 的教训。
+        """
+        calls = {"reload": 0}
+
+        class _Page:
+            def evaluate(self, js, await_promise=False):
+                return {"found": False, "ready": True, "body": "已领取"}
+
+            def reload(self, wait):
+                calls["reload"] += 1
+                return True
+
+            def close(self):
+                pass
+
+        r = Recipe.from_dict({"id": "q", "name": "q", "enabled": True, "mode": "client",
+                              "origin": "https://x",
+                              "client": {"debug_port": 9337, "process_match": "x.exe",
+                                         "target_match": "growth-page", "entry_delay_sec": 0,
+                                         "entry_timeout_sec": 0}})
+        with mock.patch.object(self.d, "_wait_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                mock.patch("checkin.drivers.client_claim.CDPPage", return_value=_Page()), \
+                mock.patch("checkin.drivers.client_claim.time.sleep"):
+            self.d._claim(r, dict(r.client), 9337, "growth-page")
+
+        self.assertGreater(calls["reload"], 0,
+                           "非主窗口站点丢了陈旧快照复核 ⇒ 会跨天误判 already、静默漏签")
 
     def test_qoder_recipe_declares_entry_labels(self):
         """回归（2026-09-26 真踩到，当天没领到）：客户端整天常开时，

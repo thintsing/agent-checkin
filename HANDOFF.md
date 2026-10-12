@@ -7,6 +7,62 @@
 
 ---
 
+## [2026-10-12 18:05] WorkBuddy(阿拾) —— 接入第三站 **Trae CN**：换掉错误的 DOM 猜法，改走 **客户端 IPC bridge**；今日三站全绿
+
+**一句话**：Trae CN 接入完成，今天的 100 积分已到手。关键不是"多接一个站"，
+而是**推翻了当天早些时候按直觉写的那套 DOM 方案**（两条假设全错），
+改用 **bridge**：直接调客户端自己的 IPC 通道 ——
+`ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`。
+
+### 证据
+
+| # | 信源 | 内容 |
+|---|---|---|
+| ① | 静态（只读 `out/`） | renderer 命令 `workbench.action.icubeClaimCheckinCredits` → `claimIdeCheckinCredits` → `claimCheckinCredits()` → IPC `vscode:sandbox::main-invoke-claimCheckinCredits` → 主进程 ttnet → `POST /trae/api/v2/ug/checkin_credits/claim` |
+| ② | CDP 实测 | `window.vscode` = Electron preload 经 contextBridge 暴露，含 `ipcRenderer.{send,invoke,on,once,removeListener}` |
+| ③ | **端到端（服务端铁证）** | before `{checked_in:false,did_checked_in:false,credits:100}` → claim `{status:200,data:{code:0,message:"success"}}` → after **`{checked_in:true,did_checked_in:true}`** |
+| ④ | 驱动复跑 | `[trae] => already | 今日已签到（客户端 bridge 状态）` —— 读到已签即**收手**，未重复调 claim |
+| ⑤ | 今日自动化 | `10:58:39 [qoder] 调试端口 9337 已就绪，直接接管` → `10:58:44 => success`（**9337 首考通过**）；`10:59:18 [workbuddy] 端口 9336 就绪` → `10:59:21 => success` |
+
+### 两个被推翻的假设（教训）
+
+1. **"Trae 是 VSCode workbench ⇒ 主窗口 URL 是 `workbench.html`"** —— 错。
+   实测 renderer URL 是 `vscode-file://vscode-app/c:/.../resources/app/out/vs/...`。
+   空 match / 错 match 在 `_wait_target` 里**永不命中** ⇒ 每天静默 `no_action`
+   （不报错、不提醒）。**这正是本项目最怕的失效模式**，已立守卫。
+2. **"签到在账号菜单里 ⇒ 点左下角账号头像 → 找到『每日签到』"** —— 也错。
+   Trae CN 1.107 跑的是 **Solo Lite 新 UI**（侧栏 task-list + chat panel）：
+   左下角账号触发器（`button.accountTrigger-*`，class 带构建期 hash）点开的是
+   **付费页**（z=9999 的"升级权益"全屏面板），不是账号菜单。
+
+⇒ 结论：**客户端把接口桥在 renderer 里时，别去猜 UI**。先找桥，桥找不到再谈 DOM。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `recipes/trae.yaml` | 重建：`enabled: true`；`target_match: 'vscode-file://'`（**实测值**）；新增 `verdict`（`checked_in_flag: checked_in`）；新增 `client.bridge.status_js/claim_js`（两段 JS，把 `data.code` 提到顶层供驱动判定）；`close_after: true`（用户选「自动拉起，签完关掉」，同 Qoder）；`wait_port_sec: 5400` |
+| `src/checkin/drivers/client_claim.py` | `_diagnose` 支持 bridge 站点（`--probe` 现在报 `bridge=已签/未签`）；签名由 `(sid,…)` 改为 `(recipe,…)` |
+| `tools/trae_cdp_probe.py` | 新增侦察工具（穿透 ShadowRoot；VSCode 系 UI 大量用 shadow DOM） |
+| `tools/win_shortcut_args.py` | 新增 `trae` 表项（端口读配方） |
+| `tests/test_core.py` | `test_trae_client_recipe_is_complete` **反转**（DOM 路径 → bridge 主路径 + `target_match` 必须含 `vscode-file`）；新增 `test_bridge_sites_declare_a_reachable_target` |
+| `README.md` | 站点表加 Trae；新增「接入新站点的两条路（bridge / DOM）」小节 |
+
+**验证门**：**193 项全绿**（192 + 1）。
+
+### 已验证的启动入口
+
+- 桌面 `TRAE CN.lnk` → 已写入 `--remote-debugging-port=9338`（备份在 `data/shortcut_backup/`）
+- 任务栏固定项：无；`HKCU\...\Run`：无 → **只有桌面这一条启动路径**，已全覆盖
+
+### 待办
+
+- 明天 10:05–12:30：**Trae 首次自动首考**（应见 `调试端口 9338 已就绪，直接接管` + `=> already`/`=> success`）。
+- 僵尸端口 9334 / 9335 仍需**重启机器**才清（不影响 9337/9338）。
+- 根目录 `_*.py` / `_*.txt` 临时侦察脚本待用户决定是否清理（**铁律 1：不自动删**）。
+
+---
+
 ## [2026-10-11 14:20] WorkBuddy(阿拾) —— Qoder **补领成功** + 揪出并修掉第二个真短板：**窗口停在设置页 ⇒ 入口一个都找不到**
 
 **一句话**：换端口后 Qoder 今天补领成功（服务端 `claimStatus: CLAIMED`，100 Credits）。

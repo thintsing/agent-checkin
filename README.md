@@ -15,7 +15,7 @@
 
 **本项目会自动化执行两个平台的每日签到，这可能违反它们的服务条款。请你自己权衡用哪个账号。**
 
-- 自动签到**违反 Qoder / WorkBuddy (CodeBuddy) 的服务条款**。无论做得多"像人"，都存在账号被限制或封禁的风险，**本工具无法保证不封号**。
+- 自动签到**违反 Qoder / WorkBuddy (CodeBuddy) / Trae 的服务条款**。无论做得多"像人"，都存在账号被限制或封禁的风险，**本工具无法保证不封号**。
 - 项目内置的降风险设计（见下文）只是把风险**压低**，不是消除。
 - **只用你自己的单一账号、单一设备、单一出口网络**；绝不批量、多号、代理轮换 —— 那才是真正触发风控的模式。
 - 项目**明确不做**的一件事：不读取、不复刻客户端加密的 `auth.machine-id` / `auth.v1.dat` —— 那等于**伪造设备身份**，正踩风控红线。Qoder 走的是"CDP 驱动客户端自己点自己的按钮"，不碰任何接口。
@@ -78,7 +78,7 @@ python tools\win_shortcut_args.py --app workbuddy --autostart            REM 给
 python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还原
 ```
 
-端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
+端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
 
 驱动随之采用**四分支决策**，核心原则是 **绝不杀掉用户正在用的客户端**：
 
@@ -128,11 +128,23 @@ token 由客户端主进程注入并**自行续期**，我们不再需要维护�
 |---|---|---|---|
 | **WorkBuddy** (`codebuddy.cn`) | `client` | **CDP bridge**：在客户端页面上下文里调用它自己的 http 通道（`window.wb.http`），走 `/v2` 桌面端前缀 | 免维护登录态 —— **客户端自己持有并续期 token**；网页侧 cookie 只有 **168 小时（7 天）** 就会过期，周期性要求人工重登 |
 | **Qoder CN** | `client` | **CDP 驱动桌面客户端**点它自己的按钮 | 网页入口不存在（见上文 ①）；且不伪造设备指纹 |
+| **Trae CN** | `client` | **CDP bridge**：调客户端自己的 IPC 通道（`window.vscode.ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`） | 签到入口藏在新版 Solo Lite UI 的账号菜单里（点开还会落到付费页）；IPC 是**客户端自己点签到按钮时走的同一条路**，不碰 token / 设备身份文件 |
 
 新增站点**不需要改一行代码** —— 在 `recipes/` 放一个 YAML 即可。
 
 > `auto`（在已登录浏览器页面上下文里 `fetch`）与 `manual`（只发提醒）两种模式**仍然保留、可用**；
-> 只是**当前两个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
+> 只是**当前三个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
+
+### 接入一个新站点的两条路（2026-10-12 补）
+
+| 路径 | 适用 | 做法 |
+|---|---|---|
+| **bridge** | 客户端把接口桥在了 renderer 里（WorkBuddy 的 `window.wb.http`、Trae 的 `window.vscode.ipcRenderer`） | 配方写 `client.bridge.status_js` / `claim_js` 两段 JS；驱动只负责执行与判定，**不认识任何产品名** |
+| **DOM** | 签到是客户端里一个独立活动页 target（Qoder 的 `growth-page` iframe） | 配方给 `target_match` + `claim_button` + `claimed_markers`，驱动等 target → 点按钮 → 读确认文案 |
+
+⚠ **bridge 站点的 `target_match` 必须写实测值**。Trae 接入时就栽在这上面：曾凭直觉写成 `workbench.html`，
+而它真实的 renderer URL 是 `vscode-file://vscode-app/...` —— 空 match / 错 match 在 `_wait_target` 里
+**永不命中**，结果是每天静默 `no_action`（不报错、不提醒）。已立守卫 `test_bridge_sites_declare_a_reachable_target`。
 
 ---
 
@@ -320,7 +332,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，
    重启客户端也拿不回。所以端口值以各站点配方的 `client.debug_port` 为单一事实源
-   （Qoder=9337 / WorkBuddy=9336），换端口是改一行的事。
+   （Qoder=9337 / WorkBuddy=9336 / Trae=9338），换端口是改一行的事。
 5. **计划任务只在有登录会话时运行**（锁屏算、未登录不算）—— 开浏览器需要桌面会话。
 
 ---

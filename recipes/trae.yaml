@@ -1,0 +1,138 @@
+# ============================================================
+#  站点配方 · Trae CN (字节跳动 AI IDE)
+#  形态：client —— 驱动桌面客户端自己完成签到（复用客户端持有的登录态与设备身份）。
+#
+#  ---- 2026-10-12 静态取证（只读 app.asar/out，未逆向、未碰鉴权文件）----
+#  客户端版本：Trae CN 1.107.1（VSCode 1.107 内核，Electron 壳）。
+#
+#  签到接口（`out/main.js` 内定义，主进程 ttnet 网络层发出）：
+#      fetchCheckinCreditsStatus() → POST /trae/api/v2/ug/checkin_credits/status
+#      claimCheckinCredits()       → POST /trae/api/v2/ug/checkin_credits/claim
+#      // 成功判据（客户端自己的）：status===200 && (data.code 不存在 || data.code===0)
+#      // 请求头由 fb(e) 注入：e["x-device-id"] = this.S.guaranteedDeviceId
+#
+#  ---- 2026-10-12 真机实测（端口 9338，**端到端跑通**）----
+#  ★ 主路径 = `bridge`：在 renderer 里直接调**客户端自己的 IPC 通道**，
+#    等价于用户点签到按钮，不点 DOM、不重载窗口。
+#
+#    链路（静态取证 + 实测复验）：
+#      renderer 命令 workbench.action.icubeClaimCheckinCredits
+#        → claimIdeCheckinCredits(source)
+#        → claimCheckinCredits()
+#        → ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')
+#        → 主进程 ttnet → POST /trae/api/v2/ug/checkin_credits/claim
+#
+#    renderer 侧的 `window.vscode` 是 Electron preload 经 contextBridge 暴露的桥，
+#    含 `ipcRenderer.{send,invoke,on,once,removeListener}` —— 这是**客户端自己的**
+#    公开通道，与"点按钮"走的是同一条路；不伪造请求、不碰 token / 设备身份文件。
+#
+#    实测证据（2026-10-12 17:5x，当日未签状态下）：
+#      status before : {"status":200,"data":{"checked_in":false,"did_checked_in":false,
+#                                            "enable":true,"code":0,"credits":100}}
+#      claim         : {"status":200,"data":{"code":0,"message":"success"}}
+#      status after  : {"checked_in":true,"did_checked_in":true}   ← 服务端铁证
+#
+#  ⚠ 为什么不用 DOM（与 Qoder 的**结构性差异**）：
+#    Qoder 的活动页是**独立 OOPIF target**（`growth-page`），驱动能"等 target → 点按钮"。
+#    Trae CN 是 **Solo Lite 新 UI**（侧栏 task-list + chat panel），签到入口是左下角
+#    账号触发器（`button.accountTrigger-*`，class 带构建期 hash）点开后的浮层 ──
+#    没有独立 target、没有 aria-label、文案由服务端下发。实测直接点该按钮打开的是
+#    **付费页**（z=9999 的"升级权益"全屏面板），并非账号菜单。
+#    ⇒ 点 DOM 这条路既脆又不可靠；bridge 才是主路径。
+#
+#  ⚠ `target_match` 必须是实测值：Trae 的渲染进程 URL 是
+#    `vscode-file://vscode-app/c:/.../resources/app/out/vs/...`（**不是** workbench.html）。
+#    bridge 靠它选中主窗口 renderer —— 写错 = 永不命中 = 每天静默 no_action。
+#
+#  ⚠ 不配 `log_state`：main.log 只记 `ttnet fetch request <url>` 与响应状态码，
+#    **不落响应体**，判不出 checked_in。没有可靠旁证就不硬凑。
+#
+#  ⚠ `close_after: true`（用户 2026-10-12 选「自动拉起，签完关掉」，与 Qoder 同策略）：
+#    它只作用于"客户端本来没在跑、由我们拉起"那条路（`run()` 分支④）——
+#    用户自己在用的实例（分支②③）永远不关，故不存在"误关用户 IDE"。
+#    关掉的理由：不留调试端口 = 不留后门。
+# ============================================================
+id: trae
+name: Trae CN 每日签到
+enabled: true              # 2026-10-12 真机端到端验证通过（status/claim/复核 三段全通）
+mode: client
+
+# 判定：业务码只认**顶层** code（bridge 表达式已把 data.code 提上来）。
+# 只配 code=0→success —— "活动已结束 / 不满足条件"这类业务拒绝会落到 unknown → no_action，
+# 且驱动在报 success 之前**必再读一次 status 复核**，所以不存在"假成功"。
+verdict:
+  transport: body_code
+  rules:
+    - { code: 0, result: success }
+  http_401_result: need_login
+  unknown_result: no_action
+  # 响应体 data 里表示"今日已签"的字段（实测：未签 false → 领取后 true）。
+  # 有它才能在已签时**收手**，绝不重复调 claim。
+  checked_in_flag: checked_in
+
+client:
+  # electron-builder per-user 安装，路径固定，无 Qoder 那种滚动版本目录。
+  exe: '%LOCALAPPDATA%\Programs\Trae CN\Trae CN.exe'
+  exe_glob: ''
+  # 调试端口 —— **单一事实源**：tools/win_shortcut_args.py 写快捷方式时读这里。
+  # 9333=网页侧专用浏览器；9336=WorkBuddy；9337=Qoder；9338=本应用。
+  # （9334/9335 已被僵尸监听占死，不可复用。）
+  debug_port: 9338
+  # 按命令行匹配主进程（排除渲染/GPU 等 --type=* 子进程与 app-host 助手）
+  process_match: 'Trae CN.exe'
+  # VSCode 系启动较慢，给足时间
+  launch_timeout_sec: 90
+  target_timeout_sec: 30
+
+  # 主窗口 renderer 的 URL 特征（2026-10-12 实测）。
+  # 第二个 page target 是 `file:///.../iCubeFloat...`（60x100 悬浮球），不匹配本串 —— 正好排除。
+  target_match: 'vscode-file://'
+  main_target_match: 'vscode-file://'
+
+  # ---- bridge：不点 DOM，直接调客户端自己的 IPC 通道 ----
+  # 表达式**必须返回 JSON 字符串**（跨 CDP 边界用 returnByValue，字符串最稳），
+  # 且驱动侧只认**顶层 `code`** —— 故这里把业务码从 `data.code` 提上来，
+  # 原始 `data` 原样带出，供上面 `verdict.checked_in_flag` 读取。
+  # 脚本内容属于**站点知识**（含产品名/IPC channel），所以放配方；驱动侧不含任何产品名。
+  bridge:
+    status_js: |
+      (async () => {
+        const r = await window.vscode.ipcRenderer.invoke(
+          'vscode:sandbox::main-invoke-fetchCheckinCreditsStatus');
+        const d = (r && r.data) || {};
+        const c = (typeof d.code === 'number') ? d.code : ((r && r.status === 200) ? 0 : -1);
+        return JSON.stringify({code: c, data: d});
+      })()
+    claim_js: |
+      (async () => {
+        const r = await window.vscode.ipcRenderer.invoke(
+          'vscode:sandbox::main-invoke-claimCheckinCredits');
+        const d = (r && r.data) || {};
+        const c = (typeof d.code === 'number') ? d.code : ((r && r.status === 200) ? 0 : -1);
+        return JSON.stringify({code: c, data: d});
+      })()
+
+  # 领取后关闭**我们拉起的那个**客户端（不留调试端口 = 不留后门）。
+  # 用户选「自动拉起，签完关掉」（2026-10-12），与 Qoder 同策略。
+  # ⚠ 语义澄清：`close_after` 只作用于 `run()` 分支④（客户端本来没在跑、由我们拉起）；
+  #   用户自己在用的实例（分支②③）**永远不会**被关 —— 故不存在"误关用户 IDE"。
+  close_after: true
+  # 无端口守候：调试端口只能在启动时绑定，IDE 可能连续数天不重启
+  # ⇒ 无端口时按此守候，用户中途重启（带上端口）即接管补领。
+  wait_port_sec: 5400
+
+  # 日志是多会话目录形态（logs/<session>/main.log），但**不记响应体**，
+  # 无法据此判已领 ⇒ 不配 log_state（详见文件头注释）。
+  data_dir: '%APPDATA%\Trae CN'
+
+reminder:
+  # 开窗时刻闸门（HH:MM, UTC+8）。Trae 每日签到按北京时间日切，0 点即刷新
+  # ⇒ 不设额外限制（全局随机窗 10:05–12:30 已在其后）。
+  not_before: '00:00'
+  toast_title: 'Trae CN 每日签到提醒'
+  toast_body: '打开 Trae CN → 从桌面快捷方式启动（带调试端口）→ 或运行 python -m checkin --now --only-site trae 补签。'
+  note: '签到入口在账号菜单；每日 0 点（UTC+8）刷新一轮，每轮 100 通用积分。'
+
+schedule_hint:
+  timezone: Asia/Shanghai
+  refresh_hour_utc8: 0

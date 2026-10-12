@@ -205,7 +205,7 @@ class ClientDriver(Driver):
         gate = str((recipe.reminder or {}).get("not_before") or "")   # 开窗时刻，如 "10:00"
 
         if dry_run or probe:
-            return self._diagnose(sid, c, port, match, gate)
+            return self._diagnose(recipe, c, port, match, gate)
 
         # ① 零打扰预检：不启动客户端，先读客户端日志判断本窗口是否已领。
         #    定时任务最常见的场景就是"用户早就手动领过了"——这一步能省掉整次启动。
@@ -279,6 +279,12 @@ class ClientDriver(Driver):
         if isinstance(bridge, dict) and bridge.get("status_js"):
             return self._claim_via_bridge(recipe, c, port, match, bridge)
         find, click, markers = self._js(c)
+        # 「签到 UI 就在客户端主窗口里」—— 与 Qoder 那种**独立活动页 target** 相对。
+        # Trae CN 的入口是主工作区里的**账号菜单浮层**，没有自己的 target：
+        #   · target 必然命中主窗口 ⇒ 不会走 "入口未自动出现" 那条分支；
+        #   · 但按钮藏在浮层后面，必须先点入口展开，否则永远 found=False；
+        #   · 且**绝不能重载**：主窗口就是用户的工作区（详见下面 `_recheck_stale` 处）。
+        main_ui = bool(c.get("claim_in_main_window"))
 
         tgt = self._wait_target(port, match, int(c.get("target_timeout_sec", 25)))
         if tgt is None:
@@ -291,6 +297,11 @@ class ClientDriver(Driver):
             log.info("[%s] 活动入口未自动出现，尝试从客户端 UI 调出", sid)
             self._open_entry(port, c)
             tgt = self._wait_target(port, match, int(c.get("entry_timeout_sec", 20)))
+        elif main_ui:
+            # 签到 UI 在主窗口内 ⇒ target 已经命中，但按钮还藏在浮层后面。
+            # 先按配方的 `open_entry_labels` 把入口点开，下面的 find/click 才找得到按钮。
+            log.info("[%s] 签到入口在客户端主窗口内，先展开入口", sid)
+            self._open_entry(port, c)
         if tgt is None:
             # 到这一步是真的取不到了。最常见的原因是"本窗口已经领过了"，
             # 但也可能是活动结束/窗口未到 —— 交给人判断，不要瞎重试。
@@ -314,9 +325,16 @@ class ClientDriver(Driver):
             # 刷新到新窗口。不复核就会把"今天能领"误判成"今天已领"，
             # 且记为 ALREADY、不触发任何提醒（2026-10-06 真漏签一整天）。
             if not _claimable(pre):
-                fresh = self._recheck_stale(page, find)
-                if fresh is not None:
-                    pre, body = fresh, str(fresh.get("body") or "")
+                if main_ui:
+                    # 主窗口就是用户的**工作区** —— 重载它会打断手头的活（VSCode 系
+                    # 重载会重建整个 workbench）。而主窗口内的菜单浮层每次点开都是
+                    # **实时渲染**的，不存在 Qoder 那种「跨天存活的陈旧快照」，
+                    # 所以这里不做重载复核，直接按当前 DOM 下结论。
+                    log.debug("主窗口 UI 站点，跳过陈旧快照复核（重载代价不可接受）")
+                else:
+                    fresh = self._recheck_stale(page, find)
+                    if fresh is not None:
+                        pre, body = fresh, str(fresh.get("body") or "")
 
             if not pre.get("found"):
                 if any(m in body for m in markers):
@@ -544,8 +562,9 @@ class ClientDriver(Driver):
 
     # ------------------------------------------------------------ 状态探测
 
-    def _diagnose(self, sid: str, c: Dict[str, Any], port: int, match: str,
+    def _diagnose(self, recipe: Recipe, c: Dict[str, Any], port: int, match: str,
                   gate: str) -> CheckinResult:
+        sid = recipe.id
         parts: List[str] = []
         detail: Dict[str, Any] = {}
 
@@ -558,13 +577,24 @@ class ClientDriver(Driver):
             detail["target_present"] = bool(tgt)
             parts.append(f"活动入口={'在' if tgt else '不在'}")
             if tgt:
-                find, _, _ = self._js(c)
                 page = CDPPage(tgt["webSocketDebuggerUrl"])
                 try:
-                    info = page.evaluate(find, await_promise=False) or {}
-                    detail["button_found"] = bool(info.get("found"))
-                    detail["body"] = str(info.get("body") or "")[:400]
-                    parts.append(f"领取按钮={'可点' if info.get('found') else '无'}")
+                    # bridge 站点（Trae / WorkBuddy）：直接读桥的状态，**不点 DOM**。
+                    # 诊断据此就能回答"今天到底领没领"，比 DOM 探针可靠得多。
+                    bridge = c.get("bridge") if isinstance(c.get("bridge"), dict) else None
+                    if bridge and bridge.get("status_js"):
+                        st = self._bridge_call(page, str(bridge["status_js"]), 10)
+                        sdata = st.get("data") if isinstance((st or {}).get("data"), dict) else {}
+                        detail["bridge_status"] = st
+                        signed = recipe.verdict.already_checked_in(sdata)
+                        detail["checked_in"] = signed
+                        parts.append(f"bridge={'已签' if signed else '未签'}")
+                    else:
+                        find, _, _ = self._js(c)
+                        info = page.evaluate(find, await_promise=False) or {}
+                        detail["button_found"] = bool(info.get("found"))
+                        detail["body"] = str(info.get("body") or "")[:400]
+                        parts.append(f"领取按钮={'可点' if info.get('found') else '无'}")
                 finally:
                     page.close()
         else:

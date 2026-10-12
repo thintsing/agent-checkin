@@ -31,6 +31,7 @@ Electron 应用的调试端口**只能在启动时绑定**，运行中无法追�
     python tools/win_shortcut_args.py --set "<.lnk>" --arg "--foo=bar"
     python tools/win_shortcut_args.py --app qoder            # 给 Qoder CN 全部入口加调试端口
     python tools/win_shortcut_args.py --app workbuddy        # 同上，WorkBuddy
+    python tools/win_shortcut_args.py --app trae             # 同上，Trae CN
     python tools/win_shortcut_args.py --app qoder --revert   # 从备份还原
     python tools/win_shortcut_args.py --qoder                # 等价 --app qoder（旧写法保留）
     python tools/win_shortcut_args.py --app workbuddy --autostart           # 改 **自启动 Run 键**
@@ -111,6 +112,19 @@ APPS = {
         # 2026-10-10 实地核查：WorkBuddy 5.7.7 有自启动项，且**不带端口** ——
         # 10-09 重启后自启的实例因此接管不了（当天真漏签）。
         "run_key": "WorkBuddy.WorkBuddy",
+    },
+    "trae": {
+        "label": "Trae CN",
+        "recipe": "trae.yaml",
+        # 桌面实际文件名是「TRAE CN.lnk」（大写）。Windows 路径不区分大小写，
+        # 但按实际写法登记，免得日后核对时以为找不到。
+        "lnks": [
+            r"%USERPROFILE%\Desktop\TRAE CN.lnk",
+        ],
+        # 未观察到 Trae 回写快捷方式；没有实测依据就不加只读锁。
+        "lock": None,
+        # 2026-10-12 实地核查 HKCU\...\Run：无 Trae 项（它不自启，只走快捷方式）。
+        "run_key": None,
     },
 }
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
