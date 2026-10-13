@@ -7,6 +7,52 @@
 
 ---
 
+## [2026-10-13 12:05] WorkBuddy(阿拾) —— **Trae 首次自动首考通过**；WorkBuddy 撞上服务端 500 故障并补领成功；顺带修掉「服务端错误体不进日志」的短板
+
+**一句话**：今天三站全绿（qoder 16 / trae 2 / workbuddy 20 天）。
+**Trae 9338 首次自动首考通过**（昨天登记的唯一待办闭环）；WorkBuddy 11:55 撞上
+**服务端故障**（HTTP 500，`data.msg="签到配置加载失败，请稍后重试"`），12:00 服务端恢复后补领成功。
+
+### 证据
+
+| # | 信源 | 内容 |
+|---|---|---|
+| ① | 今日执行日志 | `11:52:19 [qoder] 端口 9337 就绪` → 入口未自动出现 → 自动点开 → `11:52:53 => success` |
+| ② | 今日执行日志 | `11:54:13 [trae] 端口 9338 就绪` → `11:54:14 => success | 已领取（客户端 bridge）` —— **bridge 路径零 DOM、零重载** |
+| ③ | 今日执行日志 | `11:55:25 [workbuddy] bridge 表达式异常：Request failed with status code 500` |
+| ④ | **CDP 直取响应体** | `{"status":500,"statusText":"Internal Error","data":{"code":10001,"msg":"签到配置加载失败，请稍后重试","requestId":"4ea4393b…"}}` |
+| ⑤ | 客户端日志 | `03:58:10Z fetchCheckinStatus success → today_checked_in:false, streak_days:13, today_credit:100`（**客户端自己读状态是通的**，说明故障只在活动配置加载，不在鉴权/状态通道） |
+| ⑥ | 补领 | `12:00:56 [workbuddy] => success | 已领取（客户端 bridge）`；`--probe` 复核 `bridge=已签`；streak 19 → **20** |
+
+### 根因与处置
+
+**不是我们的 bug**：`/v2` 与无前缀两条路径同样 500，且客户端自己的状态接口同时刻正常
+⇒ 服务端活动配置加载故障，官方文案即"稍后重试"。
+**没有误判风险**：表达式抛错 ⇒ `_bridge_call` 返回 None ⇒ 驱动报 `error`，
+**不会**被 `verdict.rules` 里的 `code:10001 → already` 吃成"已签"（那条规则只对**正常返回体**生效）。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `src/checkin/drivers/client_claim.py` | `_bridge_call` 的 kick 模板 catch 分支增加 `detail`：把 `e.response.data`（axios 类库放服务端响应体的位置）一并回传；`log.warning` 带上它。**动机**：当天日志只说「表达式异常：status code 500」，看着像驱动的 bug，真实原因全在服务端响应体里 —— 为此专门写了个诊断脚本才看清，白绕一圈 |
+| `tests/test_core.py` | 新增 `test_bridge_call_surfaces_server_error_body`（断言 kick 取值来源 + 槽位赋值 + 日志含服务端文案） |
+| `README.md` | 测试数 193 → **194** |
+
+⚠ **这个守卫差点名存实亡**（已用"改坏看变红"验证）：
+第一版只断言 `"e.response.data" in kick` —— 而该串在**条件判断**里也出现，
+把取值改成 `e.data` 后断言依然成立。补强为 `JSON.stringify(e.response.data)` +
+`detail:` + 日志文案三条后，两种破坏方式（改错取值来源 / 删掉赋值）**均变红**。
+
+**验证门**：**194 项全绿**（193 + 1），并已做破坏性验证。
+
+### 待办
+
+- 无新增。Trae 9338 已首考通过，进入日常轮换。
+- 若 WorkBuddy 再现 500：现在日志会直接打出服务端 `msg`，按文案判断是"稍后重试"还是"活动结束"即可，不必再写诊断脚本。
+
+---
+
 ## [2026-10-12 18:05] WorkBuddy(阿拾) —— 接入第三站 **Trae CN**：换掉错误的 DOM 猜法，改走 **客户端 IPC bridge**；今日三站全绿
 
 **一句话**：Trae CN 接入完成，今天的 100 积分已到手。关键不是"多接一个站"，

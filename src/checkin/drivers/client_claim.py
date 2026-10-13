@@ -517,7 +517,17 @@ class ClientDriver(Driver):
             "(async () => {\n"
             "  try { window." + slot + " = {value: await (\n"
             + expr + "\n)}; }\n"
-            "  catch (e) { window." + slot + " = {error: String((e && e.message) || e)}; }\n"
+            # 顺带把**服务端响应体**带出来。HTTP 错误时 axios 类库把 body 放在
+            # `e.response.data`，而服务端往往在那里说明真正原因 —— 2026-10-13 实测：
+            # WorkBuddy 服务端故障，页面抛的 message 只有 "Request failed with status
+            # code 500"，真正的原因（data.code=10001 / msg="签到配置加载失败，请稍后重试"）
+            # 全在 e.response.data 里。少了它，日志只说"表达式异常"，看着像驱动的 bug，
+            # 其实是服务端故障 —— 为此白写了一个诊断脚本。
+            "  catch (e) { let d = null;\n"
+            "    try { d = (e && e.response && e.response.data) ?\n"
+            "      JSON.stringify(e.response.data) : null; } catch (x) { d = null; }\n"
+            "    window." + slot + " = {error: String((e && e.message) || e),\n"
+            "                          detail: (d && d.length > 400) ? d.slice(0, 400) : d}; }\n"
             "})();\n"
             "'started'"
         )
@@ -545,7 +555,9 @@ class ClientDriver(Driver):
             if not isinstance(obj, dict) or obj.get("pending"):
                 continue
             if "error" in obj:
-                log.warning("bridge 表达式异常：%s", obj["error"])
+                detail = obj.get("detail")
+                log.warning("bridge 表达式异常：%s%s", obj["error"],
+                            (" ｜ 服务端响应体：" + str(detail)) if detail else "")
                 return None
             val = obj.get("value")
             if isinstance(val, dict):

@@ -2140,6 +2140,42 @@ class TestClientBridge(unittest.TestCase):
 
         self.assertIsNone(ClientDriver._bridge_call(FakePage(), "S()", timeout=5))
 
+    def test_bridge_call_surfaces_server_error_body(self):
+        """HTTP 错误时必须把**服务端响应体**也带回来（2026-10-13 实测教训）。
+
+        WorkBuddy 当天服务端故障：页面抛出的 message 只有
+        `Request failed with status code 500`，而真正的原因
+        （`data.code=10001` / `msg="签到配置加载失败，请稍后重试"`）在 `e.response.data` 里。
+        少了这一步，日志只会说"表达式异常"，看着像驱动的 bug、其实是服务端故障 ——
+        当天为此专门写了个诊断脚本才看清，白绕一圈。
+
+        ⚠ 断言必须精确到 `JSON.stringify(e.response.data)`：第一版只断言
+        `"e.response.data" in kick`，而那个串在**条件判断**里也出现 ——
+        把取值改成 `e.data` 后断言依然成立，守卫名存实亡（已用"改坏看变红"验证过）。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+        state = {"n": 0}
+        body = '{"status":500,"data":{"code":10001,"msg":"签到配置加载失败，请稍后重试"}}'
+
+        class FakePage:
+            def evaluate(self, expr, await_promise=True):
+                state["n"] += 1
+                if state["n"] == 1:
+                    self.kick = expr
+                    return "started"
+                return json.dumps({"error": "Request failed with status code 500",
+                                   "detail": body})
+
+        page = FakePage()
+        with self.assertLogs("checkin.driver.client", level="WARNING") as cm:
+            self.assertIsNone(ClientDriver._bridge_call(page, "post('/x', {})", timeout=5))
+        # ① 取值来源必须是 e.response.data（防改成 e.data 之类的近似物）
+        self.assertIn("JSON.stringify(e.response.data)", page.kick)
+        # ② 取到的值必须真的赋进回传槽位（防只算不用、detail 永远是 undefined）
+        self.assertIn("detail:", page.kick)
+        # ③ 服务端响应体必须真的出现在日志里 —— 这才是本测试要守的行为
+        self.assertIn("签到配置加载失败", "\n".join(cm.output))
+
 
 class TestClientStaleSnapshot(unittest.TestCase):
     """活动页**快照陈旧**造成的静默漏签（2026-10-06 新增）。
