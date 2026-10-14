@@ -974,6 +974,61 @@ class TestClientDriverLogic(unittest.TestCase):
         wp.assert_not_called()
         self.assertEqual(res.outcome, Outcome.NO_ACTION)
 
+    # ------------------------------ 端口绑定失败（2026-10-14 真漏签一天的新形态）
+
+    def _port_arg_cmdline(self):
+        return ('"C:\\Users\\x\\AppData\\Local\\Programs\\Trae CN\\Trae CN.exe" '
+                '--remote-debugging-port=9338')
+
+    def test_port_arg_present_but_unbound_is_not_waited(self):
+        """回归（2026-10-14 真漏签一天）：命令行**已带**端口参数却连不上 ⇒ 那次启动的
+        端口绑定失败（实测：旧实例 11:54:28 才 quit、新实例 11:54:29 就起来，
+        相隔 1 秒，9338 没释放完，新实例 listen 失败后静默继续跑）。
+        这种实例整个生命周期都不会有端口 ⇒ **守候是无用的**，必须立刻提示重启客户端。
+        """
+        r = self._run_recipe(debug_port=9338, wait_port_sec=5400)
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value=self._port_arg_cmdline()), \
+             mock.patch.object(self.d, "_wait_port", return_value=False) as wp, \
+             mock.patch.object(self.d, "_claim") as claim, \
+             mock.patch.object(self.d, "_remind") as rem:
+            res = self.d.run(r, _cfg())
+        self.assertEqual(res.outcome, Outcome.NO_ACTION)
+        self.assertEqual(res.detail.get("reason"), "debug_port_bind_failed")
+        claim.assert_not_called()
+        rem.assert_called_once()
+        # 只做一次 45s 静默期探测，绝不按 wait_port_sec 长守候（那天白等了 90 分钟）
+        self.assertEqual(wp.call_count, 1)
+        self.assertEqual(wp.call_args[0][1], self.d._PORT_BIND_GRACE_SEC)
+
+    def test_port_arg_present_and_late_bound_still_claims(self):
+        """已带参数但端口**延迟**就绪（客户端刚启动、还没 listen 完）⇒ 照常接管补领，
+        不能把"慢"误判成"绑定失败"。
+        """
+        r = self._run_recipe(debug_port=9338, wait_port_sec=5400)
+        ok = CheckinResult("workbuddy", Outcome.SUCCESS, message="ok")
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value=self._port_arg_cmdline()), \
+             mock.patch.object(self.d, "_wait_port", return_value=True), \
+             mock.patch.object(self.d, "_claim", return_value=ok) as claim:
+            res = self.d.run(r, _cfg())
+        self.assertIs(res, ok)
+        claim.assert_called_once()
+
+    def test_port_arg_of_another_port_falls_back_to_waiting(self):
+        """命令行带的是**别的**端口号（不是本站点配方那个）⇒ 不算"绑定失败"，
+        仍走原来的长守候（用户可能重启时带了另一个站的端口）。"""
+        r = self._run_recipe(debug_port=9338, wait_port_sec=60)
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running",
+                               return_value='"...exe" --remote-debugging-port=9999'), \
+             mock.patch.object(self.d, "_wait_port", return_value=False) as wp, \
+             mock.patch.object(self.d, "_remind"):
+            res = self.d.run(r, _cfg())
+        self.assertEqual(res.outcome, Outcome.NO_ACTION)
+        self.assertEqual(res.detail.get("reason"), "already_running_without_debug_port")
+        self.assertEqual(wp.call_args[0][1], 60)
+
     def test_js_uses_full_event_sequence_not_bare_click(self):
         """回归：该 UI 绑 pointerdown，只派发 click() 会**静默无效**（踩过）。"""
         _, click, markers = self.d._js({"claim_button": "领取"})

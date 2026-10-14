@@ -233,6 +233,30 @@ class ClientDriver(Driver):
         #    `wait_port_sec` 缺省 0 = 不守候，保持原行为（对 Qoder 等无此场景的站点无影响）。
         running = self._app_running(c)
         if running:
+            # 客户端在跑但端口不通。**必须先分清是哪种"不通"** —— 成因与对策都不同，
+            # 混为一谈就会白等（2026-10-14 真漏签一天：守候 90 分钟，端口根本没可能出现）。
+            port_arg = "--remote-debugging-port=" + str(port)
+            if port_arg in running:
+                # ① 命令行**已带**端口参数，却连不上 ⇒ 那次启动的**端口绑定失败**。
+                #    实测成因（Trae CN，2026-10-13 11:54）：用户重启客户端时，旧实例
+                #    11:54:28 才 `app.quit()`、新实例 11:54:29 就起来了 —— 相隔 1 秒，
+                #    旧实例还没释放 9338，新实例 `listen(9338)` 失败后**静默继续跑**
+                #    （不崩、不退出、也不再重试）。此后那个实例整个生命周期都没有端口。
+                #    ⇒ **守候是无用的**：端口不会自己出现，除非用户再重启一次客户端。
+                #    但仍先给一小段静默期 —— 客户端可能刚起来、还没 listen 完，
+                #    那一刻判"绑定失败"会是误判。
+                if self._wait_port(port, self._PORT_BIND_GRACE_SEC, poll=1.0):
+                    log.info("[%s] 端口 %s 延迟就绪（客户端刚启动），接管补领", sid, port)
+                    return self._claim(recipe, c, port, match)
+                log.warning(
+                    "[%s] 客户端已带 %s 启动但端口连不上 ⇒ 该次启动的端口绑定失败"
+                    "（多为重启时新旧实例交接太近、旧实例未释放端口）。"
+                    "请重启客户端一次即可恢复；本次不守候（守候也不会自愈）", sid, port_arg)
+                self._remind(recipe)
+                return CheckinResult(sid, Outcome.NO_ACTION,
+                                     message="客户端启动时端口绑定失败，请重启客户端后补领",
+                                     detail={"reason": "debug_port_bind_failed",
+                                             "cmdline": running[:200]})
             wait_sec = int(_float_cfg(c, "wait_port_sec", 0))
             if wait_sec > 0:
                 log.warning("[%s] 客户端在运行但未开调试端口（%s）；按配方守候端口最多 %ds",
@@ -374,6 +398,11 @@ class ClientDriver(Driver):
             page.close()
 
     # ------------------------------------------------------ 陈旧快照复核
+
+    # 「命令行已带端口参数、但端口连不上」的静默期上限（秒）。
+    # 客户端可能刚启动、还没 listen 完 —— 那一刻判"绑定失败"会是误判，故先等这么久。
+    # 超过则说明 listen 失败（ Electron 侧静默继续跑，不会自愈），立刻转人工重启。
+    _PORT_BIND_GRACE_SEC = 45
 
     # 重载后等待「按钮出现」的上限。活动页实测加载 ~0.8s
     # （客户端日志 `活动 Surface 加载完成 durationMs: 730~833`），给足余量。

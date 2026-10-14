@@ -5,7 +5,7 @@
 > *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-194%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-197%20passing-brightgreen)](#测试)
 [![Sites](https://img.shields.io/badge/sites-3%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
@@ -336,7 +336,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**194 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
+**197 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥、配置加载、引擎各闸门分支、**bridge 路径**（三段判定与降级）。

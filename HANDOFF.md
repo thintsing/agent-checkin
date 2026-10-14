@@ -7,6 +7,51 @@
 
 ---
 
+## [2026-10-14 14:00] WorkBuddy(阿拾) —— **Trae 今天漏签**：端口绑定失败的新形态（旧实例没退完就拉起新的）；已修驱动不再白等
+
+**一句话**：今天 qoder ✅ / workbuddy ✅ / **trae ❌ 漏签**（streak 2 天中断）。
+根因是**从未遇到过的新形态**：客户端命令行**带着** `--remote-debugging-port=9338`，
+端口却根本不存在 —— 不是僵尸监听，是**那次启动的 listen 失败了**。
+驱动因此白守候了 90 分钟。已改成"识别绑定失败 → 立刻提示重启，不白等"。
+
+### 证据
+
+| # | 信源 | 内容 |
+|---|---|---|
+| ① | 今日执行日志 | `10:54:56 [qoder] => success`；`12:27:21 [workbuddy] => success` |
+| ② | 今日执行日志 | `10:55:44 [trae] 客户端在运行但未开调试端口（"…Trae CN.exe" --remote-debugging-port=9338）`；`12:25:48 守候 5400s 结束，端口始终未出现` → `no_action` |
+| ③ | 进程 | 主进程 PID 10312，`CreationDate 2026-10-13 11:54:29`，cmdline **带** `--remote-debugging-port=9338`；已长跑约 26 小时 |
+| ④ | 端口 | `curl 127.0.0.1:9338/json/version` → 10061 连接被拒；`netstat :9338` → **空**（⇒ **不是**僵尸监听，是压根没 listen） |
+| ⑤ | 版本 | Trae CN 仍 **1.107.1**（未升级，排除"升级重置开关"） |
+| ⑥ | **两代实例交接（根因）** | 旧实例 session `20261012T175437` 最后一条 = `2026-10-13T11:54:28.288 Lifecycle#app.on(will-quit) - calling app.quit()`；新实例进程创建于 **11:54:29** —— **只差 1 秒** ⇒ 9338 未释放完，新实例 `listen(9338)` 失败，随后**静默继续跑**（不崩、不退出、不再重试） |
+
+### 这与已知坑的关系
+
+`MEMORY.md` 里记过两条同类坑，但**都不是这一次**：
+- 「自启动 Run 键拉起 ⇒ 没经过快捷方式 ⇒ 没参数」—— 这次 cmdline **有**参数；
+- 「升级时启动器自己重启一遍 ⇒ 那趟不带开关」—— 这次版本没变、且**带**了开关。
+
+⇒ 新形态：**带了参数但绑定失败**。客户端对这种失败是静默的，外部只能看到"进程在跑、端口不存在"。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `src/checkin/drivers/client_claim.py` | `run()` 分支③先**分清"哪种不通"**：cmdline 已含 `--remote-debugging-port=<本端口>` 却连不上 ⇒ 判 `debug_port_bind_failed`，只做一次 `_PORT_BIND_GRACE_SEC=45` 静默期探测，**绝不按 `wait_port_sec` 长守候**（端口不会自愈），随即提醒"请重启客户端后补领"。新增类常量 `_PORT_BIND_GRACE_SEC` |
+| `tests/test_core.py` | +3 守卫：`test_port_arg_present_but_unbound_is_not_waited`（不白等 + reason 正确 + 只探测一次）、`test_port_arg_present_and_late_bound_still_claims`（端口延迟就绪仍照常接管，不把"慢"误判成"失败"）、`test_port_arg_of_another_port_falls_back_to_waiting`（cmdline 带的是**别的**端口号 ⇒ 不算绑定失败，仍走长守候） |
+| `README.md` | 测试数 194 → **197** |
+
+**守卫有效性（已用"改坏看变红"验证）**：① 旁路整个新分支 → FAILED；② 把 45s 静默期退化成按 `wait_port_sec` 长守候 → FAILED。复验通过，还原后 197 全绿。
+
+### 待办（按优先级）
+
+1. **今天 Trae 的 100 积分还没领**（窗口 12:30 已过）。端口现在是**空闲**的（netstat 空），
+   ⇒ **重启一次 Trae 应能正常绑上 9338**，重启后我立刻 `--now --only-site trae` 补领。
+2. 用户要求「每日签到结果推送 QQ」—— **当前没有 QQ 消息类连接器**（搜到的只有 QQ 邮箱）。
+   待用户在 QQ邮箱 / 自建 QQ 机器人两条路里选一条，我再接 `core/notify.py`。
+
+---
+
 ## [2026-10-13 12:05] WorkBuddy(阿拾) —— **Trae 首次自动首考通过**；WorkBuddy 撞上服务端 500 故障并补领成功；顺带修掉「服务端错误体不进日志」的短板
 
 **一句话**：今天三站全绿（qoder 16 / trae 2 / workbuddy 20 天）。
