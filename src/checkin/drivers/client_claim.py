@@ -17,11 +17,16 @@
    → `CDPPage.connect(..., target_types=["page","iframe"])`。
 3. **点击要用完整事件序列**，`el.click()` 对绑 `pointerdown` 的 UI 无效。
 
-不打断用户
-----------
-若客户端**已在运行**（用户在写代码），我们**绝不杀它** —— 杀掉重启会打断工作，
-而且重启用例下也未必能接管。此时降级为"发提醒请你手动领"。
+不打断用户（2026-10-14 收窄为一处例外）
+----------------------------------------
+若客户端**已在运行**（用户在写代码），默认**不动它** —— 杀进程重启会打断工作。
 只有"客户端没在跑"时才由我们拉起，并在领取后（默认）关掉，把环境还原。
+
+⚠ **唯一例外**：端口**绑定失败**（命令行已带 `--remote-debugging-port=<本端口>`、
+端口却不存在）是**已知不会自愈**的死局 —— 守候再久也没用（`listen()` 失败后客户端
+会静默继续跑一整条生命周期）。此时若配方开启 `restart_on_bind_failure`，驱动会
+**自行重启客户端并当场重试**（用户 2026-10-14 明确授权："该重启重启，不要摆着"）。
+边界：只此一种场景、且必须配方显式开启；实现见 `_restart_client`。
 """
 from __future__ import annotations
 
@@ -228,7 +233,7 @@ class ClientDriver(Driver):
         #    2026-10-10 就是这个成因：10-09 13:15 启动的实例一路跑到次日都没重启，
         #    当天自动签到只能降级为"提醒"，实际没领到。
         #
-        #    绝不杀它（那会打断用户手头的活）——改为**按配方守候端口**：
+        #    默认不杀它（那会打断用户手头的活）——先**按配方守候端口**：
         #    用户中途自己重启了客户端，端口一出现我们立刻接管补领。
         #    `wait_port_sec` 缺省 0 = 不守候，保持原行为（对 Qoder 等无此场景的站点无影响）。
         running = self._app_running(c)
@@ -247,6 +252,12 @@ class ClientDriver(Driver):
                 #    那一刻判"绑定失败"会是误判。
                 if self._wait_port(port, self._PORT_BIND_GRACE_SEC, poll=1.0):
                     log.info("[%s] 端口 %s 延迟就绪（客户端刚启动），接管补领", sid, port)
+                    return self._claim(recipe, c, port, match)
+                # 静默期过了仍不通 ⇒ `listen()` 失败，**不会自愈**（守候再久也没用）。
+                # 用户 2026-10-14 授权"该重启重启" ⇒ 配方开启时**自动重启并当场重试**，
+                # 而不是把问题摆在那儿等人工。
+                if bool(c.get("restart_on_bind_failure")) and self._restart_client(c, port):
+                    log.info("[%s] 已自动重启客户端且端口就绪，接管补领", sid)
                     return self._claim(recipe, c, port, match)
                 log.warning(
                     "[%s] 客户端已带 %s 启动但端口连不上 ⇒ 该次启动的端口绑定失败"
@@ -1008,10 +1019,10 @@ class ClientDriver(Driver):
     def _shutdown(self, port: int) -> None:
         """用 CDP `Browser.close` 优雅关闭**我们刚启动的**实例。
 
-        注意：这里**没有**"按进程名强杀"的回退（旧注释曾这么写，与实现不符）。
-        这是刻意的 —— 项目铁律是"绝不杀用户的客户端"，只关我们自己拉起来的那个。
-        因此端口不通时（例如启动被单实例锁顶掉、或端口从没开起来）本函数**静默无操作**，
-        不会误伤任何正在运行的用户进程。
+        注意：这里**没有**"按进程名强杀"的回退 —— 它只做**优雅**关闭（CDP `Browser.close`），
+        端口不通时静默无操作。需要"连用户实例一起重启"的场景走 `_restart_client()`
+        （用户 2026-10-14 明确授权），那个方法才带强制关闭，且**只在配方开启
+        `restart_on_bind_failure` 时被调用**。
         """
         conn = None
         try:
@@ -1035,6 +1046,76 @@ class ClientDriver(Driver):
                     conn.close()
                 except Exception:
                     pass
+
+    # -------------------------------------------------- 客户端重启（自愈）
+
+    def _restart_client(self, c: Dict[str, Any], port: int) -> bool:
+        """**完全退出**目标客户端，再带调试端口重新拉起 —— 端口绑定失败时的自愈。
+
+        为什么需要（2026-10-14 Trae 真漏签一天）：客户端用「重启」时，
+        `app.quit()` 与拉起新实例只隔 **1 秒**，旧实例还没把端口释放完
+        ⇒ 新实例 `listen()` 失败后**静默继续跑**（不崩、不退出、不再重试），
+        此后那个实例**整个生命周期都没有端口** —— 守候再久也不会自愈，
+        唯一的解法就是**再来一次干净的重启**。
+
+        用户 2026-10-14 明确授权："该重启重启"。但分寸仍然保留：
+          ① 只在配方开启 `restart_on_bind_failure` 时才可能被调用（不做无谓打断）；
+          ② 先走 CDP **优雅**关闭；
+          ③ 关完**必须确认进程真的没了、端口真的释放了**，否则重新拉起会再踩同一个
+             "新旧实例交接"的竞态 —— 那等于白重启。
+        """
+        exe = self._resolve_exe(c)
+        if not exe:
+            log.warning("[restart] 找不到可执行文件，无法重启")
+            return False
+        name = str(c.get("process_match") or os.path.basename(exe))
+        log.warning("[restart] 端口 %s 绑定失败（不会自愈），按授权重启客户端：%s", port, name)
+
+        # ① 优雅关闭：端口通时有效；不通时它自己静默无操作
+        self._shutdown(port)
+
+        # ② 强制关闭 —— 这是**唯一会动到用户正在使用的实例**的路径（已获授权）
+        if self._app_running(c):
+            self._kill_by_name(name)
+            for _ in range(20):                     # 最多等 10s 让进程真的退干净
+                if not self._app_running(c):
+                    break
+                time.sleep(0.5)
+        if self._app_running(c):
+            log.warning("[restart] 进程仍在运行，重启失败（不动它，交给人工）")
+            return False
+
+        # ③ 等端口释放。这一步**不能省** —— 抢在旧 socket 释放前拉起，
+        #    新实例会再次 listen 失败，等于白重启（正是今天漏签的成因）。
+        for _ in range(20):
+            if not self._port_alive(port):
+                break
+            time.sleep(0.5)
+        time.sleep(1.0)
+
+        # ④ 带端口重新拉起
+        try:
+            procenv.spawn([exe, f"--remote-debugging-port={port}"])
+        except Exception as e:                      # noqa: BLE001
+            log.warning("[restart] 拉起失败：%s", e)
+            return False
+        ok = self._wait_port(port, int(c.get("launch_timeout_sec", 60)))
+        log.info("[restart] 客户端已重启，端口 %s %s", port, "已就绪" if ok else "仍未就绪")
+        return ok
+
+    @staticmethod
+    def _kill_by_name(name: str) -> None:
+        """按进程名结束该客户端的**全部**进程（Electron 主/渲染进程同名）。
+
+        `/T` 连子进程一起结束 —— 只杀主进程会留下渲染进程继续占着端口，
+        下一次拉起照样 listen 失败。
+        """
+        try:
+            subprocess.run(["taskkill", "/IM", name, "/F", "/T"],
+                           capture_output=True, text=True, timeout=30,
+                           creationflags=procenv.NO_WINDOW)   # pythonw 下不加会闪黑框
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("[restart] taskkill 失败：%s", e)
 
     # ------------------------------------------------------------ 杂项
 

@@ -744,6 +744,20 @@ class TestConfig(unittest.TestCase):
         q = next(r for r in recipes if r.id == "qoder")
         self.assertNotIn("log_state", q.client or {})
 
+    def test_auto_restart_permission_is_symmetric_across_client_recipes(self):
+        """用户 2026-10-14 授权"该重启重启，不要摆着" ⇒ **所有** client 站点都要开。
+
+        少配一个，那个站点遇到端口绑定失败（**已知不会自愈**）时就又"摆着"了 ——
+        正是被吐槽的行为。与 `wait_port_sec` 同理：这类补救字段属于**场景共性**，
+        不对称 = 等于没修（2026-10-11 已在 `wait_port_sec` 上栽过一次）。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        clients = [r for r in recipes if r.client]
+        self.assertGreaterEqual(len(clients), 3, "至少有 qoder / workbuddy / trae 三站")
+        for r in clients:
+            self.assertIs((r.client or {}).get("restart_on_bind_failure"), True,
+                          f"{r.id}: 缺 restart_on_bind_failure，端口绑定失败时会摆着不处理")
+
     def test_debug_ports_are_distinct_and_not_recycled(self):
         """两个 client 站点不得共用调试端口（共用 = 后启动的那个静默绑不上）。
 
@@ -1028,6 +1042,86 @@ class TestClientDriverLogic(unittest.TestCase):
         self.assertEqual(res.outcome, Outcome.NO_ACTION)
         self.assertEqual(res.detail.get("reason"), "already_running_without_debug_port")
         self.assertEqual(wp.call_args[0][1], 60)
+
+    # ------------------------ 自动重启自愈（用户 2026-10-14 授权"该重启重启"）
+
+    def test_bind_failure_auto_restarts_and_retries_when_enabled(self):
+        """端口绑定失败且配方开启 `restart_on_bind_failure` ⇒ **自动重启并当场重试**，
+        而不是把问题摆在那里等人工（这正是被吐槽的行为）。"""
+        r = self._run_recipe(debug_port=9338, wait_port_sec=5400,
+                             restart_on_bind_failure=True)
+        ok = CheckinResult("workbuddy", Outcome.SUCCESS, message="ok")
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value=self._port_arg_cmdline()), \
+             mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(self.d, "_restart_client", return_value=True) as rs, \
+             mock.patch.object(self.d, "_claim", return_value=ok) as claim:
+            res = self.d.run(r, _cfg())
+        self.assertIs(res, ok, "重启成功后就该当场接管，而不是报 no_action")
+        rs.assert_called_once()
+        claim.assert_called_once()
+
+    def test_bind_failure_does_not_restart_when_disabled(self):
+        """**没开**这个开关的站点绝不能被自动重启 —— 不做无谓打断（权限是窄口的）。"""
+        r = self._run_recipe(debug_port=9338, wait_port_sec=60)
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value=self._port_arg_cmdline()), \
+             mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(self.d, "_restart_client") as rs, \
+             mock.patch.object(self.d, "_remind"):
+            res = self.d.run(r, _cfg())
+        rs.assert_not_called()
+        self.assertEqual(res.detail.get("reason"), "debug_port_bind_failed")
+
+    def test_restart_sequence_waits_for_port_release(self):
+        """重启四步必须齐全，尤其**等端口释放**不能省 —— 抢在旧 socket 释放前拉起，
+        新实例会再踩同一个 `listen()` 失败，等于白重启（2026-10-14 漏签的成因）。"""
+        r = self._run_recipe(debug_port=9338)
+        order = []
+        app_calls = {"n": 0}
+
+        def fake_app_running(_c):
+            app_calls["n"] += 1
+            return "cmdline" if app_calls["n"] == 1 else ""      # 第二次起已退出
+
+        port_calls = {"n": 0}
+
+        def fake_port_alive(_p):
+            port_calls["n"] += 1
+            return port_calls["n"] == 1                          # 先仍占用，之后释放
+
+        with mock.patch.object(self.d, "_resolve_exe", return_value="C:/x.exe"), \
+             mock.patch.object(self.d, "_shutdown",
+                               side_effect=lambda p: order.append("shutdown")), \
+             mock.patch.object(self.d, "_kill_by_name",
+                               side_effect=lambda n: order.append("kill")), \
+             mock.patch.object(self.d, "_app_running", side_effect=fake_app_running), \
+             mock.patch.object(self.d, "_port_alive", side_effect=fake_port_alive), \
+             mock.patch.object(self.d, "_wait_port", return_value=True), \
+             mock.patch("checkin.drivers.client_claim.time.sleep"), \
+             mock.patch("checkin.drivers.client_claim.procenv.spawn",
+                        side_effect=lambda a: order.append("spawn") or type(
+                            "P", (), {"pid": 1})()) as sp:
+            ok = self.d._restart_client(r.client, 9338)
+        self.assertTrue(ok)
+        self.assertEqual(order, ["shutdown", "kill", "spawn"],
+                         "顺序必须是：优雅关 → 强关 → 拉起；且强关前确认过进程还在")
+        self.assertGreaterEqual(port_calls["n"], 2,
+                                "必须**轮询等到**端口真的释放才拉起，否则会再踩 listen 失败")
+        self.assertIn("--remote-debugging-port=9338", sp.call_args[0][0])
+
+    def test_restart_gives_up_when_process_wont_die(self):
+        """进程杀不掉时**不许**继续拉起（会变成两个实例抢端口），直接放弃转人工。"""
+        r = self._run_recipe(debug_port=9338)
+        with mock.patch.object(self.d, "_resolve_exe", return_value="C:/x.exe"), \
+             mock.patch.object(self.d, "_shutdown"), \
+             mock.patch.object(self.d, "_kill_by_name"), \
+             mock.patch.object(self.d, "_app_running", return_value="cmdline"), \
+             mock.patch("checkin.drivers.client_claim.time.sleep"), \
+             mock.patch("checkin.drivers.client_claim.procenv.spawn") as sp:
+            ok = self.d._restart_client(r.client, 9338)
+        self.assertFalse(ok)
+        sp.assert_not_called()
 
     def test_js_uses_full_event_sequence_not_bare_click(self):
         """回归：该 UI 绑 pointerdown，只派发 click() 会**静默无效**（踩过）。"""

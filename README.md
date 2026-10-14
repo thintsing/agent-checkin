@@ -5,7 +5,7 @@
 > *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-204%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-209%20passing-brightgreen)](#测试)
 [![Sites](https://img.shields.io/badge/sites-3%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
@@ -82,13 +82,14 @@ python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还
 
 端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
 
-驱动随之采用**四分支决策**，核心原则是 **绝不杀掉用户正在用的客户端**：
+驱动随之采用**四分支决策**，核心原则是 **不轻易动用户正在用的客户端**
+（2026-10-14 起有**一处窄口例外**，见下表 ③）：
 
 | 分支 | 条件 | 动作 |
 |---|---|---|
 | ① | 读客户端日志，本窗口已领 | **连客户端都不启动** |
 | ② | 调试端口已就绪 | 直接接管；**入口没自动出现就按配方把入口点出来**，领完**不关闭**客户端 |
-| ③ | 客户端在跑但没开端口 | **绝不杀** → 降级为桌面提醒。⚠ **10-10 就栽在这一格**：自启动拉起的实例没端口，当天 WorkBuddy 只能靠人工领 —— 根治办法是改 Run 键（见上） |
+| ③ | 客户端在跑但**没开端口** | 按配方 `wait_port_sec` **守候**（用户中途重启带上端口即接管）；若命令行**已带端口参数**却连不上（`listen()` 失败，**不会自愈**）⇒ 配方开启 `restart_on_bind_failure` 时**自行重启客户端并当场重试**，否则降级提醒。⚠ 10-10 栽在"守候"缺失，10-14 栽在"绑定失败" |
 | ④ | 客户端没在跑 | 才由我们拉起 → 领取 → 关掉自己起的那个 |
 
 ② 这一行藏着一个**反直觉的坑**（2026-09-26 实测踩到，当天没能自动领到）：
@@ -367,7 +368,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**204 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
+**209 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥、配置加载、引擎各闸门分支、**bridge 路径**（三段判定与降级）。

@@ -123,6 +123,12 @@ client:
   #   缺省 0 = 不守候，故对 Qoder 等无此场景的站点零影响。
   wait_port_sec: 5400
 
+  # 端口绑定失败（命令行带了端口、端口却连不上 ⇒ 已知不会自愈）时，自动重启客户端
+  # 并当场重试。用户 2026-10-14 授权"该重启重启，不要摆着"。
+  # ⚠ 这是本站点**唯一**会给用户造成可感知打断的路径：重启会关掉他正在用的客户端。
+  #   但触发前提很窄（端口绑定失败 = 不重启必然漏签），且签完不关（close_after: false）。
+  restart_on_bind_failure: true
+
   # electron-builder 的 per-user 安装，路径固定，没有 Qoder 那种 `.qoder-versions\*\` 滚动目录。
   exe: '%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe'
   exe_glob: ''
