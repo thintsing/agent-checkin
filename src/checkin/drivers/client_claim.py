@@ -254,11 +254,16 @@ class ClientDriver(Driver):
                     log.info("[%s] 端口 %s 延迟就绪（客户端刚启动），接管补领", sid, port)
                     return self._claim(recipe, c, port, match)
                 # 静默期过了仍不通 ⇒ `listen()` 失败，**不会自愈**（守候再久也没用）。
-                # 用户 2026-10-14 授权"该重启重启" ⇒ 配方开启时**自动重启并当场重试**，
-                # 而不是把问题摆在那儿等人工。
-                if bool(c.get("restart_on_bind_failure")) and self._restart_client(c, port):
-                    log.info("[%s] 已自动重启客户端且端口就绪，接管补领", sid)
-                    return self._claim(recipe, c, port, match)
+                # 用户 2026-10-14 授权"该重启重启" ⇒ 配方开启时自动重启并当场重试。
+                # 但**重启前必须先过"忙闲"关**：客户端有任务在执行就**不重启**，
+                # 改为挂载监测、等它跑完；连忙闲都看不清时同样不重启（宁可漏签也不赌）。
+                if bool(c.get("restart_on_bind_failure")):
+                    if self._safe_to_restart(recipe, c, port, match):
+                        if self._restart_client(c, port):
+                            log.info("[%s] 已自动重启客户端且端口就绪，接管补领", sid)
+                            return self._claim(recipe, c, port, match)
+                    else:
+                        log.warning("[%s] 客户端可能正在执行任务（或看不清），本次不重启", sid)
                 log.warning(
                     "[%s] 客户端已带 %s 启动但端口连不上 ⇒ 该次启动的端口绑定失败"
                     "（多为重启时新旧实例交接太近、旧实例未释放端口）。"
@@ -1116,6 +1121,89 @@ class ClientDriver(Driver):
                            creationflags=procenv.NO_WINDOW)   # pythonw 下不加会闪黑框
         except (OSError, subprocess.SubprocessError) as e:
             log.debug("[restart] taskkill 失败：%s", e)
+
+    # ------------------------------------------------ 重启前的"忙闲"把关
+
+    def _client_busy(self, port: int, match: str,
+                     c: Dict[str, Any]) -> Optional[bool]:
+        """按配方的 `busy_probe.busy_js` 探测客户端**是否有任务在执行**。
+
+        返回：
+          True  = 忙（有任务在执行）
+          False = 空闲
+          None  = **不可知**（没配探测 / 取不到 target / 表达式失败）
+
+        ⚠ None 的语义是"不知道"，**调用方必须按"不能重启"处理** ——
+        用户 2026-10-14 的要求是"看看有没有在执行的任务，有的话就先不重启"，
+        那么"看不清"同样不能重启。宁可漏签，也不能赌一把打断用户。
+        """
+        probe = c.get("busy_probe")
+        if not isinstance(probe, dict) or not str(probe.get("busy_js") or "").strip():
+            return None
+        tgt = self._wait_target(port, match, 10)
+        if tgt is None:
+            return None
+        page = CDPPage(tgt["webSocketDebuggerUrl"])
+        try:
+            val = page.evaluate(str(probe["busy_js"]), await_promise=True)
+        except Exception as e:                              # noqa: BLE001
+            log.debug("忙闲探测失败：%s", e)
+            return None
+        finally:
+            page.close()
+        if val is True:
+            return True
+        if val is False:
+            return False
+        return None                      # 表达式返回了别的东西 = 不可信，按不可知
+
+    def _wait_client_idle(self, port: int, match: str, c: Dict[str, Any],
+                          timeout: int) -> bool:
+        """客户端忙时**挂载监测**：轮询到空闲为止，超时则收手。
+
+        为什么不在第一次看到"忙"就直接放弃：用户明确要"等任务执行完了再重启"。
+        守候期间用户可能自己把任务跑完 —— 那时我们就能安全重启了。
+        """
+        if timeout <= 0:
+            return False
+        deadline = time.time() + timeout
+        while True:
+            time.sleep(20)                                  # 别把客户端问得太频
+            if time.time() >= deadline:
+                break
+            busy = self._client_busy(port, match, c)
+            if busy is False:
+                log.info("客户端已空闲，可以安全重启")
+                return True
+            if busy is None:
+                log.warning("监测期间取不到客户端页面（可能被用户关掉或重启），停止监测")
+                return False
+        log.warning("监测 %ds 客户端仍在执行任务，本次不重启", timeout)
+        return False
+
+    def _safe_to_restart(self, recipe: Recipe, c: Dict[str, Any], port: int,
+                         match: str) -> bool:
+        """重启前的最后一道关：客户端没在执行任务才允许重启。
+
+        三条出路：空闲 ⇒ 放行；忙但等到了空闲 ⇒ 放行；
+        忙且等不到 / **看不清** ⇒ 不放行（降级提醒，绝不硬重启）。
+        """
+        sid = recipe.id
+        probe = c.get("busy_probe")
+        if not isinstance(probe, dict) or not str(probe.get("busy_js") or "").strip():
+            log.warning("[%s] 未配 busy_probe ⇒ 无法判断客户端是否在执行任务，按用户要求不重启", sid)
+            return False
+
+        busy = self._client_busy(port, match, c)
+        if busy is None:
+            log.warning("[%s] 忙闲探测不可用（取不到页面或表达式失败），不重启", sid)
+            return False
+        if not busy:
+            return True
+
+        wait = int(_float_cfg(probe, "wait_busy_sec", 0))
+        log.info("[%s] 客户端有任务在执行，按配方挂载监测（最多 %ds）", sid, wait)
+        return self._wait_client_idle(port, match, c, wait)
 
     # ------------------------------------------------------------ 杂项
 

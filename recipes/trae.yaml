@@ -136,6 +136,53 @@ client:
   #   优雅关闭 → 确认进程真的退干净 → **等端口释放**（这步不能省）→ 带端口重新拉起。
   restart_on_bind_failure: true
 
+  # ---- 重启前的"忙闲"把关（用户 2026-10-14 要求）----
+  # 用户原话："需要重启的话也不要直接重启，看看有没有在执行的任务，有的话就先不重启，
+  # 挂载任务监测着，等任务执行完了再重启。"
+  # 只有判定为**空闲**才放行；忙则挂载监测（最多 wait_busy_sec）；**看不清同样不重启**
+  # （宁可漏签，也不能赌一把打断用户正在跑的任务）。
+  #
+  # ⚠ 本站点用的是**通用判据**：2026-10-14 侦察时 Trae 空闲（侧栏「暂无任务」），
+  #    拿不到"忙时"的真实特征。判据如下：
+  #      class / aria-label 含 running|processing|loading|spinner|busy，
+  #      或可见短文本（<24 字）含 执行中/运行中/进行中/处理中/排队中/等待中。
+  #    判据词**刻意不含** execution / progress —— **实测** Trae 空闲时就带着
+  #    `task-panel-slide-executions` 与 `executionEnvironmentButton`，含这两个词会**永远**
+  #    误判为忙、导致永远不重启。这是本次接入专门验过的一条。
+  #    取向偏保守：宁可多等一会儿，也不能误判为空闲而错误重启。
+  #    ⇒ 将来若发现漏判（有任务却没被认出），应优先**加强判据**而不是放宽。
+  busy_probe:
+    busy_js: |
+      (() => {
+        const vis = el => { try { const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0; } catch (e) { return false; } };
+        const cn = el => { const c = el.className;
+          return typeof c === 'string' ? c : (c && c.baseVal) || ''; };
+        const txt = el => ((el.innerText || el.textContent || '') + '').trim();
+        const deepAll = (root, sel, out, depth) => {
+          out = out || []; depth = depth || 0; if (depth > 12) return out;
+          let list = []; try { list = root.querySelectorAll(sel); } catch (e) { return out; }
+          for (const el of list) out.push(el);
+          let kids = []; try { kids = root.querySelectorAll('*'); } catch (e) { return out; }
+          for (const el of kids) if (el.shadowRoot) deepAll(el.shadowRoot, sel, out, depth + 1);
+          return out;
+        };
+        const CLS = /running|processing|loading|spinner|busy/i;
+        const TXT = /执行中|运行中|进行中|处理中|排队中|等待中/;
+        for (const el of deepAll(document, '*')) {
+          if (!vis(el)) continue;
+          const c = cn(el);
+          if (c && CLS.test(c)) return true;
+          const a = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+          if (a && (CLS.test(a) || TXT.test(a))) return true;
+          const t = txt(el);
+          if (t && t.length < 24 && TXT.test(t)) return true;
+        }
+        return false;
+      })()
+    # 监测上限（秒）。超时则降级提醒，绝不无限等。
+    wait_busy_sec: 1800
+
   # 日志是多会话目录形态（logs/<session>/main.log），但**不记响应体**，
   # 无法据此判已领 ⇒ 不配 log_state（详见文件头注释）。
   data_dir: '%APPDATA%\Trae CN'

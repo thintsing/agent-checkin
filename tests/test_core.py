@@ -758,6 +758,24 @@ class TestConfig(unittest.TestCase):
             self.assertIs((r.client or {}).get("restart_on_bind_failure"), True,
                           f"{r.id}: 缺 restart_on_bind_failure，端口绑定失败时会摆着不处理")
 
+    def test_busy_probe_is_symmetric_across_client_recipes(self):
+        """用户 2026-10-14 要求"重启前先看有没有在执行的任务" ⇒ **所有** client 站点
+        都必须配忙闲判据。
+
+        缺一个的后果是双向的：判据缺失时驱动**保守不重启**（该站点回到"摆着"），
+        而若有人图省事把"没有判据也重启"的逻辑加上去，就是直接打断用户 —— 所以这道
+        守卫同时钉住"必须有判据"和"必须有监测上限"。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        clients = [r for r in recipes if r.client]
+        self.assertGreaterEqual(len(clients), 3, "至少有 qoder / workbuddy / trae 三站")
+        for r in clients:
+            probe = (r.client or {}).get("busy_probe") or {}
+            self.assertTrue(str(probe.get("busy_js") or "").strip(),
+                            f"{r.id}: 缺 busy_probe.busy_js ⇒ 无法判断忙闲 ⇒ 该站点将永远不自动重启")
+            self.assertGreater(int(probe.get("wait_busy_sec") or 0), 0,
+                               f"{r.id}: 缺 wait_busy_sec ⇒ 客户端忙时会无限等下去")
+
     def test_debug_ports_are_distinct_and_not_recycled(self):
         """两个 client 站点不得共用调试端口（共用 = 后启动的那个静默绑不上）。
 
@@ -1046,14 +1064,14 @@ class TestClientDriverLogic(unittest.TestCase):
     # ------------------------ 自动重启自愈（用户 2026-10-14 授权"该重启重启"）
 
     def test_bind_failure_auto_restarts_and_retries_when_enabled(self):
-        """端口绑定失败且配方开启 `restart_on_bind_failure` ⇒ **自动重启并当场重试**，
-        而不是把问题摆在那里等人工（这正是被吐槽的行为）。"""
-        r = self._run_recipe(debug_port=9338, wait_port_sec=5400,
-                             restart_on_bind_failure=True)
+        """端口绑定失败 + 配方开启重启 + **配了忙闲判据且客户端空闲** ⇒
+        自动重启并当场重试，而不是把问题摆在那里等人工（这正是被吐槽的行为）。"""
+        r = self._busy_recipe()
         ok = CheckinResult("workbuddy", Outcome.SUCCESS, message="ok")
         with mock.patch.object(self.d, "_port_alive", return_value=False), \
              mock.patch.object(self.d, "_app_running", return_value=self._port_arg_cmdline()), \
              mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(self.d, "_client_busy", return_value=False), \
              mock.patch.object(self.d, "_restart_client", return_value=True) as rs, \
              mock.patch.object(self.d, "_claim", return_value=ok) as claim:
             res = self.d.run(r, _cfg())
@@ -1122,6 +1140,87 @@ class TestClientDriverLogic(unittest.TestCase):
             ok = self.d._restart_client(r.client, 9338)
         self.assertFalse(ok)
         sp.assert_not_called()
+
+    # -------- 重启前的"忙闲"把关（用户 2026-10-14 要求）
+
+    def _busy_recipe(self):
+        return self._run_recipe(debug_port=9338, wait_port_sec=60,
+                                restart_on_bind_failure=True,
+                                busy_probe={"busy_js": "BUSY()", "wait_busy_sec": 1200})
+
+    def test_restart_allowed_when_client_idle(self):
+        r = self._busy_recipe()
+        with mock.patch.object(self.d, "_client_busy", return_value=False):
+            self.assertTrue(self.d._safe_to_restart(r, r.client, 9338, "m"))
+
+    def test_restart_waits_when_client_busy(self):
+        """忙 ⇒ **不立刻重启**，而是挂载监测；等到空闲才放行。"""
+        r = self._busy_recipe()
+        with mock.patch.object(self.d, "_client_busy", return_value=True), \
+             mock.patch.object(self.d, "_wait_client_idle", return_value=True) as w:
+            self.assertTrue(self.d._safe_to_restart(r, r.client, 9338, "m"))
+        w.assert_called_once()
+        self.assertEqual(w.call_args[0][3], 1200, "监测上限必须取自配方 wait_busy_sec")
+
+    def test_restart_refused_when_busy_never_ends(self):
+        """监测超时仍忙 ⇒ 不重启（宁可这次漏签）。"""
+        r = self._busy_recipe()
+        with mock.patch.object(self.d, "_client_busy", return_value=True), \
+             mock.patch.object(self.d, "_wait_client_idle", return_value=False):
+            self.assertFalse(self.d._safe_to_restart(r, r.client, 9338, "m"))
+
+    def test_restart_refused_when_busy_state_unknown(self):
+        """看不清（None）⇒ 不重启。这是本机制的核心：**不可知 ≠ 空闲**。"""
+        r = self._busy_recipe()
+        with mock.patch.object(self.d, "_client_busy", return_value=None):
+            self.assertFalse(self.d._safe_to_restart(r, r.client, 9338, "m"))
+
+    def test_restart_refused_without_busy_probe(self):
+        """没配忙闲判据 ⇒ 一律不重启（没有判据就不能动用户的客户端）。"""
+        r = self._run_recipe(debug_port=9338, restart_on_bind_failure=True)
+        with mock.patch.object(self.d, "_client_busy") as cb:
+            self.assertFalse(self.d._safe_to_restart(r, r.client, 9338, "m"))
+        cb.assert_not_called()
+
+    def test_bind_failure_busy_does_not_restart_end_to_end(self):
+        """端到端：忙 ⇒ `run()` 不重启客户端，降级为提醒。"""
+        r = self._busy_recipe()
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value=self._port_arg_cmdline()), \
+             mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(self.d, "_safe_to_restart", return_value=False), \
+             mock.patch.object(self.d, "_restart_client") as rs, \
+             mock.patch.object(self.d, "_remind") as rem:
+            res = self.d.run(r, _cfg())
+        rs.assert_not_called()
+        rem.assert_called_once()
+        self.assertEqual(res.detail.get("reason"), "debug_port_bind_failed")
+
+    def test_client_busy_normalises_return(self):
+        """表达式必须返回**严格布尔**；返回别的（undefined/字符串/数字）一律算"不可知"。
+
+        为什么这么严：`if (val is True)` 之外的任何真值都被当成"看不清"，
+        才不会因为一句 `return "busy"` 就让驱动以为看懂了。
+        """
+        class FakePage:
+            def __init__(self, *a, **k):
+                self.val = None
+            def evaluate(self, expr, await_promise=True):
+                return self.val
+            def close(self):
+                pass
+
+        cfg = {"busy_probe": {"busy_js": "BUSY()"}}
+        for raw, want in ((True, True), (False, False), (None, None),
+                          ("true", None), (1, None), (0, None), ({}, None)):
+            with mock.patch.object(self.d, "_wait_target",
+                                   return_value={"webSocketDebuggerUrl": "ws://x"}), \
+                 mock.patch("checkin.drivers.client_claim.CDPPage") as P:
+                page = FakePage()
+                page.val = raw
+                P.return_value = page
+                got = self.d._client_busy(9338, "m", cfg)
+            self.assertEqual(got, want, f"表达式返回 {raw!r} 应归一化为 {want!r}")
 
     def test_js_uses_full_event_sequence_not_bare_click(self):
         """回归：该 UI 绑 pointerdown，只派发 click() 会**静默无效**（踩过）。"""

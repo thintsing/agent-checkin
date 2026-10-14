@@ -5,7 +5,7 @@
 > *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-209%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-217%20passing-brightgreen)](#测试)
 [![Sites](https://img.shields.io/badge/sites-3%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
@@ -89,7 +89,7 @@ python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还
 |---|---|---|
 | ① | 读客户端日志，本窗口已领 | **连客户端都不启动** |
 | ② | 调试端口已就绪 | 直接接管；**入口没自动出现就按配方把入口点出来**，领完**不关闭**客户端 |
-| ③ | 客户端在跑但**没开端口** | 按配方 `wait_port_sec` **守候**（用户中途重启带上端口即接管）；若命令行**已带端口参数**却连不上（`listen()` 失败，**不会自愈**）⇒ 配方开启 `restart_on_bind_failure` 时**自行重启客户端并当场重试**，否则降级提醒。⚠ 10-10 栽在"守候"缺失，10-14 栽在"绑定失败" |
+| ③ | 客户端在跑但**没开端口** | 按配方 `wait_port_sec` **守候**（用户中途重启带上端口即接管）；若命令行**已带端口参数**却连不上（`listen()` 失败，**不会自愈**）⇒ 配方开启 `restart_on_bind_failure` 时，**先过"忙闲"关**（有任务在执行就不重启，改为挂载监测等它跑完；**看不清同样不重启**），再自行重启并当场重试。⚠ 10-10 栽在"守候"缺失，10-14 栽在"绑定失败" |
 | ④ | 客户端没在跑 | 才由我们拉起 → 领取 → 关掉自己起的那个 |
 
 ② 这一行藏着一个**反直觉的坑**（2026-09-26 实测踩到，当天没能自动领到）：
@@ -368,7 +368,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**209 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
+**217 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥、配置加载、引擎各闸门分支、**bridge 路径**（三段判定与降级）。
