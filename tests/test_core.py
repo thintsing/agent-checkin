@@ -1844,10 +1844,92 @@ class TestNotify(unittest.TestCase):
         title, _ = self._sent()
         self.assertNotIn("完成", title)
 
+    # --- QQ 推送（2026-10-14 新增） ------------------------------------
+    # 为什么是签到程序自己推、而不是走 WorkBuddy 的通知体系，见 notify.py 顶部长注释。
 
-# ----------------------------------------------------------------------
-# 计划任务注册（只验脚本内容，不真跑 —— 真跑会往系统里塞任务）
-# ----------------------------------------------------------------------
+    def _qq_root(self, payload=None):
+        """造一个临时 root，按需写入 data/notify.json。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        if payload is not None:
+            os.makedirs(os.path.join(root, "data"), exist_ok=True)
+            with open(os.path.join(root, "data", "notify.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+        return root
+
+    def test_qq_skipped_when_not_configured(self):
+        """没配 `data/notify.json` = 未开启 ⇒ 静默跳过，对没配的人零影响。"""
+        root = self._qq_root()
+        with mock.patch.object(notify, "_http_post_json") as post:
+            notify.notify_results([self._r("workbuddy", Outcome.SUCCESS)], root=root)
+        post.assert_not_called()
+
+    def test_qq_skipped_when_root_is_none(self):
+        """老调用方（root 缺省 None）不得因为 QQ 推送而改变行为。"""
+        with mock.patch.object(notify, "_http_post_json") as post:
+            notify.notify_results([self._r("workbuddy", Outcome.SUCCESS)])
+        post.assert_not_called()
+
+    def test_qq_incomplete_config_is_rejected_loudly(self):
+        """字段不全时必须**记日志并跳过** —— 静默会让用户以为"配好了但没收到"。"""
+        root = self._qq_root({"qq_bot": {"app_id": "1", "app_secret": "s"}})
+        with self.assertLogs("checkin.notify", level="WARNING") as cm:
+            self.assertIsNone(notify._load_qq_cfg(root))
+        self.assertIn("group_openid", "\n".join(cm.output))
+
+    def test_qq_pushes_group_message_with_expected_shape(self):
+        """配置齐全时，必须真的用 group_openid 调群消息接口，且带对鉴权头。"""
+        root = self._qq_root({"qq_bot": {"app_id": "102", "app_secret": "sec",
+                                         "group_openid": "GOPEN"}})
+        calls = []
+
+        def fake_post(url, payload, headers=None, timeout=15):
+            calls.append((url, payload, headers or {}))
+            if "getAppAccessToken" in url:
+                return {"access_token": "TOK", "expires_in": 7200}
+            return {"id": "msg_1"}
+
+        with mock.patch.object(notify, "_http_post_json", side_effect=fake_post):
+            notify.notify_results([self._r("workbuddy", Outcome.SUCCESS),
+                                   self._r("trae", Outcome.SUCCESS)], root=root)
+
+        self.assertEqual(len(calls), 2, "先换 token，再发消息")
+        send_url, send_body, send_headers = calls[1]
+        self.assertIn("/v2/groups/GOPEN/messages", send_url)
+        self.assertEqual(send_body.get("msg_type"), 0)
+        self.assertEqual(send_headers.get("Authorization"), "QQBot TOK")
+        self.assertEqual(send_headers.get("X-Union-Appid"), "102")
+        self.assertIn("workbuddy", send_body["content"])
+
+    def test_qq_failure_never_breaks_checkin(self):
+        """通知失败**绝不能**影响签到本身 —— 抛出去会让整轮跑挂。"""
+        root = self._qq_root({"qq_bot": {"app_id": "1", "app_secret": "s",
+                                         "group_openid": "G"}})
+        with mock.patch.object(notify, "_http_post_json",
+                               side_effect=RuntimeError("network down")):
+            notify.notify_results([self._r("workbuddy", Outcome.SUCCESS)], root=root)
+        # 没有异常穿出去即为通过；toast 仍应照发
+        title, _ = self._sent()
+        self.assertEqual(title, "每日签到完成")
+
+    def test_qq_message_has_no_emoji(self):
+        """消息必须纯文本 —— 经过 GBK 环境（Windows 控制台/日志）时 emoji 会 UnicodeEncodeError。"""
+        text = notify._qq_message(
+            [self._r("workbuddy", Outcome.SUCCESS)], [])
+        self.assertTrue(all(ord(c) < 0x10000 for c in text))
+        self.assertNotIn("✅", text)
+        self.assertNotIn("❌", text)
+        self.assertIn("workbuddy", text)
+
+    def test_qq_message_switches_title_when_problem(self):
+        """出错时标题必须变 —— 与桌面通知同一条原则：报"完成"会让人跳过检查。"""
+        err = self._r("trae", Outcome.ERROR, "boom")
+        text = notify._qq_message([err], [err])
+        self.assertIn("需处理", text)
+        self.assertNotIn("每日签到", text)
+
 
 class TestTaskInstall(unittest.TestCase):
     def setUp(self):

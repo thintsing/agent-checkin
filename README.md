@@ -5,7 +5,7 @@
 > *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-197%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-204%20passing-brightgreen)](#测试)
 [![Sites](https://img.shields.io/badge/sites-3%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
@@ -239,6 +239,36 @@ python -m checkin --print-task         # 打印等价的手写注册命令
 
 ---
 
+### 结果通知：桌面 toast +（可选）推送到 QQ
+
+跑完一轮后默认做两件事：**控制台摘要** + **Windows 桌面 toast**。出问题时标题**必然换掉**
+（"签到我处理不了"），因为"完成"配一堆失败是最坏的通知 —— 看到"完成"人就不会去查。
+
+想让结果直接到手机上，可以开启 **QQ 群推送**（2026-10-14 新增，纯标准库实现、无新依赖）：
+
+```bat
+REM 1) 建 data/notify.json，先只填 app_id / app_secret：
+REM    { "qq_bot": { "app_id": "你的AppID", "app_secret": "你的AppSecret" } }
+REM 2) 抓群标识（运行后到群里 @ 一下机器人，脚本会自动把 group_openid 回写进这个文件）
+.venv\Scripts\python.exe tools\qq_bot_openid.py
+```
+
+之后每天签到跑完，你会收到一条这样的消息：
+
+```
+【每日签到 10-14】已签到 qoder、trae、workbuddy
+```
+
+| 为什么这么绕 | 说明 |
+|---|---|
+| **为什么不直接用 WorkBuddy 的 QQ 通道** | 签到是 **Windows 计划任务**跑的，WorkBuddy 全程不参与；而 WorkBuddy 的「定时任务结果通知」只支持**企微 bot / 小程序**。它那个「QQ 机器人」是**助理远程通道**（方向是 你→WorkBuddy，用来远程下指令），不是结果通知出口 |
+| **为什么必须群聊** | QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超限；群聊无此限制（每分钟 20 条）。故需一个只有你和机器人的群 |
+| **为什么消息里没有 emoji** | 消息可能经过 GBK 环境（Windows 控制台/日志），emoji 会触发 `UnicodeEncodeError`（接入时踩过） |
+| **凭据放哪** | `data/notify.json` —— `.gitignore` 已覆盖 `data/`，**绝不进开源仓库**。文件不存在 = 未开启，对没配的人零影响 |
+| **通知会不会影响签到** | 不会。推送链路上任何一步失败都只记日志（有守卫 `test_qq_failure_never_breaks_checkin` 钉住） |
+
+---
+
 ## 工作方式
 
 ### 配方驱动：站点知识是数据，不是代码
@@ -292,6 +322,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 │   ├─ qoder_cdp_probe.py     # 只读侦察（定位活动入口，不点击）
 │   ├─ trae_cdp_probe.py      # 只读侦察（穿透 ShadowRoot；VSCode 系 UI 大量藏在里面）
 │   ├─ qoder_cdp_claim.py     # client 驱动的薄封装（launch / status / claim / close）
+│   ├─ qq_bot_openid.py       # 一次性抓 QQ 群标识（抓完就再也用不到长连接）
 │   └─ win_shortcut_args.py   # 读写启动入口参数（.lnk + 自启动 Run 键）：让客户端启动即带调试端口（含备份/回滚）
 ├─ src/checkin/
 │   ├─ __main__.py            # 唯一 CLI 入口
@@ -336,7 +367,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**197 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
+**204 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥、配置加载、引擎各闸门分支、**bridge 路径**（三段判定与降级）。

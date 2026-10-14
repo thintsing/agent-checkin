@@ -451,7 +451,8 @@ def main(argv=None) -> int:
         return 1
 
     if not (args.dry_run or args.probe):
-        notify.notify_results(results)
+        # root 传进去：`data/notify.json` 存在时会顺带推到 QQ（未配置则静默跳过）
+        notify.notify_results(results, root=cfg.root)
     else:
         print(notify.summary(results))
 

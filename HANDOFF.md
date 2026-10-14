@@ -7,6 +7,61 @@
 
 ---
 
+## [2026-10-14 14:45] WorkBuddy(阿拾) —— 落地「签到结果推送到 QQ」：绕开 WorkBuddy 通知体系，直接调 QQ 官方 Bot API
+
+**一句话**：大哥要求"每天签到结果通过 QQ 通知"。查清机制后确认 **WorkBuddy 那条路走不通**
+（签到根本不是 WorkBuddy 的任务），改为**签到程序自己调 QQ 开放平台 Bot API**。
+已在 `core/notify.py` 加好推送 + 配套抓群标识工具，**纯标准库、不新增依赖**，204 项测试全绿。
+
+### 为什么不用 WorkBuddy 里那个"QQ 机器人"连接（关键结论）
+
+| 项 | WorkBuddy 的「QQ 机器人」 | 本需求要的 |
+|---|---|---|
+| 归属 | **助理远程通道** | 定时任务结果通知 |
+| 方向 | **你 → WorkBuddy**（你在 QQ 下指令，它在你电脑上干活，结果回传到那个 QQ 会话） | WorkBuddy → 你（主动推送） |
+| 能否承载 | ❌ 不是结果通知出口 | — |
+
+两条硬理由：
+1. **WorkBuddy 的「定时任务结果通知」只支持 企微 bot / WorkBuddy 小程序**，官方文档明确，
+   **不包含 QQ**（对应设置页那张"定时任务企微 bot 同步"卡片）；
+2. **更本质**：签到是 **Windows 计划任务**跑的 `pythonw -m checkin`，
+   **WorkBuddy 全程不参与** ⇒ 结果压根不会进 WorkBuddy 的通知体系，接哪个出口都没用。
+
+⇒ 结论：**只能由签到程序自己发**。走 QQ 开放平台官方 Bot API。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `src/checkin/core/notify.py` | 新增 QQ 推送：`_load_qq_cfg` / `_http_post_json` / `_qq_access_token` / `_qq_message` / `_push_qq`。`notify_results(results, root=None)` 新增可选 `root`（**缺省 None ⇒ 行为不变**，老调用方与测试零影响）。凭据读 `data/notify.json`（`.gitignore` 已覆盖 `data/`，**不进开源仓库**）；文件不存在 = 未开启，静默跳过 |
+| `src/checkin/__main__.py` | 调用处传 `root=cfg.root` |
+| `tools/qq_bot_openid.py` | 新建：一次性抓 `group_openid`（换 token → 取 WS 网关 → Hello/Identify → 收 `GROUP_AT_MESSAGE_CREATE` → 打印并**回写** `data/notify.json`），带心跳，用已有的 `websocket-client` |
+| `tests/test_core.py` | +7 守卫：未配置静默跳过 / root=None 不变行为 / 配置不全**记日志**（不静默）/ 消息体与鉴权头形状 / **失败绝不打断签到** / 消息无 emoji / 出错时标题切换 |
+| `README.md` | 新增「结果通知：桌面 toast +（可选）推送到 QQ」小节（含三条"为什么"）；目录结构补 `qq_bot_openid.py`；测试数 197 → **204** |
+
+**守卫有效性（"改坏看变红"验证）**：① 群消息 URL 改错 → FAILED；② `msg_type` 从 0 改成 1 → FAILED；
+③ 去掉 `Authorization` 鉴权头 → FAILED。还原后 204 全绿。
+
+### 关键实现细节（都是踩过或查证过的）
+
+- **必须群聊**：QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超限；群聊无此限制（每分钟 20 条）。
+- **显式绕开系统代理**：本机会注入 `HTTP(S)_PROXY`，走它反而连不上 QQ 域名 —— 与读本地 CDP 同一处置。
+- **消息不带 emoji**：可能经过 GBK 环境（Windows 控制台/日志），emoji 会 `UnicodeEncodeError`。
+- **通知与签到解耦**：推送链路上任何失败都只记日志。
+
+### 待用户操作（配好后我实测）
+
+1. QQ 开放平台建机器人 → 拿 **AppID / AppSecret**（状态需「已上线」，开启「群聊消息」权限）；
+2. 建一个只有你和机器人的群，拉机器人进去，群设置里打开「**机器人主动在群聊内发言**」；
+3. 填 `data/notify.json` 的 `qq_bot.app_id / app_secret`；
+4. 跑 `tools/qq_bot_openid.py`，在群里 @ 一下机器人 → 自动回写 `group_openid`。
+
+> 💡 **建议另建一个专用机器人**：本工具抓 `group_openid` 时会**短暂占用该 AppID 的 WS 连接**，
+> 若复用 WorkBuddy 正在用的那个，它的远程通道会掉线（断开后一般会自动重连）。
+> 日常推送本身走 REST、不占连接，**不冲突**。
+
+---
+
 ## [2026-10-14 14:00] WorkBuddy(阿拾) —— **Trae 今天漏签**：端口绑定失败的新形态（旧实例没退完就拉起新的）；已修驱动不再白等
 
 **一句话**：今天 qoder ✅ / workbuddy ✅ / **trae ❌ 漏签**（streak 2 天中断）。
