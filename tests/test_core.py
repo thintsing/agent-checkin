@@ -620,12 +620,15 @@ class TestConfig(unittest.TestCase):
         _, recipes = load_config(str(PROJECT_ROOT))
         q = next(r for r in recipes if r.id == "qoder")
         c = q.client
-        for key in ("exe_glob", "debug_port", "target_match", "data_dir", "process_match"):
+        for key in ("debug_port", "target_match", "data_dir", "process_match"):
             self.assertTrue(c.get(key), f"client.{key} 不能为空")
         self.assertIsInstance(c["debug_port"], int)
-        # 必须用 glob：客户端版本目录会滚动累积（0.3.4 / 0.4.1 / 0.4.2 …），
-        # 写死路径会在它自更新后**静默**失效 —— 那是这条路线最大的长期成本。
-        self.assertIn("*", c["exe_glob"])
+        # 可执行文件有两种定位方式，**至少要有一种**：
+        #   · exe_glob —— 版本目录会滚动累积时用它（原来 Qoder 这么干）
+        #   · exe      —— 2026-10-15 起 Qoder 改用**顶层启动器**（见配方注释：
+        #                  glob 指向内层 exe 会绕过启动器，升级后起来就退、端口永不就绪）
+        self.assertTrue(str(c.get("exe") or "").strip() or str(c.get("exe_glob") or "").strip(),
+                        "exe / exe_glob 必须至少有一个非空，否则永远找不到客户端")
         self.assertTrue(c["close_after"] is True,
                         "领完必须关掉 —— 调试端口是本机任何程序都能接管会话的口子")
         # ⚠ 2026-10-11 实测真失败：客户端重启后落在**设置页**，那一层没有活动入口

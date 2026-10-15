@@ -59,11 +59,14 @@ enabled: true
 mode: client
 
 client:
-  # 版本目录会滚动累积（0.3.4 / 0.4.1 / 0.4.2 …），所以用 glob 并取版本号最大的那个。
-  # 写死路径会在客户端自更新后静默失效 —— 那是这条路线最大的长期成本。
-  exe_glob: '%LOCALAPPDATA%\Programs\Qoder CN\.qoder-versions\*\Qoder CN.exe'
-  # 兜底：glob 没命中时直接用这个（留空表示不兜底）
-  exe: ''
+  # ⚠ 2026-10-15 踩坑（当天真漏签，连试 6 次全败）：原来这里用 glob 指向
+  #   `.qoder-versions\*\Qoder CN.exe`（**内层实际程序**），等于**绕过顶层启动器**。
+  #   当天 Qoder 升级到 0.4.7 后，直接调内层 exe 会**起来就退** —— 60s 内端口始终不就绪；
+  #   改用顶层启动器后 **2.4 秒**端口就绪（netstat + curl 双重确认）。
+  #   启动器负责**单实例锁 / 版本切换 / 参数透传**，这三件内层 exe 都不做。
+  #   （版本目录仍会滚动累积，但那是启动器的事，不该由我们猜。）
+  exe: '%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe'
+  exe_glob: ''
   # 调试端口 —— **单一事实源**：`tools/win_shortcut_args.py` 写快捷方式时读的就是这里，
   # 驱动也读这里，不要在任何地方再硬编码一份（三处各写一份必然漂移）。
   #
