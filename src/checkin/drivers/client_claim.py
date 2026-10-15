@@ -30,6 +30,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 import glob
 import json
 import logging
@@ -887,13 +888,73 @@ class ClientDriver(Driver):
         )
 
     @staticmethod
-    def _port_alive(port: int) -> bool:
+    def _port_listener_pid(port: int) -> Optional[int]:
+        """netstat 里该端口 **LISTENING 行的 PID**；没有 LISTENING 行则返回 None。
+
+        这是判断"端口到底通不通"的权威判据之一。2026-10-15 的教训：
+        HTTP 层会**同时被两种假象骗到** ——
+          · 无监听时，沙箱对本地连接返回 502（curl 退出码 0，看着像"通"）；
+          · 僵尸 socket 时，HTTP 直接挂起超时。
+        只有 `netstat LISTENING` + `PID 活性` 两个证据都对上，才是真端口。
+        """
+        try:
+            out = subprocess.run(["netstat", "-ano"], capture_output=True, timeout=20,
+                                 creationflags=procenv.NO_WINDOW)
+            text = (out.stdout or b"").decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            return None                      # 查不到就当没这条证据（降级为只信 HTTP）
+        for ln in text.splitlines():
+            if f":{port} " in ln and "LISTENING" in ln:
+                parts = ln.split()
+                try:
+                    return int(parts[-1])
+                except (ValueError, IndexError):
+                    return None
+        return None
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """PID 是否还活着 —— 用 Windows `OpenProcess`，纯 API、不起子进程。
+
+        **为什么不用 `os.kill(pid, 0)`**：实测在 WorkBuddy 沙箱里它对**所有** PID
+        都抛 OSError（进程隔离），会把活端口全判成僵尸（2026-10-15 真踩到：
+        9336/9338/9339 三个活端口被误判成"监听者已死"）。
+        `OpenProcess` 在沙箱内外一致：句柄拿得到就是活着，拿不到（GetLastError 87）就是死了。
+
+        拿不准（API 本身不可用 / 非 Windows）时返回 True ——
+        **宁可漏判僵尸，也别把好端口说成坏**。
+        """
+        try:
+            kernel32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000：只要"进程在不在"的权限
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:                                       # noqa: BLE001
+            return True
+
+    @classmethod
+    def _port_alive(cls, port: int) -> bool:
+        """端口是否真的可用。
+
+        **两道判据都要过**（2026-10-15 加固，当天被假端口骗了半小时）：
+          ① HTTP `/json/version` 真的返回；
+          ② netstat 里 LISTENING 的 PID 还活着。
+        僵尸 socket（LISTENING 记在已死 PID 名下）会让客户端 `listen()` 失败后
+        静默没端口 —— 这种端口必须判为不可用，否则后面每一步都会白跑。
+        """
         try:
             with _LOCAL_OPENER.open(f"http://127.0.0.1:{port}/json/version", timeout=2) as r:
                 r.read()
-            return True
         except Exception:
             return False
+        pid = cls._port_listener_pid(port)
+        if pid is not None and not cls._pid_alive(pid):
+            log.warning("端口 %s 的监听者 PID %s 已死 ⇒ 僵尸 socket，判为不可用", port, pid)
+            return False
+        return True
 
     def _wait_port(self, port: int, timeout: int, poll: float = 0.8) -> bool:
         """轮询等端口就绪。

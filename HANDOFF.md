@@ -7,6 +7,70 @@
 
 ---
 
+## [2026-10-15 20:45] WorkBuddy(阿拾) —— 系统性加固：计划任务双触发器 + 端口真假两道判据（当天三次踩坑的复盘）
+
+**一句话**：今天一整天暴露的问题不是偶发 —— 漏跑、僵尸端口、假端口判断全是"静默失败"。
+按大哥要求做了一轮系统性加固：**要么自愈，要么响铃，不再安静地什么都不做**。
+
+### 加固一：计划任务双触发器（修 10-15 真漏签一天）
+
+| 问题 | 现状 |
+|---|---|
+| 主触发 09:55 因"开机未登录会话"被静默判 missed，程序**根本没启动**（当天连日志都没有） | `-StartWhenAvailable` 救不了未登录场景 |
+
+**方案**：加**兜底触发器** = 窗口结束 +30min（当前 **13:00**）。
+主触发 missed 时再给一次机会；当天已成功的站点被程序自身幂等（`skip_when_done_today`）拦下，
+**没有重复签到风险**。已重跑 `--install-task` 生效（`$t=@($t1,$t2)`）。
+
+### 加固二：端口真假的两道判据（修 10-15 被假端口骗半天）
+
+`_port_alive` 从"只看 HTTP"升级为**两道判据**：
+1. HTTP `/json/version` 真的返回；
+2. `netstat` 里 LISTENING 的 **PID 还活着**（`OpenProcess`）。
+
+**为什么要两道**：HTTP 层会同时被两种假象骗到 ——
+无监听时沙箱返回 502（curl 退出码 0 像"通"）；僵尸 socket 时直接挂起超时。
+
+**判活方式的坑（新发现）**：
+
+| 方式 | 结果 |
+|---|---|
+| `os.kill(pid, 0)` | ❌ **沙箱里对所有 PID 都抛 OSError**（进程隔离），把 9336/9338/9339 三个**活**端口全误判成僵尸 |
+| `OpenProcess`（ctypes） | ✅ 沙箱内外一致：句柄拿得到=活，GetLastError 87=死 |
+
+**真机复验**（本机四个端口）：
+
+| 端口 | 监听者 PID | PID 活性 | `_port_alive` |
+|---|---|---|---|
+| 9336 WorkBuddy | 12108 | 活 | **True** ✅ |
+| 9338 Trae | 2336 | 活 | **True** ✅ |
+| 9339 Qoder | 32440 | 活 | **True** ✅ |
+| 9337 Qoder（僵尸） | 无 LISTENING | — | **False** ✅ |
+
+### 加固三：`--print-task` 与 `--install-task` 一致性
+
+给 install 加兜底触发器时**漏改了 print**，导致 `--print-task` 直接 `NameError` 挂掉
+（用户复制到的命令与真正注册的不是一套）。已修 + 加守卫 `test_print_task_matches_install_script`。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `src/checkin/__main__.py` | 新增 `_fallback_hint()`（窗口结束 +30min）；`_install_script` / `_print_task` 都改**双触发器** |
+| `src/checkin/drivers/client_claim.py` | `_port_alive` 加 **PID 活性校验**；新增 `_port_listener_pid()`（解析 netstat）、`_pid_alive()`（**OpenProcess**，不用 os.kill） |
+| `tests/test_core.py` | +10 守卫：兜底时刻算术 / 双触发器注册 / print 与 install 一致 / 僵尸判不可用 / 健康端口放行 / HTTP 不通则短路 / netstat 缺失降级 / netstat 解析 / 判活用 OpenProcess / API 失败降级 True |
+| `README.md` | 测试数 217 → **227** |
+
+**守卫有效性（"改坏看变红"验证）**：
+① 去掉兜底触发器 → 3 个 FAILED；② `_port_alive` 去掉 PID 校验 → FAILED；
+③ 判活换回 `os.kill` → 2 个 FAILED。还原后 **227 全绿**。
+
+### 仍待观察
+- **10/16 计划任务是否恢复正常**（双触发器 + StartWhenAvailable 到位后 missed 概率应大幅下降；若仍 missed 需深挖机器侧）
+- Qoder 的 `.qoder-pending` 升级包仍未应用 —— 0.4.7 何时真正生效、生效后入口链路是否又变，需持续观察
+
+---
+
 ## [2026-10-15 14:55] WorkBuddy(阿拾) —— 计划任务漏跑一天 + Qoder 升级 0.4.7 后「绕过启动器」导致拉起即退；两个根因都已修
 
 **一句话**：今天三站只有 WorkBuddy 自动成功。另外两个的根因都找到并修掉了代码，

@@ -98,6 +98,26 @@ def _wake_hint(window_start: str) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
+def _fallback_hint(window_end: str) -> str:
+    """兜底触发时刻 = 签到窗口结束后 30 分钟（当前配置即 13:00）。
+
+    为什么需要（2026-10-15 真漏签一天）：主触发（09:55）依赖"那一刻机器已开机
+    **且已登录会话**"。一旦错过（开机未登录 / 休眠 / Windows 更新重启），
+    当日 occurrence 会被调度器**静默判为 missed 并跳次日** —— 程序根本不会启动，
+    当天连日志文件都没有（`NumberOfMissedRuns=1`、`LastRunTime` 空即是证据）。
+    `-StartWhenAvailable` 只在"错过之后机器可用"时补跑，救不了未登录的场景。
+
+    兜底触发跑起来时，程序自身的当日幂等（`skip_when_done_today`）会拦住
+    "今天已成功"的站点 ⇒ **没有重复签到风险**，纯粹是多一次机会。
+    """
+    hh, _, mm = str(window_end).partition(":")
+    try:
+        total = int(hh) * 60 + int(mm or 0) + 30
+    except ValueError:
+        total = 13 * 60
+    return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+
+
 def _plan(cfg) -> int:
     reason = scheduler.should_skip_today(cfg)
     if reason:
@@ -196,6 +216,7 @@ def _print_task(cfg) -> int:
     py = _task_python()
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
     hint = _wake_hint(cfg.schedule.window_start)
+    fallback = _fallback_hint(cfg.schedule.window_end)
 
     print("")
     print("  推荐：直接装（自动处理路径与编码）\n")
@@ -204,7 +225,9 @@ def _print_task(cfg) -> int:
     print("  等价的手写 PowerShell（可整段粘贴）：\n")
     print(f'    $a = New-ScheduledTaskAction -Execute "{py}" `')
     print(f"         -Argument '\"{entry}\"' -WorkingDirectory \"{_ROOT}\"")
-    print(f"    $t = New-ScheduledTaskTrigger -Daily -At {hint}")
+    print(f"    $t1 = New-ScheduledTaskTrigger -Daily -At {hint}")
+    print(f"    $t2 = New-ScheduledTaskTrigger -Daily -At {fallback}   # 兜底：窗口结束后 30min")
+    print("    $t = @($t1, $t2)")
     print("    $s = New-ScheduledTaskSettingsSet -StartWhenAvailable `")
     print("         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd")
     print("    $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME `")
@@ -216,6 +239,9 @@ def _print_task(cfg) -> int:
     print(f"  {cfg.schedule.window_start}–{cfg.schedule.window_end} 之间的某时刻执行，")
     print("  所以「每天几点签到」在系统层面看不出来。")
     print("")
+    print(f"  另有一个 {fallback} 的**兜底触发**：主触发 missed 时（如开机未登录会话，")
+    print("  2026-10-15 就这么漏了一整天）再给一次机会；当天已成功的站点会被")
+    print("  程序自身幂等拦下，不会重复签到。")
     print("  · 唤醒时刻没开机 → -StartWhenAvailable 会在开机后补跑一次")
     print("  · 只在有登录会话时运行（锁屏算、未登录不算）—— 开浏览器需要桌面会话")
     print("  · 本机 schtasks.exe 被程序黑名单封了，所以走 PowerShell cmdlet")
@@ -247,6 +273,7 @@ def _install_script(cfg) -> str:
     """
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
     hint = _wake_hint(cfg.schedule.window_start)
+    fallback = _fallback_hint(cfg.schedule.window_end)
     return (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute {_psq(_task_python())} "
@@ -255,7 +282,12 @@ def _install_script(cfg) -> str:
         # -At <固定时刻>，**刻意不带 -RandomDelay**：
         #   随机时刻由程序自己在窗口内采样（RandomDelay 会让当日 occurrence
         #   被静默跳过，见本函数 docstring 与 _wake_hint）
-        f"$t=New-ScheduledTaskTrigger -Daily -At {_psq(hint)};"
+        # **双触发器**（2026-10-15 加固，当天真漏签一天）：主触发 09:55
+        # + 兜底触发（窗口结束 +30min）。主触发 missed 时（如开机未登录会话），
+        # 兜底触发再给一次机会；当天已成功的站点被程序自身幂等拦下，无重复风险。
+        f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(hint)};"
+        f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(fallback)};"
+        "$t=@($t1,$t2);"
         # -StartWhenAvailable       错过唤醒时刻（休眠/关机）后，开机自动补跑一次
         # -AllowStartIfOnBatteries  笔记本不在电源上也要跑（签到本身极轻）
         # -DontStopIfGoingOnBatteries / -DontStopOnIdleEnd

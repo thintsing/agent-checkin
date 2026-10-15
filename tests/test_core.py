@@ -28,7 +28,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from checkin.__main__ import (                                # noqa: E402
+    _fallback_hint,
     _install_script,
+    _print_task,
     _psq,
     _task_command,
     _uninstall_script,
@@ -267,6 +269,17 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(_wake_hint("07:40"), "07:30")
         self.assertEqual(_wake_hint("00:05"), "00:00")   # 不产生负时刻
         self.assertEqual(_wake_hint("13:00"), "12:50")
+
+    def test_fallback_hint_is_thirty_minutes_after_window_end(self):
+        """兜底触发时刻 = 窗口结束 +30 分钟（当前配置即 13:00）。
+
+        2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默判 missed，
+        程序**根本没启动**（当天连日志都没有）。兜底触发就是为这个场景加的第二次机会。
+        """
+        self.assertEqual(_fallback_hint("12:30"), "13:00")   # 当前实际配置
+        self.assertEqual(_fallback_hint("11:00"), "11:30")
+        self.assertEqual(_fallback_hint("23:50"), "00:20")   # 跨天要回绕
+        self.assertEqual(_fallback_hint("坏值"), "13:00")    # 解析不了就退回 13:00
 
 
 # ----------------------------------------------------------------------
@@ -1144,7 +1157,92 @@ class TestClientDriverLogic(unittest.TestCase):
         self.assertFalse(ok)
         sp.assert_not_called()
 
-    # -------- 重启前的"忙闲"把关（用户 2026-10-14 要求）
+    # -------- 端口真假的两道判据（2026-10-15 被假端口骗了半天）
+
+    class _FakeResp:
+        def read(self):
+            return b"{}"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _patch_http_ok(self):
+        return mock.patch("checkin.drivers.client_claim._LOCAL_OPENER")
+
+    def test_port_alive_rejects_zombie_listener(self):
+        """HTTP 通了还不算 —— 监听者 PID 已死 = **僵尸 socket**，必须判不可用。
+
+        2026-10-15 第三次踩到：`netstat` 显示 LISTENING，但记的是**已死 PID**，
+        客户端 `listen()` 失败后静默没端口。若只信 HTTP，会被"挂起超时"
+        或沙箱对无监听端口返回的 502 同时骗过去。
+        """
+        with self._patch_http_ok() as O, \
+             mock.patch.object(type(self.d), "_port_listener_pid", return_value=12060), \
+             mock.patch.object(type(self.d), "_pid_alive", return_value=False):
+            O.open.return_value = self._FakeResp()
+            self.assertFalse(self.d._port_alive(9339))
+
+    def test_port_alive_accepts_healthy_listener(self):
+        """HTTP 通 + PID 活着 ⇒ 真端口。"""
+        with self._patch_http_ok() as O, \
+             mock.patch.object(type(self.d), "_port_listener_pid", return_value=16984), \
+             mock.patch.object(type(self.d), "_pid_alive", return_value=True):
+            O.open.return_value = self._FakeResp()
+            self.assertTrue(self.d._port_alive(9339))
+
+    def test_port_alive_http_failure_short_circuits(self):
+        """HTTP 就不通时**不该**再跑 netstat（省掉一次子进程）。"""
+        with self._patch_http_ok() as O, \
+             mock.patch.object(type(self.d), "_port_listener_pid") as lp:
+            O.open.side_effect = OSError("refused")
+            self.assertFalse(self.d._port_alive(9339))
+            lp.assert_not_called()
+
+    def test_port_alive_degrades_when_netstat_unavailable(self):
+        """netstat 查不到（被拦/超时）⇒ 降级为只信 HTTP，不误杀好端口。"""
+        with self._patch_http_ok() as O, \
+             mock.patch.object(type(self.d), "_port_listener_pid", return_value=None):
+            O.open.return_value = self._FakeResp()
+            self.assertTrue(self.d._port_alive(9339))
+
+    def test_port_listener_pid_parses_netstat(self):
+        """从 netstat 输出里正确取出 LISTENING 行的 PID。"""
+        fake = (
+            "  TCP    127.0.0.1:9339         0.0.0.0:0              LISTENING       16984\n"
+            "  TCP    127.0.0.1:9339         127.0.0.1:51263        CLOSE_WAIT      16984\n"
+            "  TCP    127.0.0.1:49201        127.0.0.1:9339         TIME_WAIT       0\n"
+        )
+
+        class _R:
+            stdout = fake.encode("utf-8")
+
+        with mock.patch("checkin.drivers.client_claim.subprocess.run",
+                        return_value=_R()):
+            self.assertEqual(self.d._port_listener_pid(9339), 16984)
+        # 没有 LISTENING 行的端口 ⇒ None（不是 0，也不是抛错）
+        with mock.patch("checkin.drivers.client_claim.subprocess.run",
+                        return_value=_R()):
+            self.assertIsNone(self.d._port_listener_pid(9999))
+
+    def test_pid_alive_uses_openprocess(self):
+        """判活用 `OpenProcess` 而不是 `os.kill` —— 沙箱里 os.kill 对所有 PID 都抛错。
+
+        2026-10-15 实测：os.kill 把 9336/9338/9339 三个**活**端口全判成"监听者已死"，
+        而 OpenProcess 准确区分死活（句柄拿得到 = 活，GetLastError 87 = 死）。
+        """
+        with mock.patch("checkin.drivers.client_claim.ctypes") as C:
+            C.windll.kernel32.OpenProcess.return_value = 4321     # 拿到句柄 = 活着
+            self.assertTrue(self.d._pid_alive(12108))
+            C.windll.kernel32.OpenProcess.return_value = None     # 拿不到 = 死了
+            self.assertFalse(self.d._pid_alive(12060))
+
+    def test_pid_alive_degrades_to_true_on_api_failure(self):
+        """API 本身不可用时返回 True —— 宁可漏判僵尸，也别把好端口说成坏。"""
+        with mock.patch("checkin.drivers.client_claim.ctypes") as C:
+            C.windll.kernel32.OpenProcess.side_effect = OSError("blocked")
+            self.assertTrue(self.d._pid_alive(12108))
+
 
     def _busy_recipe(self):
         return self._run_recipe(debug_port=9338, wait_port_sec=60,
@@ -2182,6 +2280,40 @@ class TestTaskInstall(unittest.TestCase):
                 cfg = _cfg(start, end)
                 self.assertIn(f"-At {_psq(_wake_hint(start))}", _install_script(cfg))
                 self.assertNotIn("-RandomDelay", _install_script(cfg))
+
+    def test_has_a_fallback_trigger_after_the_window(self):
+        """必须有两个触发器：主触发 + 窗口结束后的兜底触发。
+
+        2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默判 missed，
+        程序**根本没启动**（当天连日志文件都没有，`NumberOfMissedRuns=1`）。
+        只靠 `-StartWhenAvailable` 救不了未登录场景 ⇒ 必须有第二次机会。
+        已成功的站点由程序自身幂等拦下，不会重复签到。
+        """
+        for start, end in (("10:05", "12:30"), ("07:40", "11:20"), ("09:00", "09:30")):
+            with self.subTest(window=f"{start}-{end}"):
+                s = _install_script(_cfg(start, end))
+                self.assertIn(f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(_wake_hint(start))}", s)
+                self.assertIn(f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(_fallback_hint(end))}", s)
+                self.assertIn("$t=@($t1,$t2)", s, "两个触发器必须都注册，而不是只注册第一个")
+
+    def test_print_task_matches_install_script(self):
+        """`--print-task` 展示的脚本必须和 `--install-task` 实际注册的一致。
+
+        2026-10-15 踩过：给 install 加了兜底触发器，却漏改 print，于是
+        `--print-task` 直接 NameError 挂掉（用户复制到的命令和真正注册的不是一套）。
+        """
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_task(self.cfg)
+        out = buf.getvalue()
+        s = _install_script(self.cfg)
+        # 关键片段两边都要有（触发器、兜底时刻）
+        for frag in (_wake_hint(self.cfg.schedule.window_start),
+                     _fallback_hint(self.cfg.schedule.window_end)):
+            self.assertIn(frag, out)
+            self.assertIn(frag, s)
 
     def test_uses_pythonw_to_avoid_console_window(self):
         """解释器必须优先 `pythonw.exe`。
