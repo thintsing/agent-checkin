@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from typing import List, Optional
 
 # pythonw.exe 下没有控制台，`sys.stdout/stderr` 就是 **None** —— 任何 print() 都会
 # 直接 AttributeError。计划任务用的正是 pythonw（为的是不弹黑框，见 `_task_python()`），
@@ -437,6 +438,52 @@ def _login(cfg, recipes) -> int:
         print("  还没检测到登录。确认是在**专用浏览器窗口**里登录的，再按回车重试。")
 
 
+def _collect_gaps(cfg, recipes, only: Optional[List[str]] = None):
+    """回溯"本该签到却没签到"的日子。
+
+    **必须在引擎跑之前算** —— 今天一旦签上，`last_done_date` 就变成今天了，
+    那时再回溯只会得到"没有缺口"，等于把昨天那个洞永久抹掉。
+
+    **为什么要有这条**（2026-10-17，用户原话"还要我来手工检查"）：
+    在此之前，昨天漏签是**完全静默**的 —— 计划任务被判 missed、程序卡在某个
+    守候分支、机器没开机……任何一种情况下，第二天程序照常跑、照常报
+    "今日已完成"，而昨天那个洞**永远不会被提起**。用户唯一的发现途径是自己翻日志。
+    现在改由程序在每天第一次真正运行时回头看一眼，并把缺口说进通知里。
+
+    排除 **manual 站点**（只发提醒、没有服务端证据，`last_done_date` 长期不动
+    是设计如此，当缺口报出来是纯噪音）；其余能真正领到的模式都算。
+
+    ⚠ 这里**不能写成"只认 mode=auto"**（2026-10-17 当场踩到）：真实配方里
+    qoder / trae / workbuddy 三个站点的 mode 全是 **`client`**（CDP 客户端驱动），
+    一个 `auto` 都没有。按 `mode == "auto"` 过滤 ⇒ 生产环境**永远不会报缺口**，
+    而单元测试用的是手搓的 `auto` 配方 ⇒ 全绿。第三次栽在"名存实亡"上：
+    判据要按**真实配方**写，不能按测试里的便利写。
+    ⇒ 改成"排除 manual"，并加一条直接读真实配方的守卫（`test_real_project_sites…`）。
+
+    一天三个触发，缺口**只播报一次**（戳记见 `StateStore.set_gap_notice`）——
+    同样的话响三遍，就是"告警被淹没人就忽略"的开始。
+    """
+    if scheduler.should_skip_today(cfg):
+        return None
+    store = StateStore(cfg.state_path)
+    if store.gap_notice_today():
+        return None
+    skip_we = bool(getattr(cfg.schedule, "skip_weekends", False))
+    gaps = {}
+    for r in recipes:
+        if not r.enabled or r.mode in ("manual", "disabled"):
+            continue
+        if only and r.id not in only:
+            continue
+        days = store.missed_days(r.id, skip_weekends=skip_we)
+        if days:
+            gaps[r.id] = days
+    if not gaps:
+        return None
+    store.set_gap_notice(notify.gap_line(gaps))
+    return gaps
+
+
 def _focus_target_page(cfg, recipe) -> None:
     """浏览器可能本来就在跑（此时 ensure_chrome 的 start_url 会被忽略），
     这里确保目标页面确实开着，否则用户打开窗口会一脸茫然。"""
@@ -501,6 +548,9 @@ def main(argv=None) -> int:
                 [r.id for r in recipes if r.enabled],
                 "probe" if args.probe else ("dry-run" if args.dry_run else "run"))
 
+    # 缺口要在**跑之前**取 —— 跑完 last_done_date 就变成今天，昨天那个洞就没了
+    gaps = None if (args.dry_run or args.probe) else _collect_gaps(cfg, recipes, only)
+
     engine = Engine(cfg, recipes)
     results = engine.run(only=only, dry_run=args.dry_run, probe=args.probe, now=args.now)
 
@@ -518,9 +568,11 @@ def main(argv=None) -> int:
         # 三次机会里往往只有第一次有实质结果 —— 后面两次多半是"今日已完成"的 skipped。
         # 此时**不弹通知**：一天响三次同样的"已完成"会把警告淹没，用户反而开始忽略它。
         # 只有当次真的做了动作（成功/已签/提醒/出错…）才通知；结论照样写进日志与状态。
-        if any(r.outcome.value != "skipped" for r in results):
+        # `or gaps` 不是可有可无：三次机会里第一次若整体被 `not_before` 闸门拦成
+        # skipped，而昨天又确实漏了 —— 缺口会被这条门禁一起吞掉，又变回静默。
+        if gaps or any(r.outcome.value != "skipped" for r in results):
             # root 传进去：`data/notify.json` 存在时会顺带推到 QQ（未配置则静默跳过）
-            notify.notify_results(results, root=cfg.root)
+            notify.notify_results(results, root=cfg.root, gaps=gaps)
         else:
             logger.info("全部站点今日已完成/无需动作，本次不重复通知（可用 --status 查看）")
     else:

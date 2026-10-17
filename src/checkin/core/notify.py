@@ -89,6 +89,32 @@ def _brief(msg: str, limit: int = 30) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def gap_line(gaps: Optional[Dict[str, List[str]]]) -> str:
+    """把"本该签到却没签到的日子"压缩成一句人话。
+
+    为什么单独有这一条（2026-10-17）：在此之前，昨天漏签是**完全静默**的 ——
+    计划任务被判 missed、程序卡在守候分支、机器没开机……任何一种情况下，
+    第二天程序照常跑、照常报"今日已完成"，昨天那个洞永远不会被提起。
+    缺口由 `core/state.py::StateStore.missed_days` 在每天第一次运行时往前回溯得到。
+    """
+    if not gaps:
+        return ""
+    parts = []
+    for sid, days in gaps.items():
+        if len(days) == 1:
+            parts.append(f"{sid} 昨日漏签")
+        else:
+            parts.append(f"{sid} 漏签 {len(days)} 天（{days[0]} 起）")
+    return "；".join(parts)
+
+
+def _gap_title(gaps: Optional[Dict[str, List[str]]]) -> str:
+    """缺口通知的标题。漏一天说"昨天"，漏多天直接说天数 ——
+    标题是唯一一眼能扫到的东西，含糊不得。"""
+    total = max((len(d) for d in (gaps or {}).values()), default=0)
+    return "昨天漏签了" if total <= 1 else f"漏签 {total} 天"
+
+
 def _done_line(results: List[CheckinResult]) -> str:
     """【只报"今天真做了什么"，不报"没做什么"。】
 
@@ -108,18 +134,25 @@ def _done_line(results: List[CheckinResult]) -> str:
 
 
 def notify_results(results: List[CheckinResult],
-                   root: Optional[str] = None) -> None:
+                   root: Optional[str] = None,
+                   gaps: Optional[Dict[str, List[str]]] = None) -> None:
     """控制台摘要 + 桌面 toast（+ 可选：推送到 QQ）。
 
     `root` 非空且 `data/notify.json` 存在时，额外把同一份结论推到 QQ。
     `root` 缺省 None ⇒ 只做本地通知（老调用方与单元测试不受影响）。
+
+    `gaps` = {站点: [漏签日期…]}，由 `StateStore.missed_days` 回溯得到。
+    缺省 None ⇒ 不做缺口播报（老调用方行为不变）。
     """
     print(summary(results))
+    gap = gap_line(gaps)
+    if gap:
+        print("  [缺口] " + gap)
     if not results:
         return
 
     problems = [r for r in results if r.outcome in _PROBLEM]
-    text = _qq_message(results, problems)
+    text = _qq_message(results, problems, gaps)
     if problems:
         # 分类一律从 _PROBLEM 派生 —— 运行时绝不另写一份字面量元组（见上面的 ⚠）
         need_login = [r for r in problems if r.outcome in _LOGIN_NEEDED]
@@ -134,7 +167,18 @@ def notify_results(results: List[CheckinResult],
             parts.append("出错 " + "、".join(r.site_id for r in broken))
         hint = ("跑 run_checkin.bat --login 处理登录"
                 if need_login else "详情见 logs/ 里今天的日志")
-        _toast("签到我处理不了", " · ".join(parts) + f"（{hint}）")
+        _toast("签到我处理不了",
+               " · ".join(parts) + (f"；{gap}" if gap else "") + f"（{hint}）")
+        _push_qq(root, text)
+        return
+
+    # 今天没事、但昨天有洞：也要换标题。"每日签到完成"会让用户以为一切正常，
+    # 从而不知道连续天数已经断了 —— 那正是"静默漏签"的另一种形态。
+    # 正文里刻意**不写**"今日已补上"：这条分支也可能在站点被 `not_before` 闸门
+    # 拦成 skipped 时走到，那时"补上了"是假的。今天到底怎么样，交给 `_done_line`
+    # 原样说，别替它下结论。
+    if gap:
+        _toast(_gap_title(gaps), _done_line(results) + " · " + gap)
         _push_qq(root, text)
         return
 
@@ -228,7 +272,8 @@ def _qq_access_token(app_id: str, app_secret: str) -> Optional[str]:
 
 
 def _qq_message(results: List[CheckinResult],
-                problems: List[CheckinResult]) -> str:
+                problems: List[CheckinResult],
+                gaps: Optional[Dict[str, List[str]]] = None) -> str:
     """把结论压缩成一条 QQ 消息（**纯文本、不带 emoji**）。
 
     为什么不带 emoji：消息最终可能经过 GBK 环境（Windows 控制台/日志），
@@ -236,8 +281,10 @@ def _qq_message(results: List[CheckinResult],
     """
     from datetime import datetime
     head = datetime.now().strftime("%m-%d")
+    gap = gap_line(gaps)
+    tail = f" ｜另：{gap}" if gap else ""
     if not problems:
-        return f"【每日签到 {head}】{_done_line(results)}"
+        return f"【每日签到 {head}】{_done_line(results)}{tail}"
     parts = []
     login = [r.site_id for r in problems if r.outcome in _LOGIN_NEEDED]
     broken = [r.site_id for r in problems if r.outcome not in _LOGIN_NEEDED]
@@ -245,7 +292,7 @@ def _qq_message(results: List[CheckinResult],
         parts.append("需登录 " + "、".join(login))
     if broken:
         parts.append("出错 " + "、".join(broken))
-    return f"【签到需处理 {head}】{' · '.join(parts)}"
+    return f"【签到需处理 {head}】{' · '.join(parts)}{tail}"
 
 
 def _push_qq(root: Optional[str], text: str) -> None:

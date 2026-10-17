@@ -34,6 +34,7 @@ from checkin.__main__ import (                                # noqa: E402
     _install_script,
     _print_task,
     _closing_hint,
+    _collect_gaps,
     _psq,
     _task_command,
     _uninstall_script,
@@ -880,6 +881,29 @@ class TestProcEnv(unittest.TestCase):
         self.procenv.clean_env(base)
         self.assertIn("ELECTRON_RUN_AS_NODE", base, "不能改动调用方传进来的 dict")
 
+    # --- pid_alive：进程判活 -------------------------------------------
+
+    def test_a_dead_pid_is_not_alive(self):
+        """**僵尸陷阱**（2026-10-17 实测，这条守卫当时竟然是绿的）：
+
+        `OpenProcess` 对**已退出、但句柄还被父进程握着**的进程照样返回句柄 ——
+        只看"句柄拿没拿到"的话，`pid_alive` 会**恒为 True**。而它是
+        `RunLock._is_stale()` 判活的唯一依据 ⇒ 锁永远不会被判陈旧，
+        "进程死了就立刻接管"这条机制从写下那一刻起就没生效过。
+        必须再调 `GetExitCodeProcess`，只有退出码仍是 259 才算活着。
+        """
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()                       # 确认已退出；Popen 仍握着它的句柄 ⇒ 典型僵尸
+        self.assertFalse(self.procenv.pid_alive(p.pid),
+                         "已退出的进程必须判为不活 —— 否则运行锁永远不会被判陈旧")
+
+    def test_the_current_process_is_alive(self):
+        """反过来不能判死：把活的说成死的会放任并发重复签到。"""
+        self.assertTrue(self.procenv.pid_alive(os.getpid()))
+
+    def test_a_pid_that_never_existed_is_not_alive(self):
+        self.assertFalse(self.procenv.pid_alive(999999))
+
 
 # ----------------------------------------------------------------------
 # client 驱动的纯逻辑（真启动客户端属于活体测试，不进单元测试）
@@ -1266,22 +1290,46 @@ class TestClientDriverLogic(unittest.TestCase):
                         return_value=_R()):
             self.assertIsNone(self.d._port_listener_pid(9999))
 
+    @staticmethod
+    def _ctypes_stub(handle=4321, exit_code=259):
+        """假 ctypes：能分别表达"句柄拿不拿得到"与"进程退没退出"两个维度。
+
+        必须分开表达 —— 2026-10-17 就是栽在只看了第一个维度上（见下一条用例）。
+        """
+        C = mock.MagicMock()
+        C.windll.kernel32.OpenProcess.return_value = handle
+        C.c_uint32.return_value.value = exit_code      # 259 = STILL_ACTIVE
+        C.windll.kernel32.GetExitCodeProcess.return_value = 1
+        return C
+
     def test_pid_alive_uses_openprocess(self):
         """判活用 `OpenProcess` 而不是 `os.kill` —— 沙箱里 os.kill 对所有 PID 都抛错。
 
-        2026-10-15 实测：os.kill 把 9336/9338/9339 三个**活**端口全判成"监听者已死"，
-        而 OpenProcess 准确区分死活（句柄拿得到 = 活，GetLastError 87 = 死）。
+        2026-10-15 实测：os.kill 把 9336/9338/9339 三个**活**端口全判成"监听者已死"。
         """
-        with mock.patch("checkin.core.procenv.ctypes") as C:
-            C.windll.kernel32.OpenProcess.return_value = 4321     # 拿到句柄 = 活着
+        with mock.patch("checkin.core.procenv.ctypes", self._ctypes_stub()):
             self.assertTrue(self.d._pid_alive(12108))
-            C.windll.kernel32.OpenProcess.return_value = None     # 拿不到 = 死了
-            self.assertFalse(self.d._pid_alive(12060))
+        with mock.patch("checkin.core.procenv.ctypes",
+                        self._ctypes_stub(handle=None)):
+            self.assertFalse(self.d._pid_alive(12060), "拿不到句柄 = 那个进程没了")
+
+    def test_pid_alive_treats_a_zombie_as_dead(self):
+        """**句柄拿得到 ≠ 活着**（2026-10-17 实测，这条守卫当时是绿的假象）：
+
+        僵尸进程（已退出、但父进程还握着句柄）`OpenProcess` 照样返回句柄 ——
+        只看句柄 ⇒ `pid_alive` 恒为 True ⇒ `RunLock` 判活形同虚设，
+        "持锁进程死了就立刻接管"从写下那一刻起一次都没生效过。
+        必须再取退出码，只有 259(STILL_ACTIVE) 才算活着。
+        """
+        with mock.patch("checkin.core.procenv.ctypes",
+                        self._ctypes_stub(exit_code=0)):
+            self.assertFalse(self.d._pid_alive(12108))
 
     def test_pid_alive_degrades_to_true_on_api_failure(self):
         """API 本身不可用时返回 True —— 宁可漏判僵尸，也别把好端口说成坏。"""
-        with mock.patch("checkin.core.procenv.ctypes") as C:
-            C.windll.kernel32.OpenProcess.side_effect = OSError("blocked")
+        C = mock.MagicMock()
+        C.windll.kernel32.OpenProcess.side_effect = OSError("blocked")
+        with mock.patch("checkin.core.procenv.ctypes", C):
             self.assertTrue(self.d._pid_alive(12108))
 
 
@@ -2264,6 +2312,273 @@ class TestNotify(unittest.TestCase):
         text = notify._qq_message([err], [err])
         self.assertIn("需处理", text)
         self.assertNotIn("每日签到", text)
+
+
+class TestMissedDays(unittest.TestCase):
+    """回归来源（2026-10-17，用户原话"还要我来手工检查"）：
+
+    昨天整天没签到这件事，此前**不会通知任何人** —— 计划任务被判 missed、程序卡在
+    某个守候分支、机器没开机……任何一种情况下，第二天程序照常跑、照常报"今日已完成"，
+    昨天那个洞**永远不会被提起**。用户唯一的发现途径是自己翻日志。
+    这一组守卫钉死"必须回头看一眼、并把缺口说出来"。
+
+    ⚠ 缺口必须在**引擎跑之前**取（`__main__.main` 里 `_collect_gaps` 的位置）：
+    今天一旦签上，`last_done_date` 就变成今天，那时再回溯只会得到"没有缺口"。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "state.json")
+        self.store = StateStore(self.path)
+
+    def _last(self, days_ago):
+        """把"上次完成日"伪造成 N 天前（0 = 今天）。"""
+        day = (datetime.now(CST) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        self.store._site("s").update({"last_done_date": day})
+        self.store._save()
+
+    def _day(self, days_ago):
+        return (datetime.now(CST) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+    def test_yesterday_miss_is_detected(self):
+        self._last(2)
+        self.assertEqual(self.store.missed_days("s"), [self._day(1)])
+
+    def test_no_gap_when_signed_in_yesterday(self):
+        self._last(1)
+        self.assertEqual(self.store.missed_days("s"), [])
+
+    def test_no_gap_when_already_signed_in_today(self):
+        self._last(0)
+        self.assertEqual(self.store.missed_days("s"), [])
+
+    def test_never_succeeded_is_not_a_gap(self):
+        """从未成功过 ⇒ 无从判断"漏了哪天"，不能凭空报一串日期。"""
+        self.assertEqual(self.store.missed_days("s"), [])
+
+    def test_multi_day_gap_lists_every_day(self):
+        self._last(4)
+        days = self.store.missed_days("s")
+        self.assertEqual(len(days), 3)
+        self.assertEqual(days[0], self._day(3))
+        self.assertEqual(days[-1], self._day(1))
+
+    def test_today_is_never_counted_as_missed(self):
+        """今天还没跑完 —— 把今天算进去，等于在结果出来之前就判它失败。"""
+        self._last(3)
+        self.assertNotIn(today_key(), self.store.missed_days("s"))
+
+    def test_weekends_are_not_counted_when_skipped(self):
+        """skip_weekends 配了的话，周末本来就不该跑，报出来是噪音。"""
+        self._last(9)
+        all_days = self.store.missed_days("s")
+        work = self.store.missed_days("s", skip_weekends=True)
+        weekend = [d for d in all_days
+                   if datetime.strptime(d, "%Y-%m-%d").date().weekday() >= 5]
+        self.assertTrue(weekend, "9 天的缺口里必然含周末，否则这条守卫测不到东西")
+        self.assertEqual(set(all_days) - set(work), set(weekend))
+
+    def test_gap_is_capped(self):
+        """只是防止状态库被改坏后刷出一屏日期，正常路径碰不到。"""
+        self._last(400)
+        self.assertLessEqual(len(self.store.missed_days("s")), 14)
+
+    def test_unparsable_date_is_ignored(self):
+        self.store._site("s").update({"last_done_date": "not-a-date"})
+        self.store._save()
+        self.assertEqual(self.store.missed_days("s"), [])
+
+    # --- 播报戳记：一天只说一次 -----------------------------------------
+
+    def test_gap_notice_is_empty_initially(self):
+        self.assertEqual(self.store.gap_notice_today(), "")
+
+    def test_gap_notice_is_remembered_for_today(self):
+        self.store.set_gap_notice("qoder 昨日漏签")
+        self.assertEqual(self.store.gap_notice_today(), "qoder 昨日漏签")
+
+    def test_gap_notice_expires_the_next_day(self):
+        """过期必须靠**日期**判断 —— 只看"有没有值"会让它变成一次性开关。
+
+        ⚠ 这条守卫的第一版是自己改掉存储里的 `date`（等于替 `set_gap_notice`
+        把活干了），于是"戳记根本没写日期"这种缺陷它**照样是绿的** ——
+        典型的"别 mock 掉你要验证的那道约束"。现在改成只改「今天」的口径，
+        让真实写入路径自己跑。
+        """
+        self.store.set_gap_notice("qoder 昨日漏签")
+        self.assertNotEqual(self.store.gap_notice_today(), "",
+                            "同一天必须认 —— 不认的话缺口会被反复重报")
+        with mock.patch("checkin.core.state.today_key", return_value=self._day(-1)):
+            self.assertEqual(self.store.gap_notice_today(), "",
+                             "换了一天就必须失效 —— 否则以后每天的缺口都报不出来")
+
+    def test_gap_notice_survives_a_reload(self):
+        """戳记必须落在文件里，不是内存里 —— 一天三次触发是三个**独立进程**。"""
+        self.store.set_gap_notice("qoder 昨日漏签")
+        self.assertEqual(StateStore(self.path).gap_notice_today(), "qoder 昨日漏签")
+
+
+class TestMissedDayNotice(unittest.TestCase):
+    """缺口要真的进通知（桌面 + QQ）—— 只在状态里算出来、不说出来，等于没做。"""
+
+    def setUp(self):
+        toast = mock.patch("checkin.core.notify._toast")
+        self.toast = toast.start()
+        self.addCleanup(toast.stop)
+        printer = mock.patch("builtins.print")
+        self.addCleanup(printer.stop)
+        printer.start()
+
+    def _sent(self):
+        self.assertTrue(self.toast.called, "应当发出一条通知")
+        return self.toast.call_args[0][:2]
+
+    def test_gap_changes_the_title_even_when_today_is_fine(self):
+        """今天全部成功、但昨天有洞 ⇒ 标题必须提到"漏"。
+
+        报"每日签到完成"会让人以为连续天数还在 —— 那是静默漏签的另一种形态。
+        """
+        notify.notify_results([CheckinResult("qoder", Outcome.SUCCESS)],
+                              gaps={"qoder": ["2026-10-16"]})
+        title, body = self._sent()
+        self.assertIn("漏", title)
+        self.assertNotIn("完成", title)
+        self.assertIn("qoder", body)
+
+    def test_no_gap_keeps_the_plain_title(self):
+        """没有缺口时行为必须与改动前一致（老调用方不受影响）。"""
+        notify.notify_results([CheckinResult("qoder", Outcome.SUCCESS)])
+        title, _ = self._sent()
+        self.assertEqual(title, "每日签到完成")
+
+    def test_gap_is_appended_when_today_also_failed(self):
+        notify.notify_results([CheckinResult("qoder", Outcome.ERROR, "boom")],
+                              gaps={"qoder": ["2026-10-16"]})
+        title, body = self._sent()
+        self.assertIn("处理不了", title)
+        self.assertIn("漏", body)
+
+    def test_gap_reaches_the_qq_message(self):
+        text = notify._qq_message([CheckinResult("qoder", Outcome.SUCCESS)], [],
+                                  {"qoder": ["2026-10-16"]})
+        self.assertIn("漏签", text)
+
+    def test_qq_message_without_gap_is_unchanged(self):
+        text = notify._qq_message([CheckinResult("qoder", Outcome.SUCCESS)], [])
+        self.assertNotIn("漏", text)
+
+    def test_gap_line_mentions_the_site_and_the_span(self):
+        self.assertIn("trae", notify.gap_line({"trae": ["2026-10-16"]}))
+        self.assertIn("3", notify.gap_line({"trae": ["a", "b", "c"]}))
+
+    def test_empty_gap_line_is_empty(self):
+        self.assertEqual(notify.gap_line(None), "")
+        self.assertEqual(notify.gap_line({}), "")
+
+    def test_gap_title_counts_the_days(self):
+        """标题是唯一一眼扫得到的东西：漏一天说"昨天"，漏多天直接报天数。"""
+        self.assertIn("昨天", notify._gap_title({"qoder": ["a"]}))
+        self.assertIn("3", notify._gap_title({"qoder": ["a", "b", "c"]}))
+
+
+class TestCollectGaps(unittest.TestCase):
+    """`__main__._collect_gaps` 的选取口径。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = os.path.join(self.tmp.name, "state.json")
+        self.cfg = AppConfig(
+            root=self.tmp.name, chrome=ChromeConfig(), safety=SafetyConfig(),
+            state_path=self.state_path, log_dir=self.tmp.name,
+            schedule=ScheduleConfig())
+
+    def _seed(self, sid, days_ago):
+        store = StateStore(self.state_path)
+        store._site(sid).update({
+            "last_done_date":
+                (datetime.now(CST) - timedelta(days=days_ago)).strftime("%Y-%m-%d")})
+        store._save()
+
+    def _auto(self, sid="qoder", mode="client"):
+        # 用 **client**：真实配方（qoder/trae/workbuddy）就是这个 mode。
+        # 测试里图省事写 auto，就会掩盖"生产环境口径不匹配"这类静默失效。
+        return Recipe(id=sid, name=sid, mode=mode)
+
+    def test_detects_the_gap(self):
+        self._seed("qoder", 3)
+        self.assertIn("qoder", _collect_gaps(self.cfg, [self._auto()]) or {})
+
+    def test_manual_sites_are_not_reported(self):
+        """manual 站点没有服务端证据，last_done_date 长期不动是设计如此。"""
+        self._seed("m", 3)
+        self.assertIsNone(_collect_gaps(
+            self.cfg, [Recipe(id="m", name="m", mode="manual")]))
+
+    def test_only_filter_is_respected(self):
+        self._seed("qoder", 3)
+        self._seed("trae", 3)
+        gaps = _collect_gaps(self.cfg, [self._auto("qoder"), self._auto("trae")],
+                             only=["trae"])
+        self.assertEqual(list(gaps or {}), ["trae"])
+
+    def test_disabled_site_is_ignored(self):
+        self._seed("qoder", 3)
+        r = self._auto()
+        r.enabled = False
+        self.assertIsNone(_collect_gaps(self.cfg, [r]))
+
+    def test_no_gap_returns_none(self):
+        self._seed("qoder", 1)
+        self.assertIsNone(_collect_gaps(self.cfg, [self._auto()]))
+
+    def test_reported_only_once_per_day(self):
+        """一天三个触发是三个**独立进程** —— 同样的话响三遍，人就开始忽略告警。"""
+        self._seed("qoder", 3)
+        self.assertIsNotNone(_collect_gaps(self.cfg, [self._auto()]))
+        self.assertIsNone(_collect_gaps(self.cfg, [self._auto()]),
+                          "同一天第二次运行不该再报一遍同样的缺口")
+
+    def test_nothing_is_reported_on_a_skipped_day(self):
+        """今天本来就不该跑（周末）时，别拿昨天的洞刷存在感。"""
+        self._seed("qoder", 3)
+        with mock.patch("checkin.__main__.scheduler.should_skip_today",
+                        return_value="周末不执行"):
+            self.assertIsNone(_collect_gaps(self.cfg, [self._auto()]))
+
+    # --- 口径必须按**真实配方**写，不能按测试里的便利写 -----------------
+
+    def test_auto_mode_is_also_covered(self):
+        """`auto`（浏览器驱动）同样能领到，同样该报缺口。"""
+        self._seed("qoder", 3)
+        self.assertIn("qoder", _collect_gaps(self.cfg, [self._auto(mode="auto")]) or {})
+
+    def test_real_project_sites_are_all_reported(self):
+        """**直接读真实配方**（2026-10-17 这条差点又是一次静默失效）：
+
+        三个站点的 mode 都是 `client`，而第一版口径写成"只认 auto" ⇒
+        生产环境永远不报缺口，单元测试却全绿。这里用真实配方 + 造好的缺口，
+        断言**每一个启用中的非 manual 站点都在结果里**。
+        """
+        cfg, recipes = load_config(str(PROJECT_ROOT))
+        cfg.state_path = self.state_path                  # 别碰真实状态库
+        enabled = [r for r in recipes if r.enabled and r.mode != "disabled"]
+        self.assertTrue(enabled, "真实配方里应当有启用中的站点")
+        for r in enabled:
+            self._seed(r.id, 3)
+        gaps = _collect_gaps(cfg, recipes) or {}
+        expected = {r.id for r in enabled if r.mode != "manual"}
+        self.assertEqual(set(gaps), expected,
+                         "启用的非 manual 站点必须全部参与缺口回溯")
+
+    def test_real_project_modes_are_all_known(self):
+        """将来配方里出现新 mode 时，必须**显式决定**它要不要报缺口 ——
+        漏判会让它静默落在"不报"那一侧，又是一次看不见的失效。"""
+        _, recipes = load_config(str(PROJECT_ROOT))
+        for r in recipes:
+            self.assertIn(r.mode, {"auto", "client", "manual", "disabled"},
+                          f"新 mode={r.mode} 必须显式决定是否参与缺口回溯")
 
 
 class TestTaskInstall(unittest.TestCase):

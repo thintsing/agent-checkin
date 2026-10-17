@@ -56,23 +56,44 @@ _BAD_PREFIX = ("CODEBUDDY_", "CLAUDE_", "WORKBUDDY_")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+# GetExitCodeProcess 对**还没退出**的进程返回这个值（Windows 就这么定义）
+_STILL_ACTIVE = 259
+
+
 def pid_alive(pid: int) -> bool:
-    """这个 PID 还在吗 —— 用 Windows `OpenProcess`，纯 API、不起子进程。
+    """这个 PID 还在吗 —— 用 Windows `OpenProcess` + `GetExitCodeProcess`，不起子进程。
 
     **为什么不用 `os.kill(pid, 0)`**：实测在本机（含 Agent 沙箱）它对**所有** PID
     都抛 OSError（进程隔离），会把活进程全判成死的。2026-10-15 就因此把三个活着的
-    调试端口误判成僵尸。`OpenProcess` 在沙箱内外表现一致：拿到句柄 = 活着，
-    `GetLastError 87`（参数无效）＝ 那个进程没了。
+    调试端口误判成僵尸。
 
-    拿不准（API 不可用 / 非 Windows）时返回 True —— **宁可漏判死亡，也别把活的说成死的**。
+    ⚠ **拿到句柄 ≠ 进程活着**（2026-10-17 实测，这条守卫当时竟然是绿的）：
+    `OpenProcess` 对**已经退出、但句柄还被别人握着**的"僵尸"进程照样返回句柄 ——
+    只要父进程没关掉 `Popen` 的句柄，进程对象就不会销毁，于是句柄一直拿得到。
+    实测 6 个确认已退出的 PID，`OpenProcess` **六个全部成功**。
+    ⇒ 只看句柄的话 `pid_alive` 恒为 True，而它是 `RunLock._is_stale()` 判活的
+    唯一依据：**锁永远不会被判陈旧** —— 机制从写下那一刻起就是死的，
+    却因为"代码在、测试绿"而看不出来（本项目第二次栽在"名存实亡"上，见 MEMORY.md）。
+    ⇒ 必须再调 `GetExitCodeProcess`：只有退出码仍是 `STILL_ACTIVE`(259) 才算活着。
+
+    拿不准（API 不可用 / 非 Windows / 取不到退出码）时返回 True ——
+    **宁可漏判死亡，也别把活的说成死的**（后者会并发重复签到，代价大得多）。
     """
     try:
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
-        if handle:
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        open_process.restype = ctypes.c_void_p
+        handle = open_process(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_uint32()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True                     # 取不到退出码 ⇒ 拿不准，当活着
+            return code.value == _STILL_ACTIVE
+        finally:
             kernel32.CloseHandle(handle)
-            return True
-        return False
     except Exception:                                   # noqa: BLE001
         return True
 
