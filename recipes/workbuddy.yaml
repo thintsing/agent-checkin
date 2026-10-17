@@ -129,9 +129,26 @@ client:
   #   但触发前提很窄（端口绑定失败 = 不重启必然漏签），且签完不关（close_after: false）。
   restart_on_bind_failure: true
 
+  # ---- 端口的三种坏法，各自的自愈手段（2026-10-17 补齐后两种）----
+  #   ① 僵尸 socket（LISTENING 记在**已死 PID** 名下）⇒ 自动换端口（写回本文件）。
+  #   ② 命令行里**完全没有**端口参数 ⇒ 对策两条：
+  #        repair_launch_entry  把启动入口改回带端口（只影响**下一次**启动）。
+  #        repair_autostart     连**注册表自启动项**一起修 —— 这个客户端有开机自启，
+  #                             那一路由 Run 键拉起，根本不经过快捷方式（详见 tools 的注释）。
+  # ⚠ `restart_when_portless` 本站点**刻意不开**（默认 false）：
+  #   这个客户端就是 WorkBuddy 自己的桌面进程 —— 把它杀掉等于掐断我们正在进行的对话，
+  #   还会连带关掉用户正在看的聊天窗口。所以它只能走"修好入口，等你下次重启"这条路，
+  #   由每天的三次触发去补领。这是**唯一一处**不能自动重启的站点。
+  repair_launch_entry: true
+  repair_autostart: true
+  restart_when_portless: false
+
   # ---- 重启前的"忙闲"把关（用户 2026-10-14 要求）----
   # 用户原话："需要重启的话也不要直接重启，看看有没有在执行的任务，有的话就先不重启，
   # 挂载任务监测着，等任务执行完了再重启。"
+  # ⚠ 2026-10-17 修了一处"名存实亡"：`busy_js` 必须连着端口才能跑，而"端口不通"
+  #   正是我们唯一想重启的场景 ⇒ 这条关此前**永远**返回"看不清" ⇒ 授权过的一次也没重启成。
+  #   现在 busy_js 取不到结论时会退到**进程 CPU 旁证**（见下面的 cpu_window_sec）。
   # 只有判定为**空闲**才放行；忙则挂载监测（最多 wait_busy_sec）；**看不清同样不重启**
   # （宁可漏签，也不能赌一把打断用户正在跑的任务）。
   #
@@ -179,6 +196,12 @@ client:
       })()
     # 监测上限（秒）。超时则降级提醒，绝不无限等。
     wait_busy_sec: 1800
+    # 端口不通时 `busy_js` 必然取不到结论（它得连着调试端口才能跑）⇒ 退到**进程 CPU 旁证**：
+    # 观测窗 `cpu_window_sec` 内，该客户端全部进程合计消耗的 CPU（核·秒）小于
+    # `idle_cpu_sec` 才算空闲。阈值刻意留大 —— Electron 空闲也会有心跳、有时还会
+    # 跑后台索引；宁可判"忙"多等一会儿，也不能把正在干活的实例干掉。
+    cpu_window_sec: 5.0
+    idle_cpu_sec: 1.0
 
   # electron-builder 的 per-user 安装，路径固定，没有 Qoder 那种 `.qoder-versions\*\` 滚动目录。
   exe: '%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe'

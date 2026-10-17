@@ -1,0 +1,14 @@
+{
+  "_comment": "复制成 data/notify.json 并填好三个值即可开启 QQ 推送（data/ 已被 .gitignore 忽略，凭据不会进仓库）。",
+  "_steps": [
+    "1. 在 QQ 开放平台（q.qq.com）建一个机器人，记下 AppID 与 AppSecret",
+    "2. 给机器人开通「群聊消息」权限并上线；建一个只有你和机器人的群，把机器人拉进去",
+    "3. 在群里 @ 机器人说一句话，然后跑: python tools/qq_bot_openid.py   （它会抓出 group_openid 并自动回填本文件）",
+    "4. 跑一次: python src/checkin/__main__.py --now --only-site <任一站点>   验证群里收到结论"
+  ],
+  "qq_bot": {
+    "app_id": "",
+    "app_secret": "",
+    "group_openid": ""
+  }
+}

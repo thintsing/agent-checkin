@@ -36,16 +36,18 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
+import sys
 import time
 import urllib.request
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..browser.cdp import CDPPage, list_targets
 from ..core import notify, procenv
 from ..core.config import expand
-from ..core.models import CheckinResult, Outcome, Recipe
+from ..core.models import CheckinResult, Outcome, Recipe, RunBudget
 from ..core.state import CST
 from . import Driver
 
@@ -198,13 +200,25 @@ class ClientDriver(Driver):
 
     # ------------------------------------------------------------ 对外入口
 
-    def run(self, recipe: Recipe, cfg, dry_run: bool = False,
-            probe: bool = False) -> CheckinResult:
+    def run(self, recipe: Recipe, cfg, dry_run: bool = False, probe: bool = False,
+            **_) -> CheckinResult:
+        """⚠ 本签名被 AGENTS.md 冻结为跨 Agent 接缝，不能加具名参数。
+
+        "本轮还能等多久"（`RunBudget`）由引擎挂在 `cfg.budget` 上带下来 ——
+        这样既守住了冻结接口，又让 client 驱动能知道整轮还剩多少时间。
+        """
         sid = recipe.id
         c: Dict[str, Any] = dict(recipe.client or {})
         if not c:
             return CheckinResult(sid, Outcome.ERROR,
                                  message="mode=client 但配方里没有 client 段")
+
+        # `budget` 是**整轮共享的时间预算**（引擎挂在 cfg.budget 上带下来）。
+        # None = 老调用方/手工调用，行为与过去完全一致（守候多久全听配方）。
+        budget = getattr(cfg, "budget", None)
+        if not isinstance(budget, RunBudget):
+            budget = None
+        cap = self._first_pass_cap(cfg) if budget is not None else None
 
         port = int(c.get("debug_port", 9337))   # 兜底值仅在配方缺字段时生效；真实值一律读配方
         match = str(c.get("target_match") or "")
@@ -243,52 +257,92 @@ class ClientDriver(Driver):
             # 混为一谈就会白等（2026-10-14 真漏签一天：守候 90 分钟，端口根本没可能出现）。
             port_arg = "--remote-debugging-port=" + str(port)
             if port_arg in running:
-                # ① 命令行**已带**端口参数，却连不上 ⇒ 那次启动的**端口绑定失败**。
-                #    实测成因（Trae CN，2026-10-13 11:54）：用户重启客户端时，旧实例
-                #    11:54:28 才 `app.quit()`、新实例 11:54:29 就起来了 —— 相隔 1 秒，
-                #    旧实例还没释放 9338，新实例 `listen(9338)` 失败后**静默继续跑**
-                #    （不崩、不退出、也不再重试）。此后那个实例整个生命周期都没有端口。
-                #    ⇒ **守候是无用的**：端口不会自己出现，除非用户再重启一次客户端。
-                #    但仍先给一小段静默期 —— 客户端可能刚起来、还没 listen 完，
-                #    那一刻判"绑定失败"会是误判。
-                if self._wait_port(port, self._PORT_BIND_GRACE_SEC, poll=1.0):
-                    log.info("[%s] 端口 %s 延迟就绪（客户端刚启动），接管补领", sid, port)
-                    return self._claim(recipe, c, port, match)
-                # 静默期过了仍不通 ⇒ `listen()` 失败，**不会自愈**（守候再久也没用）。
-                # 用户 2026-10-14 授权"该重启重启" ⇒ 配方开启时自动重启并当场重试。
-                # 但**重启前必须先过"忙闲"关**：客户端有任务在执行就**不重启**，
-                # 改为挂载监测、等它跑完；连忙闲都看不清时同样不重启（宁可漏签也不赌）。
-                if bool(c.get("restart_on_bind_failure")):
-                    if self._safe_to_restart(recipe, c, port, match):
-                        if self._restart_client(c, port):
-                            log.info("[%s] 已自动重启客户端且端口就绪，接管补领", sid)
-                            return self._claim(recipe, c, port, match)
-                    else:
-                        log.warning("[%s] 客户端可能正在执行任务（或看不清），本次不重启", sid)
-                log.warning(
-                    "[%s] 客户端已带 %s 启动但端口连不上 ⇒ 该次启动的端口绑定失败"
-                    "（多为重启时新旧实例交接太近、旧实例未释放端口）。"
-                    "请重启客户端一次即可恢复；本次不守候（守候也不会自愈）", sid, port_arg)
-                self._remind(recipe)
-                return CheckinResult(sid, Outcome.NO_ACTION,
-                                     message="客户端启动时端口绑定失败，请重启客户端后补领",
-                                     detail={"reason": "debug_port_bind_failed",
-                                             "cmdline": running[:200]})
-            wait_sec = int(_float_cfg(c, "wait_port_sec", 0))
-            if wait_sec > 0:
-                log.warning("[%s] 客户端在运行但未开调试端口（%s）；按配方守候端口最多 %ds",
+                # 命令行**已带**本端口参数却连不上 ⇒ 那次启动的**端口绑定失败**。
+                # 详见 `_resume_broken_port` —— 那里还要再分「僵尸」与「没绑上」。
+                return self._resume_broken_port(recipe, cfg, c, port, match,
+                                                budget, cap)
+
+            # ③-b 客户端在跑，但**压根没带端口参数** —— 无端口形态起来的实例
+            #     （开机自启 / 客户端升级后自重启 / 修好快捷方式之前起的那一次）。
+            #     同样不会自愈：调试端口只能在**启动时**绑定，运行中加不上去。
+            #   ⇒ 只做两件有用的事：① 修好启动入口，让它**下次**启动就带端口；
+            #     ② 在预算内守候（用户中途重启客户端我们就接管）；仍未得了就**立刻让位**
+            #     （后面还有别的站点等着跑，见 models.RunBudget）。
+            self._repair_launch_entry(sid, c, cfg)
+            wait_sec = self._wait_budget(c, cfg, "wait_port_sec", budget, cap)
+            if wait_sec >= 1:
+                log.warning("[%s] 客户端在运行但未开调试端口（%s）；按预算守候端口最多 %ds",
                             sid, running[:100], wait_sec)
                 if self._wait_port(port, wait_sec, poll=10):
                     log.info("[%s] 端口 %s 已出现（客户端已被重启），接管补领", sid, port)
                     return self._claim(recipe, c, port, match)
                 log.warning("[%s] 守候 %ds 结束，端口始终未出现", sid, wait_sec)
+            # 走到这里说明"守候没等到"。是否**自行重启**由配方显式授权决定
+            # （`restart_when_portless`），且仍要过"忙闲关" —— 详见 AGENTS.md 铁律 7。
+            if bool(c.get("restart_when_portless")) and self._safe_to_restart(
+                    recipe, c, port, match, budget, cap,
+                    idle_fallback=lambda: self._cpu_busy(c)):
+                if self._restart_client(c, port):
+                    log.info("[%s] 已自动重启客户端且端口 %s 就绪，接管补领", sid, port)
+                    return self._claim(recipe, c, port, match)
             log.warning("[%s] 客户端已在运行且未开调试端口，无法接管，降级为提醒（%s）",
                         sid, running[:120])
             self._remind(recipe)
             return CheckinResult(sid, Outcome.NO_ACTION,
                                  message="客户端正在运行，无法自动接管，已提醒你手动领取",
                                  detail={"reason": "already_running_without_debug_port",
-                                         "waited_sec": wait_sec})
+                                         "waited_sec": wait_sec,
+                                         "pass": budget.pass_index if budget else 0})
+
+    def _resume_broken_port(self, recipe: Recipe, cfg, c: Dict[str, Any], port: int,
+                            match: str, budget: Optional[RunBudget],
+                            cap: Optional[float]) -> CheckinResult:
+        """命令行已带 `--remote-debugging-port=<本端口>`、端口却连不上时的处置。
+
+        成因（2026-10-14 实测，代价是漏签一天）：用户重启客户端时，旧实例
+        `11:54:28` 才 `app.quit()`、新实例 `11:54:29` 就起来了 —— 相隔 1 秒，
+        旧实例还没把 9338 释放完，于是新实例 `listen()` 失败后**静默继续跑**
+        （不崩、不退出、也不再重试）。此后那个实例整个生命周期都没有端口
+        ⇒ **守候是无用的**，端口不会自己出现，除非再重启一次客户端。
+
+        但仍先给一小段静默期：客户端可能刚起来、还没 listen 完，
+        那一刻判"绑定失败"会是误判。
+
+        处置顺序：**先分清两种"不通"**（僵尸 vs 未绑定），再决定是否自行重启：
+          · 僵尸 socket（LISTENING 记在**已死 PID** 名下）⇒ 本端口已经拿不回来，
+            必须**换端口**，否则重启多少次都是同一个死局；
+          · 单纯没绑上 ⇒ 用原端口重启即可。
+        """
+        sid = recipe.id
+        if self._wait_port(port, self._PORT_BIND_GRACE_SEC, poll=1.0):
+            log.info("[%s] 端口 %s 延迟就绪（客户端刚启动），接管补领", sid, port)
+            return self._claim(recipe, c, port, match)
+
+        # 静默期过了仍不通 ⇒ listen() 失败，**不会自愈**。
+        # 用户 2026-10-14 授权"该重启重启" ⇒ 配方开启时自动重启并当场重试，
+        # 但**重启前必须先过"忙闲"关**（详见 `_safe_to_restart`）。
+        if bool(c.get("restart_on_bind_failure")) and self._safe_to_restart(
+                recipe, c, port, match, budget, cap,
+                idle_fallback=lambda: self._cpu_busy(c)):
+            use = port
+            if self._port_is_zombie(port):
+                alt = self._reserve_clean_port(sid, port, cfg)
+                if alt:
+                    log.warning("[%s] 端口 %s 已被僵尸 socket 占死，换用 %s", sid, port, alt)
+                    use = alt
+            if self._restart_client(c, use):
+                log.info("[%s] 已自动重启客户端且端口 %s 就绪，接管补领", sid, use)
+                return self._claim(recipe, c, use, match)
+
+        log.warning(
+            "[%s] 客户端已带 --remote-debugging-port=%s 启动但端口连不上 ⇒ "
+            "该次启动的端口绑定失败（多为重启时新旧实例交接太近、旧实例未释放端口）。"
+            "请重启客户端一次即可恢复；本次不守候（守候也不会自愈）", sid, port)
+        self._remind(recipe)
+        return CheckinResult(sid, Outcome.NO_ACTION,
+                             message="客户端启动时端口绑定失败，请重启客户端后补领",
+                             detail={"reason": "debug_port_bind_failed",
+                                     "pass": budget.pass_index if budget else 0})
 
         # ④ 客户端没在跑 → 我们拉起来，领完再关掉
         exe = self._resolve_exe(c)
@@ -307,6 +361,274 @@ class ClientDriver(Driver):
         finally:
             if bool(c.get("close_after", True)):
                 self._shutdown(port)
+
+    def _busy_state(self, port: int, match: str, c: Dict[str, Any],
+                    idle_fallback: Optional[Callable[[], Optional[bool]]] = None
+                    ) -> Optional[bool]:
+        """取一次忙闲判断：优先 `busy_js`，取不到时可选地求助 `idle_fallback`。
+
+        **为什么要有 fallback（2026-10-17 发现的一处"名存实亡"）**：
+        `busy_js` 必须连着调试端口才能执行 —— 而"端口不通"正是我们唯一想重启的场景。
+        于是这个忙闲关的实际效果是：**永远返回 None ⇒ 永远判定"看不清" ⇒ 从不重启**。
+        用户 2026-10-14 授权的"该重启重启"，从到写下那一刻起就**没能真正执行过一次**。
+
+        这不违反"看不清就不重启"的原则 —— 那条原则约束的是**没有证据时不要赌**；
+        这里补的是一条**本来就该有的证据**（进程 CPU），不是放宽判定。
+        """
+        busy = self._client_busy(port, match, c)
+        if busy is None and idle_fallback is not None:
+            busy = idle_fallback()
+            if busy is not None:
+                log.info("忙闲探测取不到（端口不通），改用进程 CPU 旁证：%s",
+                         "忙" if busy else "空闲")
+        return busy
+
+    @staticmethod
+    def _cpu_script(name: str) -> str:
+        """构造"该客户端全部进程累计 CPU 时间（100ns）"的 PowerShell（抽成纯函数以便可测）。"""
+        safe = name.replace("'", "''")
+        return (
+            "$ns = Get-CimInstance Win32_Process -Filter \"Name = '" + safe + "'\" "
+            "-ErrorAction SilentlyContinue | "
+            "ForEach-Object { [double]$_.KernelModeTime + [double]$_.UserModeTime };"
+            "if ($ns) { '{0}' -f [int64](($ns | Measure-Object -Sum).Sum) }"
+        )
+
+    def _cpu_total(self, name: str) -> Optional[float]:
+        """读一次 CPU 累计秒数；取不到（PowerShell 不可用 / 进程不存在）返回 None。"""
+        if not name:
+            return None
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                                  "-Command", self._cpu_script(name)],
+                                 capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=25,
+                                 creationflags=procenv.NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("CPU 探针失败：%s", e)
+            return None
+        raw = (out.stdout or "").strip().splitlines()
+        if not raw:
+            return None
+        try:
+            return float(raw[-1]) / 10_000_000.0     # 100ns → 秒
+        except ValueError:
+            return None
+
+    def _cpu_busy(self, c: Dict[str, Any]) -> Optional[bool]:
+        """用**进程 CPU** 判断客户端是否在干活 —— 端口不通时唯一还能拿到的旁证。
+
+        判据：一个 `window` 秒的观测窗内，该客户端**全部进程**合计消耗的 CPU 时间
+        是否超过 `idle_cpu_sec`。取舍偏向保守 —— Electron 应用再空闲也会有些许心跳，
+        所以阈值远高于那种噪声；宁可判成"忙"多等一会儿，也不能把正在干活的应用干掉。
+        """
+        probe = c.get("busy_probe") if isinstance(c.get("busy_probe"), dict) else {}
+        name = str(c.get("process_match") or "").strip()
+        if not name:
+            exe = self._resolve_exe(c)
+            name = os.path.basename(exe) if exe else ""
+        if not name:
+            return None
+        window = _float_cfg(probe, "cpu_window_sec", 5.0)
+        thresh = _float_cfg(probe, "idle_cpu_sec", 1.0)
+        before = self._cpu_total(name)
+        if before is None:
+            return None
+        time.sleep(max(0.5, window))
+        after = self._cpu_total(name)
+        if after is None:
+            return None
+        used = max(0.0, after - before)
+        log.debug("CPU 观测窗 %.1fs 内该客户端消耗 %.2f 核·秒（阈值 %.2f）",
+                  window, used, thresh)
+        return used >= thresh
+
+    @staticmethod
+    def _first_pass_cap(cfg) -> Optional[float]:
+        """第一遍（快扫）里单站点等待的上限；读不到配置就用 25 秒。"""
+        try:
+            return float(getattr(cfg.safety, "first_pass_wait_cap_sec", 25) or 25)
+        except (TypeError, ValueError):
+            return 25.0
+
+    def _wait_budget(self, c: Dict[str, Any], cfg, key: str,
+                     budget: Optional[RunBudget],
+                     cap: Optional[float]) -> int:
+        """配方里某个"等待秒数"在**本轮到底能给多少**。
+
+        `budget is None`（手工调用 / 单测）⇒ 原样返回配方值，保持向后兼容。
+        """
+        want = int(_float_cfg(c, key, 0))
+        if budget is None:
+            return max(0, want)
+        return int(budget.clamp(want, cap))
+
+    # --------------------------------------------- 端口本身救不回来 ⇒ 换端口
+
+    # 僵尸羁押：换端口时向上扫描的范围。端口是"一次性资源"，向上找没被沾过的。
+    _PORT_SCAN_SPAN = 60
+
+    @classmethod
+    def _port_is_zombie(cls, port: int) -> bool:
+        """netstat 里有人在 LISTENING，但那个 PID 已经死了 ⇒ 僵尸 socket。
+
+        形态（本项目已遇到三次：9334 / 9335 / 9337）：带端口的实例退出时，监听
+        socket 被某个**继承了句柄的子进程**继续持有，内核 TCP 表里却仍记在**已死 PID**
+        名下。表现为"LISTENING 还在、却连不上也绑不上"，而且**重启机器之前拿不回来**。
+        ⇒ 识别到它就**必须换端口**，同一端口重启多少次都是白搭。
+        """
+        pid = cls._port_listener_pid(port)
+        return pid is not None and not cls._pid_alive(pid)
+
+    @staticmethod
+    def _port_bindable(port: int) -> bool:
+        """这个端口现在能不能被真正 bind —— 唯一可靠的"可用性"判据。
+
+        为什么不用"裸 bind 失败"判僵尸：活跃端口同样绑不上（内存笔记里 9336
+        就报过 10048）。但反过来成立 —— **能 bind 的一定还没被占住**，
+        这一步把"看起来空闲"和"真的空闲"区分开，僵尸也逃不掉。
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+                s.listen(1)
+                return True
+            finally:
+                s.close()
+        except OSError:
+            return False
+
+    def _reserve_clean_port(self, sid: str, port: int, cfg) -> Optional[int]:
+        """挑一个**真能 bind** 的干净端口，并把它写回配方。
+
+        为什么必须写回配方而不是另存一份：`debug_port` 是**单一事实源** ——
+        驱动连接它、`tools/win_shortcut_args.py` 写快捷方式也读它。两边各留一份
+        必然漂移（本项目因"同一结论两处写法"吃过亏）。
+        """
+        for cand in range(port + 1, port + self._PORT_SCAN_SPAN + 1):
+            if self._port_listener_pid(cand) is not None:
+                continue
+            if self._port_alive(cand):          # 有 HTTP 应答 ⇒ 是别人的实例
+                continue
+            if not self._port_bindable(cand):
+                continue
+            if self._write_recipe_port(cfg.root, sid, cand):
+                return cand
+            return None
+        log.warning("[%s] 端口 %s 附近 %d 个候选都不干净，无法自动换端口",
+                    sid, port, self._PORT_SCAN_SPAN)
+        return None
+
+    @staticmethod
+    def _write_recipe_port(root: str, sid: str, port: int) -> bool:
+        """把 `recipes/<sid>.yaml` 里的 `debug_port:` 改成新值（**保留注释与其余内容**）。
+
+        刻意用「行正则」而不是 yaml 重排：配方里大半是**踩坑注释**，重写会把它们
+        冲掉。目标行形如 `  debug_port: 9340`，注释行以 `#` 开头不会命中。
+        原子替换（tmp + os.replace），失败一律只记日志。
+        """
+        path = os.path.join(root or ".", "recipes", f"{sid}.yaml")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            new, n = re.subn(r"^(\s*debug_port\s*:\s*)\d+",
+                             lambda m: m.group(1) + str(port), text, flags=re.M)
+            if n != 1:
+                log.warning("配方 %s 里的 debug_port 有 %d 处（应为 1 处），拒绝改写",
+                            path, n)
+                return False
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(new)
+            os.replace(tmp, path)
+            log.warning("已把 %s 的 debug_port 改写为 %s（端口被僵尸占死，必须换）",
+                        path, port)
+            return True
+        except (OSError, ValueError) as e:
+            log.warning("改写配方端口失败（%s）：%s", path, e)
+            return False
+
+    # ------------------------------------------ 启动入口自愈（下一次就带端口）
+
+    _REPAIR_STAMP = os.path.join("data", "entry_repair.json")
+
+    def _repair_launch_entry(self, sid: str, c: Dict[str, Any], cfg) -> Optional[bool]:
+        """把这个 client 的**启动入口**（快捷方式 / 自启动项）改回带调试端口。
+
+        为什么必须有（2026-10-17 又来一次）：客户端**自升级**后会自己重启一次，
+        重启不吃我们的配方 —— 于是新实例命令行里没有 `--remote-debugging-port`，
+        之后**每天**都接管不了。当天日志原话：
+        `[qoder] 客户端在运行但未开调试端口（...\\.qoder-versions\\0.4.8\\...）`。
+        手工修一次只对"下一次启动"有效，而下次 upgrades 又会把它改回去 ⇒ 必须自动修。
+
+        ⚠ 这是**会动到用户机器**的动作，所以三重门槛：
+          ① 配方必须显式开启 `repair_launch_entry`；
+          ② 同一天同一站点只做一次（戳记录在 `data/entry_repair.json`）；
+          ③ 只调本仓库自己的工具（`tools/win_shortcut_args.py`，带备份可 `--revert`）。
+        """
+        if not bool(c.get("repair_launch_entry")):
+            return None
+        root = str(getattr(cfg, "root", "") or "")
+        if not root or self._repair_done_today(root, sid):
+            return None
+        tool = os.path.join(root, "tools", "win_shortcut_args.py")
+        if not os.path.isfile(tool):
+            log.debug("[%s] 找不到启动入口修复工具，跳过", sid)
+            return None
+        cmds: List[List[str]] = [[sys.executable, tool, "--app", sid]]
+        if bool(c.get("repair_autostart")):
+            cmds.append([sys.executable, tool, "--app", sid, "--autostart"])
+        ok = False
+        for argv in cmds:
+            try:
+                p = subprocess.run(argv, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=90,
+                                   creationflags=procenv.NO_WINDOW)
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning("[%s] 修复启动入口失败：%s", sid, e)
+                continue
+            ok = ok or ("自检通过" in (p.stdout or ""))
+            log.info("[%s] 启动入口修复：%s", sid,
+                     (p.stdout or p.stderr or "").strip().replace("\n", " ")[:200])
+        if ok:
+            log.warning("[%s] 已修好启动入口 —— 客户端下次启动即带调试端口 %s，届时自动接管",
+                        sid, c.get("debug_port"))
+        self._mark_repair_today(root, sid)
+        return ok
+
+    @classmethod
+    def _repair_stamp_path(cls, root: str) -> str:
+        return os.path.join(root, cls._REPAIR_STAMP)
+
+    @classmethod
+    def _repair_done_today(cls, root: str, sid: str) -> bool:
+        try:
+            with open(cls._repair_stamp_path(root), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        return str((data or {}).get(sid) or "") == datetime.now(CST).strftime("%Y-%m-%d")
+
+    @classmethod
+    def _mark_repair_today(cls, root: str, sid: str) -> None:
+        path = cls._repair_stamp_path(root)
+        data: Dict[str, Any] = {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                old = json.load(fh)
+            if isinstance(old, dict):
+                data = old
+        except (OSError, ValueError):
+            pass
+        data[sid] = datetime.now(CST).strftime("%Y-%m-%d")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except OSError as e:
+            log.debug("记录启动入口修复日期失败：%s", e)
 
     # ------------------------------------------------------------ 领取主流程
 
@@ -942,26 +1264,8 @@ class ClientDriver(Driver):
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
-        """PID 是否还活着 —— 用 Windows `OpenProcess`，纯 API、不起子进程。
-
-        **为什么不用 `os.kill(pid, 0)`**：实测在 WorkBuddy 沙箱里它对**所有** PID
-        都抛 OSError（进程隔离），会把活端口全判成僵尸（2026-10-15 真踩到：
-        9336/9338/9339 三个活端口被误判成"监听者已死"）。
-        `OpenProcess` 在沙箱内外一致：句柄拿得到就是活着，拿不到（GetLastError 87）就是死了。
-
-        拿不准（API 本身不可用 / 非 Windows）时返回 True ——
-        **宁可漏判僵尸，也别把好端口说成坏**。
-        """
-        try:
-            kernel32 = ctypes.windll.kernel32
-            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000：只要"进程在不在"的权限
-            handle = kernel32.OpenProcess(0x1000, False, int(pid))
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:                                       # noqa: BLE001
-            return True
+        """PID 是否还活着 —— 实现在 `core.procenv.pid_alive`（同一套判据全项目共用）。"""
+        return procenv.pid_alive(pid)
 
     @classmethod
     def _port_alive(cls, port: int) -> bool:
@@ -993,11 +1297,15 @@ class ClientDriver(Driver):
             用 0.8s 去守候两小时 = 九千次 HTTP 探测，纯属浪费。
         """
         deadline = time.time() + timeout
-        while time.time() < deadline:
+        while True:
             if self._port_alive(port):
                 return True
-            time.sleep(poll)
-        return False
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            # ⚠ 必须按**剩余时间**夹一下：本轮预算常常只剩几秒，而长守候档的 poll 是 10s。
+            #   不夹的话"让我等 1 秒"会真的睡满 10 秒 —— 一路攒下来整轮就跑不动了。
+            time.sleep(min(poll, left))
 
     @staticmethod
     def _wait_target(port: int, match: str, timeout: int) -> Optional[Dict[str, Any]]:
@@ -1247,7 +1555,9 @@ class ClientDriver(Driver):
         return None                      # 表达式返回了别的东西 = 不可信，按不可知
 
     def _wait_client_idle(self, port: int, match: str, c: Dict[str, Any],
-                          timeout: int) -> bool:
+                          timeout: int,
+                          idle_fallback: Optional[Callable[[], Optional[bool]]] = None
+                          ) -> bool:
         """客户端忙时**挂载监测**：轮询到空闲为止，超时则收手。
 
         为什么不在第一次看到"忙"就直接放弃：用户明确要"等任务执行完了再重启"。
@@ -1260,7 +1570,7 @@ class ClientDriver(Driver):
             time.sleep(20)                                  # 别把客户端问得太频
             if time.time() >= deadline:
                 break
-            busy = self._client_busy(port, match, c)
+            busy = self._busy_state(port, match, c, idle_fallback)
             if busy is False:
                 log.info("客户端已空闲，可以安全重启")
                 return True
@@ -1271,11 +1581,20 @@ class ClientDriver(Driver):
         return False
 
     def _safe_to_restart(self, recipe: Recipe, c: Dict[str, Any], port: int,
-                         match: str) -> bool:
+                         match: str, budget: Optional[RunBudget] = None,
+                         cap: Optional[float] = None,
+                         idle_fallback: Optional[Callable[[], Optional[bool]]] = None
+                         ) -> bool:
         """重启前的最后一道关：客户端没在执行任务才允许重启。
 
         三条出路：空闲 ⇒ 放行；忙但等到了空闲 ⇒ 放行；
         忙且等不到 / **看不清** ⇒ 不放行（降级提醒，绝不硬重启）。
+
+        `idle_fallback` 是 busy_js **取不到结论时**的旁证来源（端口不通时必发生）；
+        两条路都是 None 时，这条关仍然一票否决 —— 用户的原话是："看不见就在执行的任务，
+        也不能赌"。详见 `_busy_state` 的说明。
+
+        `budget` / `cap` 用来把"挂载监测的时长"压进本轮预算（不传 = 按配方原值）。
         """
         sid = recipe.id
         probe = c.get("busy_probe")
@@ -1283,7 +1602,7 @@ class ClientDriver(Driver):
             log.warning("[%s] 未配 busy_probe ⇒ 无法判断客户端是否在执行任务，按用户要求不重启", sid)
             return False
 
-        busy = self._client_busy(port, match, c)
+        busy = self._busy_state(port, match, c, idle_fallback)
         if busy is None:
             log.warning("[%s] 忙闲探测不可用（取不到页面或表达式失败），不重启", sid)
             return False
@@ -1291,8 +1610,10 @@ class ClientDriver(Driver):
             return True
 
         wait = int(_float_cfg(probe, "wait_busy_sec", 0))
+        if budget is not None:
+            wait = int(budget.clamp(wait, cap))
         log.info("[%s] 客户端有任务在执行，按配方挂载监测（最多 %ds）", sid, wait)
-        return self._wait_client_idle(port, match, c, wait)
+        return self._wait_client_idle(port, match, c, wait, idle_fallback)
 
     # ------------------------------------------------------------ 杂项
 

@@ -10,7 +10,7 @@ from typing import List, Optional
 from . import jitter
 from . import scheduler
 from .lock import RunLock
-from .models import CheckinResult, FAILURE_OUTCOMES, Outcome, Recipe
+from .models import CheckinResult, FAILURE_OUTCOMES, Outcome, Recipe, RunBudget
 from .state import CST, StateStore
 from ..drivers import Driver, driver_for
 
@@ -105,19 +105,92 @@ class Engine:
         finally:
             lock.release()
 
+    # 第二遍开跑的最低余粮（秒）。低于这个值就不回头了 ——
+    # 补领动辄要几分钟（拉起客户端、等端口），剩十几秒只能收获超时。
+    _MIN_PASS2_SEC = 60
+
     def _run_all(self, targets: List[Recipe], dry_run: bool,
                  probe: bool) -> List[CheckinResult]:
-        results: List[CheckinResult] = []
-        for i, recipe in enumerate(targets):
-            if i > 0 and not (dry_run or probe):
-                gap = jitter.sleep_range(self.cfg.safety.inter_site_gap_range)
-                log.info("站点间隔 %.1fs …", gap)
-                time.sleep(gap)
+        if dry_run or probe:
+            return self._pass(targets, dry_run, probe, None)
 
-            results.append(self._run_one(recipe, dry_run, probe))
-        return results
+        # 整轮总预算 —— **防止一个站点把后面的全部饿死**。
+        # 2026-10-17 三站全军覆没：qoder 卡在"守候端口 5400s"那个分支上，
+        # 排在它后面的 trae / workbuddy **压根没被执行**，而进程还一直在等
+        # ⇒ 连汇总通知都没发出来。详见 models.RunBudget 的说明。
+        sa = self.cfg.safety
+        budget_sec = int(getattr(sa, "round_budget_sec", 0) or 0)
+        deadline = time.monotonic() + budget_sec if budget_sec > 0 else 0.0
+        if budget_sec > 0:
+            log.info("本轮预算 %d 分钟（超时的站点退到第二遍补领）", budget_sec // 60)
 
-    def _run_one(self, recipe: Recipe, dry_run: bool, probe: bool) -> CheckinResult:
+        results = self._pass(targets, dry_run, probe, RunBudget(deadline, 1))
+        pending = [r.site_id for r in results if self._still_worth_retrying(r)]
+        if not pending:
+            return results
+
+        left = RunBudget(deadline, 2).left()
+        if left is not None and left < self._MIN_PASS2_SEC:
+            log.warning("预算只剩 %.0fs（<%ds），本轮不再回头补领：%s",
+                        left, self._MIN_PASS2_SEC, "、".join(pending))
+            return results
+
+        log.info("第一遍 %d/%d 个站点未落实，用剩余预算回头补领：%s",
+                 len(pending), len(results), "、".join(pending))
+        again = [t for t in targets if t.id in pending]
+        second = self._pass(again, dry_run, probe, RunBudget(deadline, 2))
+        # 按第一遍的**顺序**合并 —— 通知/日志读起来要跟站点声明顺序一致
+        merged = {r.site_id: r for r in second}
+        return [merged.get(r.site_id, r) for r in results]
+
+    # 值得回头再试一次的语义。SKIPPED（今天已完成/窗口未到/周末）不该重试，
+    # NEED_LOGIN 重试毫无意义（要的是人去登录），CIRCUIT 本来就是"今天别再碰"。
+    _RETRYABLE = (Outcome.NO_ACTION, Outcome.ERROR)
+
+    def _still_worth_retrying(self, res: CheckinResult) -> bool:
+        """这个站点值不值得占用剩余预算再跑一遍。
+
+        除了看结果语义，还要再看一次**幂等状态** —— 典型反例是 manual 站点：
+        它第一遍返回 NO_ACTION 表示"提醒已发出"，若不看状态就重试，第二遍会被
+        幂等闸门拦成 SKIPPED，反而把一个"我做完了"的结论换成"跳过了"，更难读。
+        """
+        recipe = next((r for r in self.recipes if r.id == res.site_id), None)
+        if res.outcome in (Outcome.NEED_LOGIN, Outcome.CIRCUIT):
+            return False
+        if self.state.done_today(res.site_id):
+            return False
+        if recipe is not None and recipe.mode == "manual" \
+                and self.state.prompted_today(res.site_id):
+            return False
+        return res.outcome in self._RETRYABLE
+
+    def _pass(self, targets: List[Recipe], dry_run: bool, probe: bool,
+              budget: Optional[RunBudget]) -> List[CheckinResult]:
+        """跑一遍站点集合，返回与 `targets` **同序**的结果列表。
+
+        预算挂到 `cfg.budget` 上带下去 —— `Driver.run` 的签名被 AGENTS.md 冻结，
+        不能加参数，详见 core/config.py 里 AppConfig.budget 的说明。
+        """
+        previous = getattr(self.cfg, "budget", None)
+        self.cfg.budget = budget
+        try:
+            results: List[CheckinResult] = []
+            for i, recipe in enumerate(targets):
+                if i > 0 and not (dry_run or probe):
+                    gap = jitter.sleep_range(self.cfg.safety.inter_site_gap_range)
+                    if budget is not None:
+                        left = budget.left()
+                        if left is not None:
+                            gap = min(gap, left)
+                    log.info("站点间隔 %.1fs …", gap)
+                    time.sleep(gap)
+                results.append(self._run_one(recipe, dry_run, probe, budget))
+            return results
+        finally:
+            self.cfg.budget = previous
+
+    def _run_one(self, recipe: Recipe, dry_run: bool, probe: bool,
+                 budget: Optional[RunBudget] = None) -> CheckinResult:
         sid = recipe.id
         sa = self.cfg.safety
         idle = not (dry_run or probe)      # 只有真跑才走闸门；诊断/演练永远放行
@@ -152,6 +225,10 @@ class Engine:
 
         if idle:
             delay = jitter.sleep_range(sa.pre_delay_range)
+            if budget is not None:
+                left = budget.left()
+                if left is not None:
+                    delay = min(delay, left)
             log.info("[%s] 拟人延迟 %.1fs 后执行（%s）", sid, delay, recipe.mode)
             time.sleep(delay)
         else:
@@ -171,6 +248,10 @@ class Engine:
 
             if last.outcome in FAILURE_OUTCOMES and attempts < max_attempts:
                 wait = jitter.backoff_sec(attempts)
+                if budget is not None:
+                    left = budget.left()
+                    if left is not None:
+                        wait = min(wait, left)
                 log.warning("[%s] 失败(%s)，%.0fs 后重试", sid, last.outcome.value, wait)
                 time.sleep(wait)
                 continue

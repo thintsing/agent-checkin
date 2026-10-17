@@ -15,8 +15,10 @@ import logging
 import os
 import random
 import re
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -31,6 +33,7 @@ from checkin.__main__ import (                                # noqa: E402
     _fallback_hint,
     _install_script,
     _print_task,
+    _closing_hint,
     _psq,
     _task_command,
     _uninstall_script,
@@ -50,6 +53,7 @@ from checkin.core.config import (                            # noqa: E402
 from checkin.core.engine import Engine                       # noqa: E402
 from checkin.core.lock import RunLock                        # noqa: E402
 from checkin.core.models import (                            # noqa: E402
+    RunBudget,
     Action,
     CheckinResult,
     Outcome,
@@ -539,6 +543,43 @@ class TestRunLock(unittest.TestCase):
     def test_context_manager_releases(self):
         with RunLock(self.path):
             self.assertFalse(RunLock(self.path).acquire())
+        self.assertTrue(RunLock(self.path).acquire())
+
+    def _write_lock(self, pid, ts=None):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"pid": pid, "ts": int(time.time()) if ts is None else ts}, fh)
+
+    @staticmethod
+    def _a_dead_pid():
+        """拿一个**确定已经退出**的 PID —— 比硬编码某个数字可靠得多。"""
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        return p.pid
+
+    def test_lock_held_by_a_dead_process_is_reclaimed_immediately(self):
+        """**回归（2026-10-17 实测）**：进程被杀/崩掉时 `release()` 不会执行，锁文件留下。
+
+        原先只按时间判陈旧（30 分钟）⇒ 进程早就没了、锁还压着半小时，这期间每一次运行
+        （含兜底与收尾触发）都被"另一实例正在运行"整轮跳过，**且不报错不提醒**。
+        现在持锁进程不在了就视为陈旧，下一轮立刻能接上。
+        """
+        dead = self._a_dead_pid()
+        self._write_lock(dead, ts=int(time.time()))                   # 时间戳是**现在**
+        self.assertTrue(RunLock(self.path)._is_stale(),
+                        "持锁进程已死 ⇒ 即便时间戳是刚刚也算陈旧")
+        self.assertTrue(RunLock(self.path).acquire(), "陈旧锁必须能被立刻接管")
+
+    def test_lock_held_by_a_live_process_is_respected(self):
+        """反过来：持锁进程还活着 ⇒ **必须**让路，防的是并发重复签到。"""
+        self._write_lock(os.getpid(), ts=int(time.time()))
+        self.assertFalse(RunLock(self.path)._is_stale())
+        self.assertFalse(RunLock(self.path).acquire())
+
+    def test_unparsable_lock_file_counts_as_stale(self):
+        """锁文件写坏了 ⇒ 当陈旧处理（宁可接管，也不能永久卡死）。"""
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertTrue(RunLock(self.path)._is_stale())
         self.assertTrue(RunLock(self.path).acquire())
 
 
@@ -1231,7 +1272,7 @@ class TestClientDriverLogic(unittest.TestCase):
         2026-10-15 实测：os.kill 把 9336/9338/9339 三个**活**端口全判成"监听者已死"，
         而 OpenProcess 准确区分死活（句柄拿得到 = 活，GetLastError 87 = 死）。
         """
-        with mock.patch("checkin.drivers.client_claim.ctypes") as C:
+        with mock.patch("checkin.core.procenv.ctypes") as C:
             C.windll.kernel32.OpenProcess.return_value = 4321     # 拿到句柄 = 活着
             self.assertTrue(self.d._pid_alive(12108))
             C.windll.kernel32.OpenProcess.return_value = None     # 拿不到 = 死了
@@ -1239,7 +1280,7 @@ class TestClientDriverLogic(unittest.TestCase):
 
     def test_pid_alive_degrades_to_true_on_api_failure(self):
         """API 本身不可用时返回 True —— 宁可漏判僵尸，也别把好端口说成坏。"""
-        with mock.patch("checkin.drivers.client_claim.ctypes") as C:
+        with mock.patch("checkin.core.procenv.ctypes") as C:
             C.windll.kernel32.OpenProcess.side_effect = OSError("blocked")
             self.assertTrue(self.d._pid_alive(12108))
 
@@ -2281,12 +2322,15 @@ class TestTaskInstall(unittest.TestCase):
                 self.assertIn(f"-At {_psq(_wake_hint(start))}", _install_script(cfg))
                 self.assertNotIn("-RandomDelay", _install_script(cfg))
 
-    def test_has_a_fallback_trigger_after_the_window(self):
-        """必须有两个触发器：主触发 + 窗口结束后的兜底触发。
+    def test_has_three_triggers_covering_the_whole_day(self):
+        """必须有三个触发器：主触发 + 窗口结束后的兜底 + 当夜收尾。
 
-        2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默判 missed，
-        程序**根本没启动**（当天连日志文件都没有，`NumberOfMissedRuns=1`）。
-        只靠 `-StartWhenAvailable` 救不了未登录场景 ⇒ 必须有第二次机会。
+        **三个都有血案在身：**
+        · 兜底（t2）—— 2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默
+          判 missed，程序**根本没启动**（当天连日志文件都没有，`NumberOfMissedRuns=1`）。
+          只靠 `-StartWhenAvailable` 救不了未登录场景 ⇒ 必须有第二次机会。
+        · 收尾（t3）—— 2026-10-17：前两次都撞上"客户端还在无端口形态"（自升级后自重启
+          留下来的），那是**当天不会自愈**的状态；到夜里再试一次才可能自己了结。
         已成功的站点由程序自身幂等拦下，不会重复签到。
         """
         for start, end in (("10:05", "12:30"), ("07:40", "11:20"), ("09:00", "09:30")):
@@ -2294,7 +2338,30 @@ class TestTaskInstall(unittest.TestCase):
                 s = _install_script(_cfg(start, end))
                 self.assertIn(f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(_wake_hint(start))}", s)
                 self.assertIn(f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(_fallback_hint(end))}", s)
-                self.assertIn("$t=@($t1,$t2)", s, "两个触发器必须都注册，而不是只注册第一个")
+                self.assertIn(f"$t3=New-ScheduledTaskTrigger -Daily -At {_psq(_closing_hint(end))}", s)
+                self.assertIn("$t=@($t1,$t2,$t3)", s,
+                              "三个触发器必须都注册，漏注册就不会真的生效")
+
+    def test_closing_trigger_lands_in_the_evening(self):
+        """收尾触发必须落在傍晚之后 —— 它要的是"距离最后一次失败已经过去很久"。
+
+        窗口设到很晚（>=20 点）时就顺延一小时，绝不跑到窗外去。
+        """
+        self.assertEqual(_closing_hint("12:30"), "21:00")
+        self.assertEqual(_closing_hint("19:00"), "21:00")
+        self.assertEqual(_closing_hint("21:30"), "22:30")
+        self.assertEqual(_closing_hint("坏值"), "21:00")
+
+    def test_closing_trigger_is_not_before_the_fallback(self):
+        """收尾必须严格晚于兜底 —— 顺序反了就失去"最后再给一次机会"的意义。"""
+
+        def _min(s):
+            h, m = s.split(":")
+            return int(h) * 60 + int(m)
+
+        for end in ("12:30", "11:20", "09:30", "21:30"):
+            with self.subTest(window_end=end):
+                self.assertGreater(_min(_closing_hint(end)), _min(_fallback_hint(end)))
 
     def test_print_task_matches_install_script(self):
         """`--print-task` 展示的脚本必须和 `--install-task` 实际注册的一致。
@@ -2309,9 +2376,10 @@ class TestTaskInstall(unittest.TestCase):
             _print_task(self.cfg)
         out = buf.getvalue()
         s = _install_script(self.cfg)
-        # 关键片段两边都要有（触发器、兜底时刻）
+        # 关键片段两边都要有（主唤醒、兜底、收尾时刻）
         for frag in (_wake_hint(self.cfg.schedule.window_start),
-                     _fallback_hint(self.cfg.schedule.window_end)):
+                     _fallback_hint(self.cfg.schedule.window_end),
+                     _closing_hint(self.cfg.schedule.window_end)):
             self.assertIn(frag, out)
             self.assertIn(frag, s)
 
@@ -2880,6 +2948,396 @@ class TestClientStaleSnapshot(unittest.TestCase):
         self.assertEqual(self._run().outcome, Outcome.SUCCESS)
         self.assertEqual(state["reloads"], 1)
         self.assertEqual(state["clicks"], 1)
+
+
+class TestRoundBudget(unittest.TestCase):
+    """整轮时间预算 + 两遍扫描 —— **2026-10-17 三站全军覆没的回归守卫**。
+
+    当天的事故：站点串行执行，qoder 卡在"守候端口 5400s"那个分支上，
+    排在它后面的 trae / workbuddy **压根没被执行**；因为进程一直在等，
+    连最后的汇总通知都发不出来 —— 用户只能自己翻日志才发现整天没签到。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = os.path.join(self.tmp.name, "state.json")
+
+    def _engine_cfg(self, budget=120, cap=1):
+        cfg = AppConfig(root=str(PROJECT_ROOT), chrome=ChromeConfig(),
+                        safety=SafetyConfig(), state_path=self.state_path,
+                        log_dir=os.path.join(self.tmp.name, "logs"))
+        cfg.safety.pre_delay_range = [0.0, 0.0]        # 拟人延迟会拖慢测试，这里不需要
+        cfg.safety.inter_site_gap_range = [0.0, 0.0]
+        cfg.safety.round_budget_sec = budget
+        cfg.safety.first_pass_wait_cap_sec = cap
+        return cfg
+
+    @staticmethod
+    def _client(sid, port, **over):
+        client = {"debug_port": port, "wait_port_sec": 5400}
+        client.update(over)
+        return Recipe.from_dict({"id": sid, "name": sid, "enabled": True,
+                                 "mode": "client", "client": client})
+
+    def test_a_stuck_site_does_not_starve_the_others(self):
+        """**本组最重要的一条**：第一个站点卡住，后面的站点必须照常签到。
+
+        断言落在"后面的站点真的被 Claim 过"这个**可观测行为**上 ——
+        只看"轮次在预算内结束"是不够的：卡住时也会结束，只是白白漏了一整天。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+
+        stuck = self._client("stuck", 9336)
+        fine = self._client("fine", 9337)
+        ok = CheckinResult("fine", Outcome.SUCCESS, message="ok")
+
+        # 记录**调用顺序**：这才是不被饿死的结构性证据 ——
+        # 先快速放弃卡住的站点 → 服务能服务的 → 最后才回头啃硬骨头。
+        # （只看"轮次结束"是抓不到回归的：卡住时也一样会结束，只是别人没被服务过。）
+        order: list = []
+
+        def _fake_wait(_port, timeout, poll=0.8):
+            order.append(("wait", _port, timeout))
+            time.sleep(min(0.05, timeout / 1000.0))   # 等比缩小的"等待"，保留时序关系
+            return False
+
+        def _fake_claim(_recipe, _c, port, _match):
+            order.append(("claim", _recipe.id))
+            return ok
+
+        with mock.patch.object(ClientDriver, "_log_state", return_value=None), \
+             mock.patch.object(ClientDriver, "_port_alive", side_effect=lambda p: p == 9337), \
+             mock.patch.object(ClientDriver, "_app_running", return_value="cmdline"), \
+             mock.patch.object(ClientDriver, "_wait_port", side_effect=_fake_wait), \
+             mock.patch.object(ClientDriver, "_remind"), \
+             mock.patch.object(ClientDriver, "_claim", side_effect=_fake_claim):
+            results = Engine(self._engine_cfg(budget=120, cap=7), [stuck, fine]).run(now=True)
+
+        self.assertEqual([r.site_id for r in results], ["stuck", "fine"])
+        self.assertEqual([e[0] for e in order], ["wait", "claim", "wait"],
+                         "必须是「先让位 → 服务别人 → 回头补领」，不能一头扎进等待里")
+        self.assertLessEqual(order[0][2], 7, "第一次尝试的等待必须被 cap 夹住")
+        self.assertGreater(order[2][2], 7, "回头补领时才允许放开等")
+        self.assertIs(results[1].outcome, Outcome.SUCCESS)
+        self.assertIs(results[0].outcome, Outcome.NO_ACTION)
+
+    def test_first_pass_wait_is_capped_so_the_round_cannot_hang(self):
+        """第一遍里单站点的等待必须被压到 cap，而不是吃掉配方的 5400s。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        cfg = self._engine_cfg(budget=120, cap=7)
+        cfg.budget = RunBudget(0.0, 1)          # 模拟引擎已在第一遍
+        with mock.patch.object(ClientDriver, "_log_state", return_value=None), \
+             mock.patch.object(ClientDriver, "_port_alive", return_value=False), \
+             mock.patch.object(ClientDriver, "_app_running", return_value="cmdline"), \
+             mock.patch.object(ClientDriver, "_wait_port", return_value=False) as wp, \
+             mock.patch.object(ClientDriver, "_remind"):
+            ClientDriver().run(self._client("s", 9336), cfg)
+        self.assertEqual(wp.call_args[0][1], 7,
+                         "wait_port_sec=5400 也要先被 first_pass_wait_cap_sec 夹住")
+
+    def test_budget_left_overrides_everything_when_time_runs_out(self):
+        """预算快耗尽时，等待必须让步 —— 否则永远出不了结论、也发不出通知。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        cfg = self._engine_cfg(cap=25)
+        cfg.budget = RunBudget(time.monotonic() + 3, 2)   # 第二遍，只剩 3 秒
+        with mock.patch.object(ClientDriver, "_log_state", return_value=None), \
+             mock.patch.object(ClientDriver, "_port_alive", return_value=False), \
+             mock.patch.object(ClientDriver, "_app_running", return_value="cmdline"), \
+             mock.patch.object(ClientDriver, "_wait_port", return_value=False) as wp, \
+             mock.patch.object(ClientDriver, "_remind"):
+            ClientDriver().run(self._client("s", 9336), cfg)
+        self.assertLessEqual(wp.call_args[0][1], 3)
+
+    def test_no_budget_keeps_the_recipe_value(self):
+        """没给预算（手工调用 / 老调用方）⇒ 行为与改造前完全一致。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        cfg = AppConfig(root=str(PROJECT_ROOT), chrome=ChromeConfig(),
+                        safety=SafetyConfig(), state_path=self.state_path,
+                        log_dir=os.path.join(self.tmp.name, "logs"))
+        self.assertIsNone(getattr(cfg, "budget", None))
+        with mock.patch.object(ClientDriver, "_log_state", return_value=None), \
+             mock.patch.object(ClientDriver, "_port_alive", return_value=False), \
+             mock.patch.object(ClientDriver, "_app_running", return_value="cmdline"), \
+             mock.patch.object(ClientDriver, "_wait_port", return_value=True), \
+             mock.patch.object(ClientDriver, "_claim",
+                               return_value=CheckinResult("s", Outcome.SUCCESS)):
+            res = ClientDriver().run(self._client("s", 9336), cfg)
+        self.assertIs(res.outcome, Outcome.SUCCESS)
+
+    def test_pass_is_recorded_in_the_result_detail(self):
+        """结算时把"这是第几遍"带出来 —— 排障时一眼看出有没有走到补领。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        cfg = self._engine_cfg()
+        cfg.budget = RunBudget(0.0, 2)
+        with mock.patch.object(ClientDriver, "_log_state", return_value=None), \
+             mock.patch.object(ClientDriver, "_port_alive", return_value=False), \
+             mock.patch.object(ClientDriver, "_app_running", return_value="cmdline"), \
+             mock.patch.object(ClientDriver, "_wait_port", return_value=False), \
+             mock.patch.object(ClientDriver, "_remind"):
+            res = ClientDriver().run(self._client("s", 9336), cfg)
+        self.assertEqual(res.detail.get("pass"), 2)
+
+    def test_budget_config_defaults_stay_in_sync(self):
+        """`config.yaml` ↔ `SafetyConfig` 两处默认值必须一致。
+
+        这一条是本项目老坑：**失同步是静默的**，只在配置缺失时才暴露。
+        """
+        from checkin.core import config as cfg_mod
+        cfg, _ = cfg_mod.load_config(str(PROJECT_ROOT))
+        self.assertEqual(cfg.safety.round_budget_sec, SafetyConfig.round_budget_sec)
+        self.assertEqual(cfg.safety.first_pass_wait_cap_sec,
+                         SafetyConfig.first_pass_wait_cap_sec)
+        self.assertGreater(cfg.safety.round_budget_sec, 0, "默认必须有预算，否则等于没这道闸")
+
+    def test_clamp_applies_the_role_cap_then_the_budget(self):
+        """两道夹取必须依次生效，且顺序不能反（角色夹快扫、预算夹上限）。"""
+        a = RunBudget(0.0, 1)                              # 不限时 + 快扫
+        self.assertEqual(a.clamp(5400, 25), 25)
+        b = RunBudget(time.monotonic() + 5, 1)             # 只剩 5s + 快扫
+        self.assertLessEqual(b.clamp(5400, 25), 5)         # 期间还会流逝一点点
+        self.assertGreater(b.clamp(5400, 25), 4)
+        c = RunBudget(time.monotonic() + 600, 2)           # 第二遍不再受角色夹
+        self.assertEqual(c.clamp(300, 25), 300)
+        d = RunBudget(time.monotonic() - 10, 2)            # 已经超支
+        self.assertEqual(d.clamp(5400, 25), 0.0, "耗尽了就是 0，不许为负")
+        self.assertEqual(RunBudget(0.0, 1).left(), None)   # 0 = 不限，不是"已耗尽"
+
+
+class TestClientSelfHealGroundwork(unittest.TestCase):
+    """2026-10-17 补的三条自愈路径：僵尸换端口 / CPU 旁证 / 启动入口修复。"""
+
+    def setUp(self):
+        from checkin.drivers.client_claim import ClientDriver
+        self.d = ClientDriver()
+
+    def _root(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        os.makedirs(os.path.join(root, "tools"))
+        with open(os.path.join(root, "tools", "win_shortcut_args.py"), "w") as fh:
+            fh.write("# stub\n")
+        return root
+
+    @staticmethod
+    def _client(sid="demo", **over):
+        client = {"debug_port": 9338, "process_match": "Demo.exe", "wait_port_sec": 0}
+        client.update(over)
+        return Recipe.from_dict({"id": sid, "name": sid, "mode": "client", "client": client})
+
+    # ------------------------------------------------ 僵尸端口 ⇒ 换端口
+
+    def test_zombie_port_switches_to_a_clean_port(self):
+        """僵尸 socket 拿不回来 ⇒ **必须用新端口**重启，否则重启多少次都是同一个死局。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        r = self._client(restart_on_bind_failure=True)
+        ok = CheckinResult("demo", Outcome.SUCCESS, message="ok")
+        with mock.patch.object(self.d, "_log_state", return_value=None), \
+             mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running",
+                               return_value='"x.exe" --remote-debugging-port=9338'), \
+             mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(ClientDriver, "_port_is_zombie", return_value=True), \
+             mock.patch.object(self.d, "_reserve_clean_port", return_value=9341), \
+             mock.patch.object(self.d, "_safe_to_restart", return_value=True), \
+             mock.patch.object(self.d, "_restart_client", return_value=True) as rs, \
+             mock.patch.object(self.d, "_claim", return_value=ok):
+            res = self.d.run(r, _cfg())
+        self.assertIs(res, ok)
+        self.assertEqual(rs.call_args[0][1], 9341,
+                         "僵尸端口下仍用旧端口拉起 = 必然再失败一次")
+
+    def test_non_zombie_port_reuses_the_same_port(self):
+        """只是没绑上（端口本身是干净的）⇒ 不必换端口。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        r = self._client(restart_on_bind_failure=True)
+        ok = CheckinResult("demo", Outcome.SUCCESS, message="ok")
+        with mock.patch.object(self.d, "_log_state", return_value=None), \
+             mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running",
+                               return_value='"x.exe" --remote-debugging-port=9338'), \
+             mock.patch.object(self.d, "_wait_port", return_value=False), \
+             mock.patch.object(ClientDriver, "_port_is_zombie", return_value=False), \
+             mock.patch.object(self.d, "_reserve_clean_port") as alt, \
+             mock.patch.object(self.d, "_safe_to_restart", return_value=True), \
+             mock.patch.object(self.d, "_restart_client", return_value=True) as rs, \
+             mock.patch.object(self.d, "_claim", return_value=ok):
+            self.d.run(r, _cfg())
+        alt.assert_not_called()
+        self.assertEqual(rs.call_args[0][1], 9338)
+
+    def test_port_is_zombie_needs_a_dead_listener_pid(self):
+        """僵尸判据 = netstat 有人在 LISTEN **且** 那个 PID 已死。缺一不可。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        with mock.patch.object(ClientDriver, "_port_listener_pid", return_value=4242), \
+             mock.patch.object(ClientDriver, "_pid_alive", return_value=False):
+            self.assertTrue(self.d._port_is_zombie(9338))
+        with mock.patch.object(ClientDriver, "_port_listener_pid", return_value=4242), \
+             mock.patch.object(ClientDriver, "_pid_alive", return_value=True):
+            self.assertFalse(self.d._port_is_zombie(9338), "PID 活着就还没被占死")
+        with mock.patch.object(ClientDriver, "_port_listener_pid", return_value=None):
+            self.assertFalse(self.d._port_is_zombie(9338), "没 LISTENING 行 = 不是僵尸")
+
+    def test_write_recipe_port_keeps_the_comments(self):
+        """换端口要**改写注释里那行**，而不是重写整个 YAML —— 配方大半价值在注释里。"""
+        import yaml
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        os.makedirs(os.path.join(root, "recipes"))
+        path = os.path.join(root, "recipes", "demo.yaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("# 踩坑注释：端口是一次性资源\n"
+                     "client:\n  debug_port: 9338\n  close_after: false\n")
+        self.assertTrue(ClientDriver._write_recipe_port(root, "demo", 9351))
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("# 踩坑注释", text, "注释不能被冲掉")
+        self.assertIn("close_after: false", text)
+        self.assertEqual(yaml.safe_load(text)["client"]["debug_port"], 9351)
+        self.assertNotIn("9338", text)
+
+    def test_write_recipe_port_refuses_files_it_cannot_pin_down(self):
+        """找不到目标行、或出现多处 ⇒ 拒绝改写（宁可不动手，也不能写坏配方）。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        os.makedirs(os.path.join(root, "recipes"))
+        path = os.path.join(root, "recipes", "demo.yaml")
+        for label, body in (("没有目标行", "client:\n  exe: 'x.exe'\n"),
+                            ("目标行不止一处", "client:\n  debug_port: 9338\n"
+                                              "other:\n  debug_port: 9339\n")):
+            with self.subTest(case=label):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                self.assertFalse(ClientDriver._write_recipe_port(root, "demo", 9351))
+                self.assertEqual(open(path, encoding="utf-8").read(), body,
+                                 "拒绝时必须一个字节都不动")
+
+    def test_write_recipe_port_ignores_lines_inside_comments(self):
+        """注释里提到 debug_port 不算一处 —— 配方注释极多，误伤就把知识库冲掉了。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        os.makedirs(os.path.join(root, "recipes"))
+        path = os.path.join(root, "recipes", "demo.yaml")
+        body = ("# 注释里也写了 debug_port: 9330，别改我\n"
+                "client:\n  debug_port: 9338\n")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        self.assertTrue(ClientDriver._write_recipe_port(root, "demo", 9351))
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("# 注释里也写了 debug_port: 9330，别改我", text)
+        self.assertIn("debug_port: 9351", text)
+
+    # ------------------------------------------------ 忙闲关的 CPU 旁证
+
+    def test_busy_gate_accepts_cpu_evidence_when_probe_is_blind(self):
+        """busy_js 取不到结论（端口不通时必然）⇒ **退到进程 CPU 旁证**，空闲才放行。
+
+        没有这条退路，用户 2026-10-14 授权的"该重启重启"就永远执行不了 ——
+        因为 busy_js 恰恰在需要重启的场景里跑不起来（详见 `_busy_state` 的说明）。
+        """
+        r = self._client(busy_probe={"busy_js": "false", "wait_busy_sec": 60})
+        with mock.patch.object(self.d, "_client_busy", return_value=None), \
+             mock.patch.object(self.d, "_wait_client_idle", return_value=False) as mon:
+            self.assertTrue(
+                self.d._safe_to_restart(r, r.client, 9338, "m",
+                                        idle_fallback=lambda: False))
+            self.assertFalse(
+                self.d._safe_to_restart(r, r.client, 9338, "m",
+                                        idle_fallback=lambda: True),
+                "CPU 显示有活干 ⇒ 不许重启")
+        # 忙的时候是"等它跑完"，不是"立刻动手" —— 这条粒度与 TestBusyGate 同口径
+        mon.assert_called_once()
+
+    def test_busy_gate_still_refuses_when_both_sources_are_blind(self):
+        """两条情报都说不清 ⇒ 依然一票否决。**不可知 ≠ 空闲**，这条原则不能松。"""
+        r = self._client(busy_probe={"busy_js": "false", "wait_busy_sec": 60})
+        with mock.patch.object(self.d, "_client_busy", return_value=None):
+            self.assertFalse(self.d._safe_to_restart(r, r.client, 9338, "m",
+                                                     idle_fallback=lambda: None))
+            self.assertFalse(self.d._safe_to_restart(r, r.client, 9338, "m"))
+
+    def test_cpu_busy_threshold(self):
+        """CPU 判据：观测窗内的实际消耗与阈值比较，取不到样本就返回 None（看不清）。"""
+        r = self._client(busy_probe={"cpu_window_sec": 0.01, "idle_cpu_sec": 5})
+        with mock.patch.object(self.d, "_cpu_total", side_effect=[10.0, 12.0]):
+            self.assertFalse(self.d._cpu_busy(r.client), "1 核·秒 < 5 ⇒ 空闲")
+        with mock.patch.object(self.d, "_cpu_total", side_effect=[10.0, 99.0]):
+            self.assertTrue(self.d._cpu_busy(r.client), "89 核·秒 ⇒ 明显在干活")
+        with mock.patch.object(self.d, "_cpu_total", return_value=None):
+            self.assertIsNone(self.d._cpu_busy(r.client), "取不到样本 = 看不清")
+
+    def test_cpu_script_filters_and_sums_both_times(self):
+        s = self.d._cpu_script("Trae CN.exe")
+        self.assertIn("Win32_Process", s)
+        self.assertIn("KernelModeTime", s)
+        self.assertIn("UserModeTime", s)
+        self.assertIn("Name = 'Trae CN.exe'", s)
+        self.assertIn("Measure-Object -Sum", s)
+        # 进程名里的单引号要靠双写转义，否则整段 PS 脚本会被截断
+        self.assertIn("Name = 'a''b'", self.d._cpu_script("a'b"))
+
+    # ------------------------------------------------ 启动入口修复
+
+    def test_repair_entry_runs_once_per_day_and_needs_the_flag(self):
+        """没开启 repair_launch_entry 的站点绝不动手；开启了也**一天只修一次**。
+
+        ⚠ 刻意**不 patch** `_repair_done_today` / `_mark_repair_today` —— 让"一天一次"
+        这个约束真的跑起来：写戳文件 → 第二次读取时才拦得住。
+        （用 mock 把这两步替掉，那条守卫就是个没人守的空壳。）
+        """
+        root = self._root()
+        cfg = AppConfig(root=root, chrome=ChromeConfig(), safety=SafetyConfig(),
+                        state_path=os.path.join(root, "state.json"), log_dir=root)
+        proc = mock.Mock(stdout="自检通过", stderr="", returncode=0)
+        with mock.patch("checkin.drivers.client_claim.subprocess.run",
+                        return_value=proc) as run:
+            self.d._repair_launch_entry("demo", {"repair_launch_entry": True}, cfg)
+            self.assertEqual(run.call_count, 1)
+            self.d._repair_launch_entry("demo", {"repair_launch_entry": True}, cfg)
+            self.assertEqual(run.call_count, 1, "同一天同一站点只修一次")
+            self.d._repair_launch_entry("demo", {}, cfg)
+            self.assertEqual(run.call_count, 1, "没开 repair_launch_entry 的站点不该被碰")
+            self.d._repair_launch_entry("another", {"repair_launch_entry": True}, cfg)
+            self.assertEqual(run.call_count, 2, "别的站点有自己的额度")
+
+    def test_repair_entry_also_fixes_the_autostart_key_when_asked(self):
+        """有开机自启项的站点必须连 Run 键一起修 —— 那条路根本不经过快捷方式。"""
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        cfg = AppConfig(root=root, chrome=ChromeConfig(), safety=SafetyConfig(),
+                        state_path=os.path.join(root, "state.json"), log_dir=root)
+        proc = mock.Mock(stdout="自检通过", stderr="", returncode=0)
+        with mock.patch.object(self.d, "_repair_done_today", return_value=False), \
+             mock.patch.object(ClientDriver, "_mark_repair_today"), \
+             mock.patch("checkin.drivers.client_claim.subprocess.run",
+                        return_value=proc) as run:
+            self.d._repair_launch_entry(
+                "demo", {"repair_launch_entry": True, "repair_autostart": True}, cfg)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("--autostart", run.call_args_list[1][0][0])
+
+    def test_repair_stamp_is_per_site_and_per_day(self):
+        today = datetime.now(CST).strftime("%Y-%m-%d")
+        root = self._root()
+        self.assertFalse(self.d._repair_done_today(root, "demo"))
+        self.d._mark_repair_today(root, "demo")
+        self.assertTrue(self.d._repair_done_today(root, "demo"))
+        self.assertFalse(self.d._repair_done_today(root, "other"),
+                         "别的站点有自己的戳，不能共用")
+        stamp = json.load(open(os.path.join(root, "data", "entry_repair.json"),
+                               encoding="utf-8"))
+        self.assertEqual(stamp["demo"], today)
 
 
 if __name__ == "__main__":

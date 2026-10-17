@@ -1,6 +1,7 @@
 """核心数据结构与判定语义。"""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -131,6 +132,51 @@ class Recipe:
             client=d.get("client") or {},
             safety_overrides=d.get("safety_overrides") or {},
         )
+
+
+@dataclass
+class RunBudget:
+    """**整轮共享**的时间预算 —— 防止一个站点把后面的站点全部饿死。
+
+    为什么必须有（2026-10-17 事故，代价是三站全军覆没）：
+    站点是**串行**跑的，而 client 驱动里有一个长达 `wait_port_sec`（当时 5400 秒）
+    的"守候端口"分支。当天 qoder 卡在这个分支上，于是排在它后面的 trae / workbuddy
+    **根本没被执行** —— 一轮跑完，日志里只有一行 qoder 的警告，另外两站连影子都没有。
+    更隐蔽的是：**那次连通知都没发出去**（进程还在跑，没走到汇总那一步），
+    用户只能自己去看日志才发现。
+
+    ⇒ 结论是两条，缺一不可：
+      ① **一个站点的等待必须有上限**（`pass_index=1` 时压缩到 `cap`）；
+      ② 等待也得让出 CPU —— 卡住的站点**退出本轮**，把后面的站点先跑完，
+         有余力再回来补（`pass_index=2`）。
+
+    `deadline_monotonic`：本轮到期的 `time.monotonic()` 读秒；**0 = 不限**（手动跑的场景）。
+    `pass_index`：1 = 快扫一遍（不许长守候）；2 = 回头补领（允许守候到预算耗尽）。
+    """
+
+    deadline_monotonic: float = 0.0
+    pass_index: int = 1
+
+    def left(self) -> Optional[float]:
+        """还剩多少秒；`None` = 不限（没设预算）。耗尽时返回 0.0，不是负数。"""
+        if not self.deadline_monotonic:
+            return None
+        return max(0.0, self.deadline_monotonic - time.monotonic())
+
+    def clamp(self, want: float, cap_in_pass1: Optional[float] = None) -> float:
+        """把"想要等待的秒数"压到本轮真正能给的范围里。
+
+        两道夹取依次生效，顺序不能反：
+          ① **角色夹**：第一遍（快扫）时压到 `cap_in_pass1` —— 这一步与预算无关，
+             它的目的是让"卡住"的站点**立刻让位**，而不是吃掉整轮预算。
+          ② **预算夹**：无论如何不能超过整轮剩余时间。
+        """
+        if self.pass_index <= 1 and cap_in_pass1 is not None:
+            want = min(want, float(cap_in_pass1))
+        left = self.left()
+        if left is not None:
+            want = min(want, left)
+        return max(0.0, want)
 
 
 @dataclass

@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 
-from .models import Recipe
+from .models import Recipe, RunBudget
 
 
 def expand(value: str) -> str:
@@ -32,6 +32,14 @@ class SafetyConfig:
     max_retries: int = 2
     circuit_break_after: int = 3
     skip_when_done_today: bool = True
+    # **整轮总预算**（秒）：一轮签到从开始到收尾最多花这么久，超时后
+    # 剩下的站点不再"等待"，直接给结论。**0 = 不限**（手动跑时的默认）。
+    # 存在的理由：站点串行执行，而 client 驱动有长达 `wait_port_sec` 的守候分支；
+    # 没有这道闸时，第一个站点能把后面全部站点饿死（2026-10-17 三站全挂）。
+    round_budget_sec: int = 1800
+    # 第一遍（快扫）里单个站点最多能"等待"多少秒。超过就让位给别人，
+    # 自己退到第二遍补领。**刻意很小**：第一遍的职责是"把能签的都签掉"。
+    first_pass_wait_cap_sec: int = 25
 
 
 @dataclass
@@ -59,6 +67,11 @@ class AppConfig:
     log_level: str = "INFO"
     redact_keys: List[str] = field(default_factory=list)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    # **运行时**字段（不是配置项）：本轮共享的时间预算，由 Engine 在每一遍开始前挂上。
+    # 之所以走 cfg 而不是给驱动加参数 —— `Driver.run` 的签名是**跨 Agent 冻结的接缝**
+    # （AGENTS.md 第三节），加参数要惊动另一个 Agent；而"还能等多久"本来就是
+    # 调度层的信息，由引擎统一挂下来最自然。驱动侧统一用 `getattr(cfg, "budget", None)` 读。
+    budget: Optional[RunBudget] = None
 
 
 def load_config(root: str) -> tuple[AppConfig, List[Recipe]]:
@@ -85,6 +98,9 @@ def load_config(root: str) -> tuple[AppConfig, List[Recipe]]:
             max_retries=int(sa.get("max_retries", 2)),
             circuit_break_after=int(sa.get("circuit_break_after", 3)),
             skip_when_done_today=bool(sa.get("skip_when_done_today", True)),
+            round_budget_sec=int(sa.get("round_budget_sec", SafetyConfig.round_budget_sec)),
+            first_pass_wait_cap_sec=int(
+                sa.get("first_pass_wait_cap_sec", SafetyConfig.first_pass_wait_cap_sec)),
         ),
         state_path=expand(st.get("path", "data/state.json")),
         log_dir=expand(lg.get("dir", "logs")),

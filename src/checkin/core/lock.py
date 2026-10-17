@@ -1,12 +1,22 @@
 """单实例互斥锁：防止两个签到进程并发抢跑导致重复请求（对"防封"有意义）。
 
-用独占创建锁文件实现；写入 pid+时间戳，遇陈旧锁（进程已不在或超时）自愈接管。
+用独占创建锁文件实现；写入 pid+时间戳，遇陈旧锁（**持锁进程已不在**或超时）自愈接管。
+
+⚠ **为什么必须判"持锁进程还活着"（2026-10-17 实测补的漏洞）**：
+进程被杀 / 崩掉 / 手工中断时，`release()` 不会被调用，锁文件就留在那里。
+原先只按**时间**判陈旧（30 分钟），于是"进程早就没了、锁还压着 30 分钟" ——
+这半小时里任何一次运行（包括兜底与收尾触发）都会被告知"另一实例正在运行"并**整轮跳过**，
+而且**不报错、不提醒**，正是本项目最忌讳的静默漏签。
+现在先看持锁 PID 在不在：进程没了 ⇒ 锁立即失效，下一轮马上能接上。
+（PID 判活在本机要用 `OpenProcess`，见 `core.procenv.pid_alive` 的说明。）
 """
 from __future__ import annotations
 
 import json
 import os
 import time
+
+from . import procenv
 
 
 class RunLock:
@@ -41,9 +51,13 @@ class RunLock:
                 info = json.load(f)
         except (OSError, ValueError):
             return True
+        # ① 持锁进程已经不在 ⇒ 锁立即失效（进程被杀/崩掉时 release() 不会执行）
+        pid = info.get("pid")
+        if isinstance(pid, int) and pid > 0 and not procenv.pid_alive(pid):
+            return True
+        # ② 兜底：判活拿不准时（API 不可用）还留着超时这一条，避免永久压死
         if int(info.get("ts", 0)) + self.stale_after < time.time():
             return True
-        # 进程已不存在则视为陈旧（Windows 无 os.kill(pid,0) 语义，保守只按时间判断）
         return False
 
     def release(self) -> None:

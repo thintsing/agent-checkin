@@ -118,6 +118,27 @@ def _fallback_hint(window_end: str) -> str:
     return f"{(total // 60) % 24:02d}:{total % 60:02d}"
 
 
+def _closing_hint(window_end: str) -> str:
+    """收尾触发时刻：**当天夜里的最后一次机会**（默认 21:00，与窗口无关）。
+
+    为什么要第三次（2026-10-17 的教训叠加）：主触发可能被判 missed、兜底触发也可能
+    赶上"客户端还在无端口形态"这种**当天不会自愈**的状态 —— 那时的现场是：
+    整天没有任何一次成功，而用户要到翻日志才会发现。
+    夜里再给一次机会，覆盖"用户白天在某个时刻手动重启过客户端"的情形
+    （重启 → 启动入口已被 `repair_launch_entry` 修好 → 带端口 → 我们接管补领）。
+
+    刻意**固定**在傍晚之后、与窗口脱钩：它要的是"距离最后一次失败已经过去很久"，
+    而不是"窗口刚结束"。它和兜底触发一样：已完成的站点被程序自身幂等拦下，不会重复签到。
+    """
+    hh, _, mm = str(window_end).partition(":")
+    try:
+        hour = int(hh)
+    except ValueError:
+        hour = 12
+    # 一律落在傍晚之后；窗口设得很晚时（>=20 点）就顺延一小时，绝不跑到当天之外
+    return "21:00" if hour < 20 else f"{(hour + 1) % 24:02d}:{mm or '00'}"
+
+
 def _plan(cfg) -> int:
     reason = scheduler.should_skip_today(cfg)
     if reason:
@@ -217,6 +238,7 @@ def _print_task(cfg) -> int:
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
     hint = _wake_hint(cfg.schedule.window_start)
     fallback = _fallback_hint(cfg.schedule.window_end)
+    closing = _closing_hint(cfg.schedule.window_end)
 
     print("")
     print("  推荐：直接装（自动处理路径与编码）\n")
@@ -227,7 +249,8 @@ def _print_task(cfg) -> int:
     print(f"         -Argument '\"{entry}\"' -WorkingDirectory \"{_ROOT}\"")
     print(f"    $t1 = New-ScheduledTaskTrigger -Daily -At {hint}")
     print(f"    $t2 = New-ScheduledTaskTrigger -Daily -At {fallback}   # 兜底：窗口结束后 30min")
-    print("    $t = @($t1, $t2)")
+    print(f"    $t3 = New-ScheduledTaskTrigger -Daily -At {closing}   # 收尾：当夜最后一次机会")
+    print("    $t = @($t1, $t2, $t3)")
     print("    $s = New-ScheduledTaskSettingsSet -StartWhenAvailable `")
     print("         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd")
     print("    $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME `")
@@ -242,6 +265,9 @@ def _print_task(cfg) -> int:
     print(f"  另有一个 {fallback} 的**兜底触发**：主触发 missed 时（如开机未登录会话，")
     print("  2026-10-15 就这么漏了一整天）再给一次机会；当天已成功的站点会被")
     print("  程序自身幂等拦下，不会重复签到。")
+    print(f"  {closing} 还有一次**收尾触发**：前两次都可能撞上\"客户端还在无端口形态\"")
+    print("  这种当天不会自愈的状态；夜里再试一次，就够了结绝大多数当天缺口。")
+    print("  三次机会都说\"今日已完成\"时**不会重复弹通知**（否则一天三响，人也麻了）。")
     print("  · 唤醒时刻没开机 → -StartWhenAvailable 会在开机后补跑一次")
     print("  · 只在有登录会话时运行（锁屏算、未登录不算）—— 开浏览器需要桌面会话")
     print("  · 本机 schtasks.exe 被程序黑名单封了，所以走 PowerShell cmdlet")
@@ -274,6 +300,7 @@ def _install_script(cfg) -> str:
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
     hint = _wake_hint(cfg.schedule.window_start)
     fallback = _fallback_hint(cfg.schedule.window_end)
+    closing = _closing_hint(cfg.schedule.window_end)
     return (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute {_psq(_task_python())} "
@@ -282,12 +309,17 @@ def _install_script(cfg) -> str:
         # -At <固定时刻>，**刻意不带 -RandomDelay**：
         #   随机时刻由程序自己在窗口内采样（RandomDelay 会让当日 occurrence
         #   被静默跳过，见本函数 docstring 与 _wake_hint）
-        # **双触发器**（2026-10-15 加固，当天真漏签一天）：主触发 09:55
-        # + 兜底触发（窗口结束 +30min）。主触发 missed 时（如开机未登录会话），
-        # 兜底触发再给一次机会；当天已成功的站点被程序自身幂等拦下，无重复风险。
+        # **三个触发器**（2026-10-17 定型）：
+        #   t1 主触发 09:55  窗口开始前 10 分钟唤醒，由程序在窗口内随机采样后执行
+        #   t2 兜底 13:00    主触发 missed 时（如开机未登录会话，2026-10-15 就这么漏了
+        #                    一整天，当天连日志文件都没有）再给一次机会
+        #   t3 收尾 21:00    前两次都可能撞上"客户端还在无端口形态"这种当天不会自愈的
+        #                    状态；到夜里再试一次，覆盖用户白天手动重启过客户端的情形
+        # 已成功的站点会被程序自身幂等拦下（skip_when_done_today），不会有重复签到。
         f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(hint)};"
         f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(fallback)};"
-        "$t=@($t1,$t2);"
+        f"$t3=New-ScheduledTaskTrigger -Daily -At {_psq(closing)};"
+        "$t=@($t1,$t2,$t3);"
         # -StartWhenAvailable       错过唤醒时刻（休眠/关机）后，开机自动补跑一次
         # -AllowStartIfOnBatteries  笔记本不在电源上也要跑（签到本身极轻）
         # -DontStopIfGoingOnBatteries / -DontStopOnIdleEnd
@@ -483,8 +515,14 @@ def main(argv=None) -> int:
         return 1
 
     if not (args.dry_run or args.probe):
-        # root 传进去：`data/notify.json` 存在时会顺带推到 QQ（未配置则静默跳过）
-        notify.notify_results(results, root=cfg.root)
+        # 三次机会里往往只有第一次有实质结果 —— 后面两次多半是"今日已完成"的 skipped。
+        # 此时**不弹通知**：一天响三次同样的"已完成"会把警告淹没，用户反而开始忽略它。
+        # 只有当次真的做了动作（成功/已签/提醒/出错…）才通知；结论照样写进日志与状态。
+        if any(r.outcome.value != "skipped" for r in results):
+            # root 传进去：`data/notify.json` 存在时会顺带推到 QQ（未配置则静默跳过）
+            notify.notify_results(results, root=cfg.root)
+        else:
+            logger.info("全部站点今日已完成/无需动作，本次不重复通知（可用 --status 查看）")
     else:
         print(notify.summary(results))
 

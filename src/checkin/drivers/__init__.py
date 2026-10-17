@@ -11,6 +11,12 @@ class Driver:
 
     def run(self, recipe: Recipe, cfg, dry_run: bool = False,
             probe: bool = False) -> CheckinResult:  # pragma: no cover - 接口
+        """执行一个站点的一次签到。
+
+        ⚠ 本签名是**跨 Agent 冻结的接缝**（见 AGENTS.md 第三节），不能加参数。
+        于是"本轮还能等多久"（`core.models.RunBudget`）由引擎挂在 `cfg.budget` 上带下来
+        —— 它是**调度层**才知道的信息，由引擎统一决定，驱动不必自己猜。
+        """
         raise NotImplementedError
 
 

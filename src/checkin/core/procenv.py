@@ -27,6 +27,7 @@ WorkBuddy 以 Electron 运行时启动，会把下面两个变量注入到所有
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 from typing import Dict, List, Optional, Sequence
@@ -53,6 +54,27 @@ _BAD_PREFIX = ("CODEBUDDY_", "CLAUDE_", "WORKBUDDY_")
 # `subprocess.run(["powershell", ...])` 原样还回来（2026-10-08 排查）。
 # 非 Windows 上该常量不存在，取 0 即可（无此概念）。
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def pid_alive(pid: int) -> bool:
+    """这个 PID 还在吗 —— 用 Windows `OpenProcess`，纯 API、不起子进程。
+
+    **为什么不用 `os.kill(pid, 0)`**：实测在本机（含 Agent 沙箱）它对**所有** PID
+    都抛 OSError（进程隔离），会把活进程全判成死的。2026-10-15 就因此把三个活着的
+    调试端口误判成僵尸。`OpenProcess` 在沙箱内外表现一致：拿到句柄 = 活着，
+    `GetLastError 87`（参数无效）＝ 那个进程没了。
+
+    拿不准（API 不可用 / 非 Windows）时返回 True —— **宁可漏判死亡，也别把活的说成死的**。
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except Exception:                                   # noqa: BLE001
+        return True
 
 
 def clean_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
