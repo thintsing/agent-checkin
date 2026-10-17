@@ -83,7 +83,7 @@ client:
   #   ⇒ **仅重启 Qoder 拿不回端口**，只能换端口或重启机器（故轮到 9337）。
   #   ⚠ 排查判据：`curl http://127.0.0.1:<port>/json/version` —— 僵尸端口连不上，
   #     而**活跃**端口能连上。注意「裸 bind 失败」**不能**区分两者（活跃端口同样绑不上）。
-  debug_port: 9339
+  debug_port: 9340
   # 活动页在 /json 里的 target url 特征串
   target_match: 'growth-page'
   # 领取按钮文本

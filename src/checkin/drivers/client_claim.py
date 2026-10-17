@@ -543,7 +543,7 @@ class ClientDriver(Driver):
             page.close()
 
     @classmethod
-    def _bridge_call(cls, page: CDPPage, expr: str, timeout: int) -> Optional[Dict[str, Any]]:
+    def _bridge_call_once(cls, page: CDPPage, expr: str, timeout: int) -> tuple:
         """执行配方给的 JS 表达式并取回它 resolve 出来的 JSON。
 
         为什么不用 `evaluate(..., await_promise=True)`（2026-10-06 实测）：
@@ -581,7 +581,7 @@ class ClientDriver(Driver):
             page.evaluate(kick, await_promise=False)
         except Exception as e:                                  # noqa: BLE001
             log.warning("bridge kick 失败：%s", e)
-            return None
+            return None, True                    # 调用层失败 ⇒ **可重试**
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -604,18 +604,46 @@ class ClientDriver(Driver):
                 detail = obj.get("detail")
                 log.warning("bridge 表达式异常：%s%s", obj["error"],
                             (" ｜ 服务端响应体：" + str(detail)) if detail else "")
-                return None
+                return None, False               # 服务端明确报错 ⇒ **别重试**
             val = obj.get("value")
             if isinstance(val, dict):
-                return val
+                return val, False
             if isinstance(val, str):
                 try:
                     parsed = json.loads(val)
                 except ValueError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-            return None
+                    return None, False
+                return (parsed if isinstance(parsed, dict) else None), False
+            return None, False
         log.warning("bridge 表达式超时（%ss）", timeout)
+        return None, True                        # 轮询超时 ⇒ **可重试**
+
+    @classmethod
+    def _bridge_call(cls, page, expr, timeout=25, retries=3):
+        """带重试的 bridge 调用。返回解析后的 dict，或 None（失败）。
+
+        **为什么要重试**（2026-10-17 实测）：客户端被我们**重启拉起**时，窗口在后台，
+        Chromium 会把页面**冻结**（Page Lifecycle → frozen）—— 此时 `await` 的 Promise
+        永远不 resolve，CDP 侧表现为"WebSocket 读超时"。`page.wake()` 能解冻，
+        但**刚拉起的那一两分钟内可能还没稳**，单次调用必然失败。
+        用户手动启动的实例窗口在前台，不会冻结 —— 这就是"我重启就失败、你重启就好"的原因。
+
+        **只有"调用层失败"才重试**（kick 失败 / 轮询超时）；
+        表达式本身报错（服务端 5xx 等）说明链路是通的，重试无意义，直接返回。
+        """
+        for attempt in range(1, max(1, retries) + 1):
+            val, retryable = cls._bridge_call_once(page, expr, timeout)
+            if val is not None:
+                return val
+            if not retryable or attempt >= retries:
+                return None
+            wait = 3 * attempt                          # 3s、6s —— 别把客户端问得太频
+            log.info("bridge 第 %d/%d 次未取到结果，%ds 后重试", attempt, retries, wait)
+            time.sleep(wait)
+            try:
+                page.wake()                             # 重试前再解冻一次
+            except Exception:                                   # noqa: BLE001
+                pass
         return None
 
     # ------------------------------------------------------------ 状态探测

@@ -2572,7 +2572,9 @@ class TestClientBridge(unittest.TestCase):
                 seen.append(expr)
                 return "started"
 
-        ClientDriver._bridge_call(FakePage(), "post('/x', {a: 1})", timeout=0.3)
+        # retries=1：本测试只验"kick 模板没被 f-string 破坏"，轮询超时是预期的，
+        # 没必要真去重试（那会白等 3s+6s，把整个验证门拖慢 10 秒）。
+        ClientDriver._bridge_call(FakePage(), "post('/x', {a: 1})", timeout=0.3, retries=1)
         self.assertIn("post('/x', {a: 1})", seen[0])
 
     def test_bridge_call_unwraps_json_string(self):
@@ -2604,6 +2606,69 @@ class TestClientBridge(unittest.TestCase):
                 return json.dumps({"error": "Cannot read properties of undefined"})
 
         self.assertIsNone(ClientDriver._bridge_call(FakePage(), "S()", timeout=5))
+
+    def test_bridge_call_retries_transient_failure_and_rewakes(self):
+        """调用层失败（页面冻结 / WebSocket 超时）要**重试**，且每次重试前重新 wake。
+
+        2026-10-17 实测：客户端被我们重启拉起时窗口在后台，Chromium 冻结页面，
+        `await` 的 Promise 不 resolve ⇒ 单次调用必失败；用户手动启动（前台）则不会。
+        这就是"我重启就失败、你重启就好"的原因。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+        calls = {"n": 0}
+
+        class FakePage:
+            def __init__(self):
+                self.wakes = 0
+            def wake(self):
+                self.wakes += 1
+
+        page = FakePage()
+
+        def fake_once(p, expr, timeout=25):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return None, True                 # 前两次"调用层失败" ⇒ 可重试
+            return {"code": 0}, False
+
+        with mock.patch.object(ClientDriver, "_bridge_call_once",
+                               side_effect=fake_once), \
+             mock.patch("checkin.drivers.client_claim.time.sleep") as sl:
+            out = ClientDriver._bridge_call(page, "S()", timeout=5)
+        self.assertEqual(out, {"code": 0})
+        self.assertEqual(calls["n"], 3, "失败两次后第三次应成功")
+        self.assertEqual(sl.call_count, 2, "每次重试前都要等待")
+        self.assertEqual(page.wakes, 2, "每次重试前都要重新 wake（解冻）")
+
+    def test_bridge_call_does_not_retry_expression_error(self):
+        """表达式报错（服务端 5xx 等）说明**链路是通的**，重试无意义，必须立刻返回。
+
+        ⚠ 这里**刻意不 mock `_bridge_call_once`** —— 用 FakePage 真实走一遍。
+        之前 mock 了底层，结果"表达式错误也重试"的退化抓不到（只表现为整体变慢 20 秒，
+        没有断言变红）。断言要落在可观测行为上：**一次都不该多等**。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+
+        class FakePage:
+            def __init__(self):
+                self.kicks = 0
+                self.wakes = 0
+            def evaluate(self, expr, await_promise=True):
+                self.kicks += 1
+                if self.kicks == 1:
+                    return "started"
+                return json.dumps({"error": "Request failed with status code 500"})
+            def wake(self):
+                self.wakes += 1
+
+        page = FakePage()
+        with mock.patch("checkin.drivers.client_claim.time.sleep") as sl:
+            self.assertIsNone(ClientDriver._bridge_call(page, "S()", timeout=1, retries=3))
+        # 0.35s 是轮询间隔（正常），重试等待是 3s/6s —— 只要没有"等待级"sleep 就行
+        self.assertTrue(all(c.args and c.args[0] < 1 for c in sl.call_args_list),
+                        f"表达式错误时不该有重试等待，实际 sleep：{sl.call_args_list}")
+        self.assertEqual(page.wakes, 0, "表达式错误时连 wake 都不该发生")
+        self.assertEqual(page.kicks, 2, "只该 kick 一次 + 轮询一次，不该有第二轮")
 
     def test_bridge_call_surfaces_server_error_body(self):
         """HTTP 错误时必须把**服务端响应体**也带回来（2026-10-13 实测教训）。
