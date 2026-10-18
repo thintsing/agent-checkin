@@ -580,18 +580,27 @@ class ClientDriver(Driver):
         cmds: List[List[str]] = [[sys.executable, tool, "--app", sid]]
         if bool(c.get("repair_autostart")):
             cmds.append([sys.executable, tool, "--app", sid, "--autostart"])
+        # 子进程 stdout 走管道时 Python 会退回 **locale 编码**（本机 cp936/GBK）。
+        # 父进程按 utf-8 解 ⇒ 全部降级成 U+FFFD ⇒ ① 日志不可读 ② 下面那道
+        # 「自检通过」子串判定**恒为 False**（2026-10-18 日志里就是乱码，且当天
+        # 从未打出过"已修好启动入口"）。强制让子进程用 utf-8，管道两端才对得上。
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
         ok = False
         for argv in cmds:
             try:
                 p = subprocess.run(argv, capture_output=True, text=True,
                                    encoding="utf-8", errors="replace", timeout=90,
-                                   creationflags=procenv.NO_WINDOW)
+                                   env=env, creationflags=procenv.NO_WINDOW)
             except (OSError, subprocess.SubprocessError) as e:
                 log.warning("[%s] 修复启动入口失败：%s", sid, e)
                 continue
-            ok = ok or ("自检通过" in (p.stdout or ""))
-            log.info("[%s] 启动入口修复：%s", sid,
-                     (p.stdout or p.stderr or "").strip().replace("\n", " ")[:200])
+            # 判据用 **退出码**，不在 stdout 里找中文子串：工具是 `return 0 if ok else 1`，
+            # 退出码不随文案改动、也不受任何编码影响 —— 比字符串匹配硬得多。
+            line = (p.stdout or p.stderr or "").strip().replace("\n", " ")
+            ok = ok or (p.returncode == 0)
+            log.info("[%s] 启动入口修复（exit=%s）：%s", sid, p.returncode,
+                     line[:200])
         if ok:
             log.warning("[%s] 已修好启动入口 —— 客户端下次启动即带调试端口 %s，届时自动接管",
                         sid, c.get("debug_port"))

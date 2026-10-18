@@ -121,6 +121,16 @@ bridge 两段 JS（`status_js` / `claim_js`）各返回一段 **JSON 字符串**
 > 例如 workbuddy 的 status 接口**必须 POST**（GET 会回 404，看着像"接口不存在"），且
 > `/billing/meter/checkin-status` 是恒返回全 0 的**废弃接口**——别被它骗成"永远成功"。
 
+> **跨进程拿结论的规则（2026-10-18 定）**
+> ① **判据用退出码，不用 stdout 里的中文子串。** 本仓库自带工具一律 `return 0 if ok else 1`。
+> 在 stdout 里找文案同时被两件事击穿：文案一改就失效，**编码一糊就失效**——后者已真实发生（见下）。
+> ② **给 Python 子进程显式注入 `PYTHONIOENCODING=utf-8`。** 子进程 stdout 走管道时 Python
+> 会退回 locale 编码（本机 cp936/GBK），父进程按 utf-8 解 ⇒ 全变 `U+FFFD`。**别指望继承**：
+> 开发环境常带这个变量，让它看起来没事；定时任务的 `pythonw` 环境恰恰没有 ⇒ 只有定时跑才糊。
+> ⇒ 写这类守卫必须 `mock.patch.dict(os.environ, {}, clear=True)`，否则是假的绿。
+> ③ PowerShell 子进程同样依赖控制台代码页（见 ②），但**当前所有 PS 脚本输出的都是 ASCII**
+> （进程名 / 路径 / 数字），本机无中文路径 ⇒ 暂不处理，登记在 `HANDOFF.md` 待办。
+
 ---
 
 ## 四、文件所有权

@@ -3642,6 +3642,62 @@ class TestClientSelfHealGroundwork(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertIn("--autostart", run.call_args_list[1][0][0])
 
+    def test_repair_entry_forces_utf8_on_the_child(self):
+        """子进程必须用 utf-8 吐 stdout —— 否则 cp936 字节被按 utf-8 解，
+        日志整行变成 U+FFFD，看不出修复到底动没动手。
+
+        2026-10-18 的日志就是这样：`[qoder] 启动入口修复：\ufffd\ufffd...`，
+        一句中文都没留下。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        cfg = AppConfig(root=root, chrome=ChromeConfig(), safety=SafetyConfig(),
+                        state_path=os.path.join(root, "state.json"), log_dir=root)
+        proc = mock.Mock(stdout="自检通过", stderr="", returncode=0)
+        # ⚠ 必须把环境**清空**再验：本机开发会话天生带 PYTHONIOENCODING=utf-8，
+        # 不清就靠继承也能拿到这个值 ⇒ 守卫永远绿，而真正的受害者（计划任务的
+        # pythonw 环境）恰恰没有这个变量 ⇒ 每天定时跑必乱码。这条 2026-10-18 实测。
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.d, "_repair_done_today", return_value=False), \
+             mock.patch.object(ClientDriver, "_mark_repair_today"), \
+             mock.patch("checkin.drivers.client_claim.subprocess.run",
+                        return_value=proc) as run:
+            self.d._repair_launch_entry("demo", {"repair_launch_entry": True}, cfg)
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs.get("env", {}).get("PYTHONIOENCODING"), "utf-8",
+                         "子进程环境必须**显式**带上 utf-8，不能指望继承父进程的")
+
+    def test_repair_entry_trusts_the_exit_code_not_the_text(self):
+        """成功与否只认**退出码**（工具是 `return 0 if ok else 1`）。
+
+        为什么不能在 stdout 里找"自检通过"：那个判据同时被两件事击穿 ——
+        文案一改就失效，编码一糊就失效。2026-10-18 实测后者已经发生了：
+        入口其实是修好的（工具 stdout 含"参数已正确，跳过"），但乱码让含 自检通过
+        的判定**恒为 False** ⇒ 日志里从头到尾没出现过"已修好启动入口"。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        cfg = AppConfig(root=root, chrome=ChromeConfig(), safety=SafetyConfig(),
+                        state_path=os.path.join(root, "state.json"), log_dir=root)
+        cases = [
+            # (退出码, stdout,                期望是否算修好, 说明)
+            (0, "\ufffd\ufffd\ufffd（编码已糊，看不懂）", True, "糊了但退 0 = 真成功"),
+            (1, "自检通过", False, "文案写着成功，但退 1 = 没修成"),
+            (0, "", True, "静默成功也认"),
+        ]
+        for code, out, want, note in cases:
+            with self.subTest(note=note):
+                proc = mock.Mock(stdout=out, stderr="", returncode=code)
+                with mock.patch.object(self.d, "_repair_done_today",
+                                       return_value=False), \
+                     mock.patch.object(ClientDriver, "_mark_repair_today"), \
+                     mock.patch("checkin.drivers.client_claim.subprocess.run",
+                                return_value=proc):
+                    self.assertIs(self.d._repair_launch_entry(
+                        "demo", {"repair_launch_entry": True}, cfg), want, note)
+
     def test_repair_stamp_is_per_site_and_per_day(self):
         today = datetime.now(CST).strftime("%Y-%m-%d")
         root = self._root()
