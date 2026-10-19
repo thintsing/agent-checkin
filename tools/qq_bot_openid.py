@@ -82,6 +82,78 @@ def save_openid(path, cfg, openid):
     return qq
 
 
+def _listen_once(ws_url, token, app_id, deadline):
+    """开一次 WS 会话、等群里的 @ 事件。
+
+    返回 `group_openid`；到点或连接被断开都返回 None。
+
+    **为什么要能重连**（2026-10-19 实测）：同一个 AppID 只允许**一条** WS 连接。
+    如果这个机器人同时在别处跑（比如 WorkBuddy 的 QQ 通道），我们一上线就会被它
+    挤掉 —— `ws.recv()` 直接抛 `WebSocketConnectionClosedException`。这不是偶发，
+    是**必然**，所以不能像以前那样一断就崩，必须由上层重连。
+    """
+    ws = websocket.create_connection(ws_url, timeout=30)
+    ws.settimeout(30)
+    seq = None
+    last_hb = time.time()
+    identified = False
+    ready_n = 0
+    try:
+        while time.time() < deadline:
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                # 心跳：Hello 之后必须定期发，否则会被服务端断开
+                if identified and time.time() - last_hb > 40:
+                    ws.send(json.dumps({"op": OP_HEARTBEAT, "d": seq}))
+                    last_hb = time.time()
+                continue
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            op, t = msg.get("op"), msg.get("t")
+            if msg.get("s") is not None:
+                seq = msg.get("s")
+            if op == OP_HELLO:
+                ws.send(json.dumps({"op": OP_IDENTIFY, "d": {
+                    "token": "QQBot %s" % token,
+                    "intents": INTENT_GROUP_AND_C2C,
+                    "shard": [0, 1],
+                }}))
+            elif op == OP_DISPATCH and t == "READY":
+                identified = True
+                ready_n += 1
+                print("[OK] 第 %d 次连通，窗口已开 —— 就现在 @（存活通常只有几秒）" % ready_n)
+            elif op == OP_DISPATCH and t == "C2C_MESSAGE_CREATE":
+                # 最常见的操作失误：在**私聊**里给机器人发消息。这里拿不到群 openid，
+                # 而且官方对私聊主动消息限制为每月 4 条，根本撑不住每日推送。
+                print("[!] 收到的是**私聊**消息，里面没有群 openid")
+                print("    => 请到**群里** @ 机器人（不是私聊窗口），并确认群里已开启")
+                print("       「机器人主动在群聊内发言」")
+            elif op == OP_DISPATCH and t in (
+                    "GROUP_AT_MESSAGE_CREATE", "GROUP_ADD_ROBOT"):
+                d = msg.get("d") or {}
+                openid = str(d.get("group_openid") or "").strip()
+                if not openid:
+                    continue
+                return openid
+    except websocket.WebSocketConnectionClosedException:
+        print("[!] 连接被断开（多半是这个机器人同时在别处在线，抢走了同一条 WS）")
+        return None
+    except websocket.WebSocketException as e:
+        print("[!] WS 异常：%s" % e)
+        return None
+    finally:
+        try:
+            ws.close()
+        except Exception:                                       # noqa: BLE001
+            pass
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=default_root(),
@@ -131,69 +203,41 @@ def main():
         return 4
     print("[OK] 网关: %s" % ws_url[:60])
 
-    ws = websocket.create_connection(ws_url, timeout=30)
-    ws.settimeout(30)
+    deadline = time.time() + args.timeout
     print("-" * 58)
-    print(">>> 现在到群里 @ 一下机器人，随便发一句话 <<<")
-    print(">>> 正在等待，最长 %d 秒..." % args.timeout)
+    print(">>> 现在到**群里** @ 一下机器人，随便发一句话 <<<")
+    print(">>>   注意是群里 @，不是给机器人发私聊（私聊消息里没有群 openid）<<<")
+    print(">>> 正在等待，最长 %d 秒（断了会自动重连，别管日志里的重连提示）" % args.timeout)
     print("-" * 58)
 
-    seq = None
-    last_hb = time.time()
-    identified = False
-    deadline = time.time() + args.timeout
-    try:
-        while time.time() < deadline:
-            try:
-                raw = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                # 心跳：Hello 之后必须定期发，否则会被服务端断开
-                if identified and time.time() - last_hb > 40:
-                    ws.send(json.dumps({"op": OP_HEARTBEAT, "d": seq}))
-                    last_hb = time.time()
-                continue
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except ValueError:
-                continue
-            op, t = msg.get("op"), msg.get("t")
-            if msg.get("s") is not None:
-                seq = msg.get("s")
-            if op == OP_HELLO:
-                ws.send(json.dumps({"op": OP_IDENTIFY, "d": {
-                    "token": "QQBot %s" % token,
-                    "intents": INTENT_GROUP_AND_C2C,
-                    "shard": [0, 1],
-                }}))
-            elif op == OP_DISPATCH and t == "READY":
-                identified = True
-                print("[OK] WebSocket 已就绪，等你 @ 机器人…")
-            elif op == OP_DISPATCH and t in (
-                    "GROUP_AT_MESSAGE_CREATE", "GROUP_ADD_ROBOT", "C2C_MESSAGE_CREATE"):
-                d = msg.get("d") or {}
-                openid = str(d.get("group_openid") or "").strip()
-                if not openid:
-                    print("[!] 收到事件 %s 但没有 group_openid（可能是单聊事件）" % t)
-                    continue
-                print()
-                print("[OK] GROUP_OPENID=%s" % openid)
-                saved = save_openid(cfg_path, cfg, openid)
-                print("[OK] 已回写 %s" % cfg_path)
-                print("     现在 data/notify.json 里的 qq_bot 段：%s"
-                      % json.dumps({k: (v[:6] + "…" if k == "app_secret" else v)
-                                    for k, v in saved.items()}, ensure_ascii=False))
-                return 0
-    finally:
-        try:
-            ws.close()
-        except Exception:                                       # noqa: BLE001
-            pass
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        if attempt > 1:
+            print("[..] 第 %d 次尝试建立 WebSocket…" % attempt)
+        openid = _listen_once(ws_url, token, app_id, deadline)
+        if openid:
+            print()
+            print("[OK] GROUP_OPENID=%s" % openid)
+            saved = save_openid(cfg_path, cfg, openid)
+            print("[OK] 已回写 %s" % cfg_path)
+            print("     现在 data/notify.json 里的 qq_bot 段：%s"
+                  % json.dumps({k: (v[:6] + "…" if k == "app_secret" else v)
+                                for k, v in saved.items()}, ensure_ascii=False))
+            return 0
+        left = deadline - time.time()
+        if left <= 1:
+            break
+        # 抢线模式：间隔压到最低。这个 AppID 只要在别处在线（比如 WorkBuddy 的
+        # QQ 通道），我们每次连上都会被它挤掉，单条连接的存活只有几秒 ——
+        # 唯一能补的就是**尝试密度**：多 READY 一次就多一个窗口。
+        time.sleep(0.5)
 
     print("[X] 等超时了，没收到群内 @消息。")
     print("    检查：① 机器人是否已加入群 ② 群里 @ 的是不是这个机器人"
           " ③ 开放平台是否开了「群聊消息」权限 ④ 机器人状态是否「已上线」")
+    print("    ⑤ 群里「机器人主动在群聊内发言」有没有打开"
+          " ⑥ 是不是发成了**私聊**（私聊里取不到群 openid）")
     return 5
 
 
