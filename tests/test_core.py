@@ -2260,7 +2260,48 @@ class TestNotify(unittest.TestCase):
         root = self._qq_root({"qq_bot": {"app_id": "1", "app_secret": "s"}})
         with self.assertLogs("checkin.notify", level="WARNING") as cm:
             self.assertIsNone(notify._load_qq_cfg(root))
-        self.assertIn("group_openid", "\n".join(cm.output))
+        out = "\n".join(cm.output)
+        self.assertIn("接收目标", out)
+        self.assertIn("group_openid", out)
+
+    def test_single_chat_openid_is_accepted_without_a_group(self):
+        """**不需要群**。只配 `user_openid` 就必须能推 —— 早期版本硬性要求群，
+
+        那条依据是过期资料（声称单聊主动消息每月只有 4 条），导致白折腾三轮。
+        """
+        root = self._qq_root({"qq_bot": {"app_id": "102", "app_secret": "sec",
+                                         "user_openid": "UOPEN"}})
+        calls = []
+
+        def fake_post(url, payload, headers=None, timeout=15):
+            calls.append((url, payload, headers or {}))
+            if "getAppAccessToken" in url:
+                return {"access_token": "TOK", "expires_in": 7200}
+            return {"id": "msg_1"}
+
+        with mock.patch.object(notify, "_http_post_json", side_effect=fake_post):
+            notify.notify_results([self._r("workbuddy", Outcome.SUCCESS)], root=root)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("/v2/users/UOPEN/messages", calls[1][0])
+        self.assertNotIn("/v2/groups/", calls[1][0])
+
+    def test_single_chat_wins_when_both_are_configured(self):
+        """两个都配时走单聊 —— 群那条依赖链更长（群设置/@ 对对象），能不用就不用。"""
+        self.assertEqual(notify._qq_target({"user_openid": "U",
+                                            "group_openid": "G"}),
+                         ("user_openid", "U"))
+
+    def test_target_routing_matches_the_key(self):
+        """URL 必须跟着 key 走 —— 单聊和群聊是**两个不同的接口**，走错就打不到对方。"""
+        self.assertEqual(notify._qq_send_url(("user_openid", "U")),
+                         "https://api.sgroup.qq.com/v2/users/U/messages")
+        self.assertEqual(notify._qq_send_url(("group_openid", "G")),
+                         "https://api.sgroup.qq.com/v2/groups/G/messages")
+
+    def test_blank_openid_does_not_count_as_configured(self):
+        """空串/空白不是"配好了" —— 否则用户照模版建了文件，却仍然收不到，还不知道哪错了。"""
+        self.assertIsNone(notify._qq_target({"user_openid": "   ", "group_openid": ""}))
+        self.assertIsNone(notify._qq_target({}))
 
     def test_qq_pushes_group_message_with_expected_shape(self):
         """配置齐全时，必须真的用 group_openid 调群消息接口，且带对鉴权头。"""
@@ -3800,6 +3841,75 @@ class TestQQOpenidHeartbeat(unittest.TestCase):
         period = self.tool.heartbeat_period(self._hello())
         self.assertFalse(self.tool.heartbeat_due(100.0, 100.1, period))
         self.assertTrue(self.tool.heartbeat_due(100.0, 100.0 + 41.25, period))
+
+    def _fake_ws(self, frames):
+        """造一个假 WS：依次吐帧，吐完就报"连接已关"，避免测试真去连网。"""
+        it = iter(frames)
+        ws = mock.Mock()
+
+        def recv():
+            try:
+                return next(it)
+            except StopIteration:
+                raise self.tool.websocket.WebSocketConnectionClosedException("EOF")
+
+        ws.recv = recv
+        ws.send = mock.Mock()
+        ws.close = mock.Mock()
+        return ws
+
+    def _frames(self, dispatch=None):
+        base = [json.dumps({"op": 10, "d": {"heartbeat_interval": 41250}}),
+                json.dumps({"op": 0, "t": "READY", "s": 1, "d": {}})]
+        return base + [json.dumps(x) for x in (dispatch or [])]
+
+    def _listen(self, dispatch):
+        frames = self._frames(dispatch)
+        with mock.patch.object(self.tool.websocket, "create_connection",
+                               return_value=self._fake_ws(frames)):
+            return self.tool._listen_once("wss://x", "TOK", "1",
+                                          time.time() + 5)
+
+    def test_a_private_message_yields_the_user_openid(self):
+        """**私聊就够了，不必建群** —— 早期版本把这条明确排斥掉了。
+
+        当时的理由是"官方限制单聊主动消息每月 4 条"，那出自过时资料；官文当期版本是
+        **每日 1000 条/用户**，和群同级。为这条结论我们让用户白折腾了三轮建群/拉群。
+        """
+        got = self._listen([{"op": 0, "t": "C2C_MESSAGE_CREATE", "s": 2,
+                             "d": {"author": {"user_openid": "UOPEN"}}}])
+        self.assertEqual(got, ("user_openid", "UOPEN"))
+
+    def test_author_id_alone_is_enough(self):
+        """有的平台版本 `author` 里只给 `id` —— 只看 `user_openid` 会抓不到。"""
+        got = self._listen([{"op": 0, "t": "C2C_MESSAGE_CREATE", "s": 2,
+                             "d": {"author": {"id": "UID123"}}}])
+        self.assertEqual(got, ("user_openid", "UID123"))
+
+    def test_group_event_still_routes_to_group(self):
+        """群事件仍然要走群 —— 两条并存，谁先到用谁，但不能串台。"""
+        got = self._listen([{"op": 0, "t": "GROUP_ADD_ROBOT", "s": 2,
+                             "d": {"group_openid": "GOPEN"}}])
+        self.assertEqual(got, ("group_openid", "GOPEN"))
+
+    def test_private_message_without_openid_does_not_crash(self):
+        """author 里什么都没有时不能崩、也不能拿空串当 openid（那会推出一条打到空目标的消息）。"""
+        self.assertIsNone(self._listen(
+            [{"op": 0, "t": "C2C_MESSAGE_CREATE", "s": 2, "d": {"author": {}}}]))
+
+    def test_save_openid_writes_the_key_it_is_given(self):
+        """写哪一键必须听调用方的 —— 早期主流程无脑用 `group_openid` 回写，
+
+        把刚抓到的私聊 id 直接盖掉：日志明明打 OK，配置里那一栏却还是空的。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "notify.json")
+            self.tool.save_openid(path, {"qq_bot": {"app_id": "1"}},
+                                  "UOPEN", key="user_openid")
+            with open(path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+        self.assertEqual(saved["qq_bot"]["user_openid"], "UOPEN")
+        self.assertIsNone(saved["qq_bot"].get("group_openid"))
 
 
 if __name__ == "__main__":

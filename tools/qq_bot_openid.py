@@ -1,19 +1,32 @@
-r"""一次性抓取 QQ 群的 `group_openid`（抓完就再也用不到 WS 了）。
+r"""一次性抓取 QQ 的 `openid`（抓完就再也用不到 WS 了）。
 
 为什么需要这一步
 ----------------
-发群消息的接口要的是 `group_openid`，它**不是群号** —— 只能从**机器人收到群内 @消息**
-的事件里取。所以流程是：运行本脚本 → 到群里 @ 一下机器人 → 脚本打印 openid 并回写配置。
+发消息的 HTTP 接口要的是 `openid`，它**不是 QQ 号也不是群号** —— 只能从**机器人收到的事件**
+里取。所以流程是：运行本脚本 → 触发一次事件 → 脚本打印 openid 并回写配置。
 
-为什么提供两条抓取路径
-----------------------
-1. **`GROUP_ADD_ROBOT`（首选）**：机器人被拉进群的那一刻就带 `group_openid`。
-   不要求群里开任何开关、也不要求 @ —— 只要在监听期间把机器人拉（或重新拉）进群。
-   ⚠ 这是比 @ 可靠得多的入口：@ 依赖群设置/主动发言开关/@ 对对象，拉群不依赖任何一项。
-2. **`GROUP_AT_MESSAGE_CREATE`（兜底）**：群里 @ 机器人一句。
+⚠ 为什么**首选单聊（私聊）**而不是群 —— 一条被纠正的错误结论
+--------------------------------------------------------------
+早期版本锁定了「必须有群」，理由是"官方限制私聊主动消息每月 4 条"。这个说法来自过时资料，
+**当前官方文档（bot.qq.com 消息收发概述，2026-07 版）写的是**：
 
-已经拉过群的情况没关系 —— **`GROUP_ADD_ROBOT` 每次重新拉都会再触发一次**，
-移出去再拉回来即可。
+    单聊主动消息  每日上限 1000 条/用户    Bot 维度 10/qps（未认证 5/qps & 30/qpm）
+    群聊主动消息  每日上限 1000 条/群      Bot 维度 60/qpm（未认证 30/qpm）
+
+**两者是同一个量级，单聊一点不吃亏。** 而群这条路要额外付出：建群、拉机器人进群、
+开「机器人主动在群聊内发言」、@ 对对象，任何一环没做对都不来事件 —— 我们在这上面
+耗了三轮零结果。单聊只需要一件事：**给机器人发一条私信**。
+
+⇒ 教训：**限制类结论必须回到官方文档当期版本核对**，二手资料的过期信息会把整个方案
+  带偏，而且偏得很难察觉（看起来一切正常，只是"一直不成功"）。
+
+三条触发路径（按省心程度排序）
+------------------------------
+1. **`C2C_MESSAGE_CREATE`（首选）**：直接给机器人发一条**私信**，任何内容都行。
+   `d.author.user_openid` 就是目标，配置里写成 `user_openid` ⇒ 走单聊推送。
+2. **`GROUP_ADD_ROBOT`**：机器人被拉进群的那一刻同样带 `group_openid`，
+   不要求群里开任何开关、也不要求 @。已经拉过群也没关系 —— 移出去再拉回来会再触发。
+3. **`GROUP_AT_MESSAGE_CREATE`（兜底）**：群里 @ 机器人一句。
 
 ⚠ 这个脚本会**短暂占用该 AppID 的 WebSocket 连接**。如果你用的是 WorkBuddy 里
    正在使用的那同一个机器人，WorkBuddy 的 QQ 通道会在这期间掉线（断开后一般会自动重连）。
@@ -21,15 +34,13 @@ r"""一次性抓取 QQ 群的 `group_openid`（抓完就再也用不到 WS 了�
 
 前置
 ----
-1. QQ 开放平台建机器人 → 拿 AppID / AppSecret；机器人状态需为**已上线**；
-   开发设置里开启「**群聊消息**」权限。
+1. QQ 开放平台建机器人 → 拿 AppID / AppSecret；机器人状态需为**已上线**。
 2. 开发设置 → 权限设置：开启 **GROUP_AND_C2C_EVENT (1<<25)**；
-   ⚠ 更隐蔽的是第二步：**开发设置 → 事件订阅里勾选「群@消息」**。
+   ⚠ 更隐蔽的是第二步：**开发设置 → 事件订阅里勾选「单聊消息」/「群@消息」**。
    只建应用、填凭据是不够的 —— 没勾这里，表现是"连接正常、心跳正常、
-   READY 也收到了，但群里 @ 破天荒不来一个事件"，排查极易跑偏。
-3. 建一个群（只有你一人即可），把机器人拉进群；
-   群设置 → 机器人 → 打开「**机器人主动在群聊内发言**」。
-4. 填好 `data/notify.json` 里的 `app_id` / `app_secret`（或命令行传）。
+   READY 也收到了，但消息怎么都不来一个事件"，排查极易跑偏。
+3. 填好 `data/notify.json` 里的 `app_id` / `app_secret`（或命令行传）。
+   **不需要建群**（走单聊的话）。
 
 ⚠ 传输层：别被"连上几秒就断"骗了
 ---------------------------------
@@ -43,7 +54,8 @@ r"""一次性抓取 QQ 群的 `group_openid`（抓完就再也用不到 WS 了�
 用法
 ----
     .venv\Scripts\python.exe tools\qq_bot_openid.py
-    # 然后到群里 @机器人 发一句话，脚本会打印 GROUP_OPENID 并回写 data/notify.json
+    # 然后**给机器人发一条私信**（推荐，不用建群），脚本立刻回写 data/notify.json
+    # 想要群推送的话：把机器人拉进群（或群里 @ 一句）即可，两条并存也没问题
 """
 import argparse
 import json
@@ -94,9 +106,14 @@ def load_cfg(path):
         return {}
 
 
-def save_openid(path, cfg, openid):
+def save_openid(path, cfg, openid, key="group_openid"):
+    """把拿到的 openid 回写进 `data/notify.json` 的 `qq_bot` 段。
+
+    `key` 决定走到哪条推送路由：`group_openid` ⇒ 发群消息，
+    `user_openid` ⇒ 发单聊/私聊消息。**两个都行，私聊那条路更省事**（见文件头）。
+    """
     qq = dict((cfg or {}).get("qq_bot") or {})
-    qq["group_openid"] = openid
+    qq[key] = openid
     cfg = dict(cfg or {})
     cfg["qq_bot"] = qq
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -143,9 +160,14 @@ def enable_keepalive(ws):
 
 
 def _listen_once(ws_url, token, app_id, deadline):
-    """开一次 WS 会话、等群里的 @ 事件。
+    """开一次 WS 会话、等一条能带出 openid 的事件（私聊或群都行）。
 
-    返回 `group_openid`；到点或连接被断开都返回 None。
+    返回 `(key, openid)`，其中 key ∈ {"user_openid", "group_openid"}；
+    到点或连接被断开都返回 None。**由调用方负责回写配置**，这里不写 —— 早期版本
+    两边都写，结果主流程会用 `group_openid` 覆盖掉刚抓到的 `user_openid`。
+
+    为什么要支持私聊：见文件头。单聊主动消息每日上限与群同级（各 1000 条），
+    却省掉建群/拉群/群内 @ 这一整串依赖。
 
     ⚠ **必须发心跳，否则 60 秒必断**（2026-10-19 取证结论，三次复现一模一样）：
     本机的 WS 会走会话注入的代理（实测 `getpeername()` 返回的是 `127.0.0.1:62046`
@@ -202,24 +224,39 @@ def _listen_once(ws_url, token, app_id, deadline):
                     peer = str(ws.sock.getpeername())
                 except Exception:                              # noqa: BLE001
                     pass
-                print("[OK] 已就绪（第 %d 次）—— 现在把机器人拉进群即可" % ready_n)
+                print("[OK] 已就绪（第 %d 次）—— 现在给机器人发条私信即可" % ready_n)
                 print("     心跳周期 %.2fs（服务端下发）；对端 %s"
                       % (hb_period, peer))
                 if peer.startswith("('127.0.0.1'"):
                     print("     ⚠ 走了本地代理 ⇒ 没有心跳会在 60s 后被掐，已自动兜住")
             elif op == OP_DISPATCH and t == "C2C_MESSAGE_CREATE":
-                # 最常见的操作失误：在**私聊**里给机器人发消息。这里拿不到群 openid，
-                # 而且官方对私聊主动消息限制为每月 4 条，根本撑不住每日推送。
-                print("[!] 收到的是**私聊**消息，里面没有群 openid")
-                print("    => 请到**群里** @ 机器人（不是私聊窗口），并确认群里已开启")
-                print("       「机器人主动在群聊内发言」")
+                # **首选路径**（2026-10-19 纠正）：私聊完全够用，不需要群。
+                #   官方 bot.qq.com「消息收发概述」明确：单聊主动消息
+                #   **每日上限 1000 条/用户**（群聊是 1000 条/群），二者同级。
+                #   早先那份「私聊每月 4 条」来自过时资料，据此判定"必须要有群"，
+                #   白白让用户多折腾了建群/拉群/群内 @ 三套动作 —— 见 MEMORY。
+                d = msg.get("d") or {}
+                author = d.get("author") or {}
+                # 两套字段都试：不同平台版本 author 里可能只给其中一个。
+                user_openid = str(author.get("user_openid")
+                                  or author.get("id") or "").strip()
+                if not user_openid:
+                    # 拿不到就把结构打出来 —— 静默吞掉是最坏的结果。
+                    print("[..] 私聊事件里取不到 user_openid，author=%s"
+                          % json.dumps(author, ensure_ascii=False)[:300])
+                    continue
+                print()
+                print("[OK] USER_OPENID=%s（走单聊推送，不需要群）" % user_openid)
+                return ("user_openid", user_openid)
             elif op == OP_DISPATCH and t in (
                     "GROUP_AT_MESSAGE_CREATE", "GROUP_ADD_ROBOT"):
                 d = msg.get("d") or {}
                 openid = str(d.get("group_openid") or "").strip()
                 if not openid:
                     continue
-                return openid
+                print()
+                print("[OK] GROUP_OPENID=%s（走群推送）" % openid)
+                return ("group_openid", openid)
             elif op == OP_DISPATCH and t not in _QUIET_EVENTS:
                 # 未知事件必须**打出来**：曾经只认识两种事件名，其余全部静默忽略，
                 # 于是"机器人到底收到没""平台用的是不是别的事件名"这类信息被吞掉，
@@ -273,7 +310,7 @@ def main():
         return 2
 
     print("=" * 58)
-    print("QQ group_openid 抓取")
+    print("QQ openid 抓取（单聊 / 群聊均可）")
     print("=" * 58)
     print("AppID: %s" % app_id)
 
@@ -310,9 +347,9 @@ def main():
 
     deadline = time.time() + args.timeout
     print("-" * 58)
-    print(">>> 首选：把我这个机器人**拉进一个群**（已在群里就移出再拉回来）<<<")
+    print(">>> 首选：**给这个机器人发一条私信**（内容随便）—— 单聊即可，不必建群 <<<")
+    print(">>> 备选：把它拉进一个群（已在群里就移出再拉回来）            <<<")
     print(">>>        GROUP_ADD_ROBOT 事件里就有 group_openid，不必 @     <<<")
-    print(">>> 兜底：群里 @ 机器人一句（**群里** @，别发成私聊）           <<<")
     print(">>> 正在等待，最长 %d 秒（断了会自动重连，别管重连提示）" % args.timeout)
     print("-" * 58)
 
@@ -321,15 +358,18 @@ def main():
         attempt += 1
         if attempt > 1:
             print("[..] 第 %d 次尝试建立 WebSocket…" % attempt)
-        openid = _listen_once(ws_url, token, app_id, deadline)
-        if openid:
+        got = _listen_once(ws_url, token, app_id, deadline)
+        if got:
+            key, openid = got
             print()
-            print("[OK] GROUP_OPENID=%s" % openid)
-            saved = save_openid(cfg_path, cfg, openid)
-            print("[OK] 已回写 %s" % cfg_path)
+            saved = save_openid(cfg_path, cfg, openid, key=key)
+            print("[OK] 已回写 %s（键=%s）" % (cfg_path, key))
             print("     现在 data/notify.json 里的 qq_bot 段：%s"
                   % json.dumps({k: (v[:6] + "…" if k == "app_secret" else v)
                                 for k, v in saved.items()}, ensure_ascii=False))
+            route = "单聊 /v2/users/{openid}/messages" if key == "user_openid" \
+                else "群聊 /v2/groups/{openid}/messages"
+            print(" => 推送路由：%s" % route)
             return 0
         left = deadline - time.time()
         if left <= 1:
@@ -341,12 +381,11 @@ def main():
 
     print("[X] 等超时了，没收到群内 @消息。")
     print("    ⚠ 连接和心跳都正常却收不到事件，**第一嫌疑永远是「事件订阅没勾」**：")
-    print("     开发设置 → 事件订阅/权限：勾选「群@消息(GROUP_AT_MESSAGE_CREATE)」")
+    print("     开发设置 → 事件订阅/权限：勾选「单聊消息(C2C_MESSAGE_CREATE)」")
+    print("     走群的话再勾「群@消息(GROUP_AT_MESSAGE_CREATE)」+ 把机器人拉进群。")
     print("     —— 只建应用、填凭据是不够的，没勾这里，连接正常、心跳正常、就是没事件。")
-    print("   其次检查：①机器人是否已加入群 ②群里 @ 的是不是这个机器人"
-          " ③机器人是否「已上线」")
-    print("   ⑤群里「机器人主动在群聊内发言」有没有打开"
-          " ⑥是不是发成了**私聊**（私聊里取不到群 openid）")
+    print("   其次检查：①机器人状态是否「已上线」②@ 的是不是这个机器人"
+          " ③群里「机器人主动在群聊内发言」有没有打开")
     return 5
 
 

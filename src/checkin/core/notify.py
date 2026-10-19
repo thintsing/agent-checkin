@@ -193,9 +193,14 @@ def notify_results(results: List[CheckinResult],
 #   WorkBuddy 里那个「QQ 机器人」是**助理远程通道**（方向是 你→WorkBuddy，用来远程下指令），
 #   不是结果通知出口。⇒ 要让签到结果到 QQ，只能直接调 QQ 开放平台的 Bot API。
 #
-# 为什么必须是**群聊**而不是私聊：
-#   QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超限；
-#   群聊无此限制（每分钟 20 条）。所以需要一个只有你和机器人的群。
+# 单聊还是群聊 —— **两个都行，推荐单聊**（2026-10-19 纠正）：
+#   早期版本写了"必须是群聊"，理由是"官方限制私聊主动消息每月 4 条"。那个数字出自过时
+#   资料。**官方文档当期版本（bot.qq.com 消息收发概述）写的是**：
+#       单聊主动消息：每日上限 1000 条/用户    Bot 维度 10/qps（未认证 5/qps & 30/qpm）
+#       群聊主动消息：每日上限 1000 条/群      Bot 维度 60/qpm（未认证 30/qpm）
+#   同一个量级，单聊一点不吃亏，却省掉建群/拉群/开「机器人主动在群聊内发言」/ @ 对对象
+#   这一串依赖（这一串我们当时逐项排查了三轮全是零结果）。
+#   ⇒ 拿 openid 只要给机器人发一条**私信**即可。详见 tools/qq_bot_openid.py 文件头。
 #
 # 凭据放 `data/notify.json`（`.gitignore` 已覆盖 `data/`）—— **绝不进开源仓库**。
 # 文件不存在 = 未开启 ⇒ 静默跳过，对没配的人零影响。
@@ -220,12 +225,36 @@ def _load_qq_cfg(root: Optional[str]) -> Optional[Dict[str, Any]]:
         log.warning("QQ 推送配置读取失败（%s）：%s", path, e)
         return None
     qq = (data or {}).get("qq_bot") or {}
-    missing = [k for k in ("app_id", "app_secret", "group_openid")
+    missing = [k for k in ("app_id", "app_secret")
                if not str(qq.get(k) or "").strip()]
     if missing:
         log.warning("QQ 推送配置不完整，缺 %s，已跳过", "、".join(missing))
         return None
+    if _qq_target(qq) is None:
+        log.warning("QQ 推送缺少接收目标：qq_bot 里要有 user_openid（单聊）"
+                    "或 group_openid（群聊）之一，已跳过")
+        return None
     return qq
+
+
+def _qq_target(qq: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """选推送目标：**单聊优先**（不用建群），没配才退回群聊。
+
+    返回 `(key, openid)`；两个都没配 ⇒ None。
+    """
+    for key in ("user_openid", "group_openid"):
+        openid = str((qq or {}).get(key) or "").strip()
+        if openid:
+            return key, openid
+    return None
+
+
+def _qq_send_url(target: Tuple[str, str]) -> str:
+    """按目标类型拼发送接口 —— 单聊和群聊是**两个不同的 URL**。"""
+    key, openid = target
+    if key == "user_openid":
+        return f"{_QQ_API_BASE}/v2/users/{openid}/messages"
+    return f"{_QQ_API_BASE}/v2/groups/{openid}/messages"
 
 
 def _http_post_json(url: str, payload: Dict[str, Any],
@@ -304,7 +333,10 @@ def _push_qq(root: Optional[str], text: str) -> None:
     token = _qq_access_token(app_id, str(qq["app_secret"]).strip())
     if not token:
         return
-    url = f"{_QQ_API_BASE}/v2/groups/{str(qq['group_openid']).strip()}/messages"
+    target = _qq_target(qq)
+    if target is None:                       # _load_qq_cfg 已筛过，这里是防御
+        return
+    url = _qq_send_url(target)
     try:
         resp = _http_post_json(
             url,
