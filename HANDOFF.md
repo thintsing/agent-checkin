@@ -7,7 +7,52 @@
 
 ---
 
-## [2026-10-18 12:20] WorkBuddy(阿拾) —— 首轮自愈实战全胜 + 修「启动入口修复」的编码型名存实亡
+## [2026-10-19 11:05] WorkBuddy(阿拾) —— QQ 推送：凭据已通，但 openid 抓取撞上「WS 单连接」硬约束
+
+### 结论：**暂时没配上**，大哥决定另建专用机器人（等新凭据）
+
+### 一、进展：凭据这一层已打通
+
+大哥给了 AppID `1903735114` + Secret。第一次给的 Secret（16 位）被平台拒：
+`{"code":100016,"invalid appid or secret}`。判据链：
+- 本地自检：Secret 16 位纯 ASCII、无空白无隐藏字符 ⇒ 不是写入带脏字符
+- **AppID 确认有效** —— 本机 `~/.workbuddy/agent-im-bindings.json` 里就是这个 AppID，
+  它**正是 WorkBuddy 那条 QQ 通道在用的同一个机器人**。AppID 错会回 `100007`，
+  这里回 `100016` ⇒ 精确指向 **Secret 失效**（平台 Secret 生成页与展示页不在一起，
+  从旧位置复制的会失效）
+- 想从本机复用那份 Secret ⇒ 走不通：`agent-im-bindings.json` 只有 bindingId，
+  `connectors/*/connector-states*.json` 不含该 AppID ⇒ **凭据由 WorkBuddy 服务端托管**
+
+大哥重置后给了新 Secret（32 位）⇒ `access_token` 立刻拿到（expires_in=4320）。
+
+### 二、卡点：`group_openid` 抓不到，根因是 WS **单连接**硬约束
+
+- `group_openid` **没有捷径**：官方 `/v2/groups/{openid}/info` 是**反查**且要白名单，
+  **不存在「按群号换 openid」的公开接口** ⇒ 只能挂 WS 监听 `GROUP_AT_MESSAGE_CREATE`
+- ⚠ **同一个 AppID 全平台只允许一条 WebSocket 连接**。而这个机器人此刻正被 WorkBuddy
+  占着 ⇒ 我们连上几秒就被挤掉（`WebSocketConnectionClosedException`）。这不是偶发，是必然。
+- 三轮尝试：**240s / 150s(抢线模式) / 300s** —— 最好的一轮连通 5 次、每次存活只有几秒，
+  一次群事件都没收到。密度打不过对方持续在线。
+- 第一次运行还暴露一个操作坑：收到的是 `C2C_MESSAGE_CREATE`（**私聊**），
+  大哥在私聊窗口跟机器人说了"你好" —— 私聊事件里没有 `group_openid`。
+
+### 三、做了什么
+
+`tools/qq_bot_openid.py`（commit `288cfa7`）：
+1. WS 断开**不再崩** —— 抽 `_listen_once()`，断开返回 None，上层最小间隔重连到 deadline
+2. `C2C_MESSAGE_CREATE` 时**明确提示"你发的是私聊，请到群里 @"**，而不是含糊带过
+3. READY 打印连通次数（用来判断到底有没有稳定占住过窗口）
+
+### 四、下一步（等专用机器人）
+
+专用机器人到位后的流程：验证 token → 挂 WS（这次没人抢）→ 群里 @ 一次 → 抓 openid
+→ 回填 `data/notify.json` → 发一条测试消息验收。
+**抓完之后推送走的是 HTTP API，再也不碰 WS，不会跟 WorkBuddy 冲突** —— 这次是一次性的麻烦。
+
+⚠ 另外要提醒大哥：**旧机器人那个 Secret 已在聊天记录里出现过，建议再重置一次。**
+
+---
+
 
 ### 一、今天的结果：三站全自动签到成功（**零人工干预**）
 
