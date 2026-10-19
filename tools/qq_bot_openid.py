@@ -22,6 +22,15 @@ QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超
    群设置 → 机器人 → 打开「**机器人主动在群聊内发言**」。
 3. 填好 `data/notify.json` 里的 `app_id` / `app_secret`（或命令行传）。
 
+⚠ 传输层：别被"连上几秒就断"骗了
+---------------------------------
+本机实测三次，每次都是"0.2s 拿到 READY → 正好第 60.0 秒断，且没有关闭帧"。
+看起来像被别处抢占，其实是：**WS 走了会话注入的代理**（`getpeername()` 返回
+`127.0.0.1:<随机端口>` 而不是 QQ 的 IP），代理对空闲隧道有 60 秒超时。
+修法是发**应用层心跳**（周期取 HELLO 里的 `heartbeat_interval`，实测 41250ms）。
+加了心跳之后同一条连接跑满 180 秒稳在线。TCP keepalive 在这里没用 ——
+它只到代理本地那一跳，代理到 QQ 那一跳照样空闲。
+
 用法
 ----
     .venv\Scripts\python.exe tools\qq_bot_openid.py
@@ -30,6 +39,7 @@ QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -82,34 +92,81 @@ def save_openid(path, cfg, openid):
     return qq
 
 
+def heartbeat_period(hello_msg, default_sec=41.25):
+    """从 HELLO 帧里取心跳周期（秒）；拿不到就用兜底值。
+
+    为什么必须在 HELLO 里取而不是硬编码：官方的 `heartbeat_interval` 是服务端下发的
+    （实测 41250ms），硬编码一旦平台改值就会踩到"发得太晚被踢"。
+    """
+    d = (hello_msg or {}).get("d") or {}
+    try:
+        ms = float(d.get("heartbeat_interval"))
+    except (TypeError, ValueError):
+        return default_sec
+    return ms / 1000.0 if ms > 0 else default_sec
+
+
+def heartbeat_due(last_hb, now, period_sec):
+    """到点了吗 —— 提前到周期的 80% 就发，别卡着边界，留出网络抖动余量。"""
+    if period_sec <= 0:
+        return False
+    return (now - last_hb) >= period_sec * 0.8
+
+
+def enable_keepalive(ws):
+    """TCP keepalive —— 20s 空闲后每 5s 探活一次。
+
+    ⚠ 这条**救不了代理掐隧道**（见本文件顶部 §传输层）：代理掐的是它自己那一跳，
+    本地 keepalive 探活只到代理就停了。真正管用的是**应用层心跳**。这里保留它，
+    仅为直连场景下的兜底。
+    """
+    try:
+        sock = ws.sock
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.ioctl(0x98000004, (1, 20000, 5000))   # SIO_KEEPALIVE_VALS
+        return True
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 def _listen_once(ws_url, token, app_id, deadline):
     """开一次 WS 会话、等群里的 @ 事件。
 
     返回 `group_openid`；到点或连接被断开都返回 None。
 
-    **为什么要能重连**（2026-10-19 实测）：同一个 AppID 只允许**一条** WS 连接。
-    如果这个机器人同时在别处跑（比如 WorkBuddy 的 QQ 通道），我们一上线就会被它
-    挤掉 —— `ws.recv()` 直接抛 `WebSocketConnectionClosedException`。这不是偶发，
-    是**必然**，所以不能像以前那样一断就崩，必须由上层重连。
+    ⚠ **必须发心跳，否则 60 秒必断**（2026-10-19 取证结论，三次复现一模一样）：
+    本机的 WS 会走会话注入的代理（实测 `getpeername()` 返回的是 `127.0.0.1:62046`
+    而不是 QQ 的 IP），代理对**空闲隧道**有 60 秒超时 —— 没有应用层心跳时，
+    连接拿到 READY 后正好在第 60.0 秒夭折，且**没有关闭帧**（`close_status_code=N/A`），
+    看起来就像"被别人抢走"，很容易误判成抢占或机器人离线。
+    加上按 HELLO 周期的应用层心跳后，实测 180 秒稳定在线（40/80/120/160s 四次 ACK）。
+    TCP keepalive 在这里**没用**：它只 OpenSSL 到代理本地那一跳。
+
+    **为什么还要能重连**：确实存在抢线（同一 AppID 只允许一条 WS），只是它不是
+    这次的主因。断了就重连，由上层负责。
     """
-    ws = websocket.create_connection(ws_url, timeout=30)
-    ws.settimeout(30)
+    ws = websocket.create_connection(ws_url, timeout=5)
+    ws.settimeout(5)
+    enable_keepalive(ws)
     seq = None
+    hb_period = 41.25                  # 收到 HELLO 之前先兜个底
     last_hb = time.time()
     identified = False
     ready_n = 0
     try:
         while time.time() < deadline:
+            now = time.time()
+            # 心跳放在 recv 之前检查：recv 超时不能成为唯一的心跳驱动，
+            # 否则一旦超时粒度大于周期就永远发不出去（第一次就是这么漏的）。
+            if identified and heartbeat_due(last_hb, now, hb_period):
+                ws.send(json.dumps({"op": OP_HEARTBEAT, "d": seq}))
+                last_hb = now
             try:
                 raw = ws.recv()
             except websocket.WebSocketTimeoutException:
-                # 心跳：Hello 之后必须定期发，否则会被服务端断开
-                if identified and time.time() - last_hb > 40:
-                    ws.send(json.dumps({"op": OP_HEARTBEAT, "d": seq}))
-                    last_hb = time.time()
                 continue
             if not raw:
-                continue
+                break
             try:
                 msg = json.loads(raw)
             except ValueError:
@@ -118,6 +175,7 @@ def _listen_once(ws_url, token, app_id, deadline):
             if msg.get("s") is not None:
                 seq = msg.get("s")
             if op == OP_HELLO:
+                hb_period = heartbeat_period(msg)
                 ws.send(json.dumps({"op": OP_IDENTIFY, "d": {
                     "token": "QQBot %s" % token,
                     "intents": INTENT_GROUP_AND_C2C,
@@ -126,7 +184,16 @@ def _listen_once(ws_url, token, app_id, deadline):
             elif op == OP_DISPATCH and t == "READY":
                 identified = True
                 ready_n += 1
-                print("[OK] 第 %d 次连通，窗口已开 —— 就现在 @（存活通常只有几秒）" % ready_n)
+                peer = "(未知)"
+                try:
+                    peer = str(ws.sock.getpeername())
+                except Exception:                              # noqa: BLE001
+                    pass
+                print("[OK] 已就绪（第 %d 次）—— 现在到群里 @ 机器人" % ready_n)
+                print("     心跳周期 %.2fs（服务端下发）；对端 %s"
+                      % (hb_period, peer))
+                if peer.startswith("('127.0.0.1'"):
+                    print("     ⚠ 走了本地代理 ⇒ 没有心跳会在 60s 后被掐，已自动兜住")
             elif op == OP_DISPATCH and t == "C2C_MESSAGE_CREATE":
                 # 最常见的操作失误：在**私聊**里给机器人发消息。这里拿不到群 openid，
                 # 而且官方对私聊主动消息限制为每月 4 条，根本撑不住每日推送。
@@ -141,7 +208,16 @@ def _listen_once(ws_url, token, app_id, deadline):
                     continue
                 return openid
     except websocket.WebSocketConnectionClosedException:
-        print("[!] 连接被断开（多半是这个机器人同时在别处在线，抢走了同一条 WS）")
+        peer = "(未知)"
+        try:
+            peer = str(ws.sock.getpeername())
+        except Exception:                                      # noqa: BLE001
+            pass
+        print("[!] 连接断开了（对端 %s，close=%s/%s）—— 正在重连，不影响"
+              % (peer, getattr(ws, "close_status_code", "N/A"),
+                 getattr(ws, "close_reason", "N/A")))
+        print("    可能是：①同一 AppID 在别处在线（抢线）②代理掐了空闲隧道 "
+              "③服务端要求重连。心跳已按 %.1fs 周期在发，①②都兜住了。" % hb_period)
         return None
     except websocket.WebSocketException as e:
         print("[!] WS 异常：%s" % e)

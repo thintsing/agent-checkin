@@ -3711,5 +3711,96 @@ class TestClientSelfHealGroundwork(unittest.TestCase):
         self.assertEqual(stamp["demo"], today)
 
 
+class TestQQOpenidHeartbeat(unittest.TestCase):
+    """`tools/qq_bot_openid.py` 的心跳 —— 这是**能不能抓到 openid 的唯一变量**。
+
+    背景（2026-10-19 取证，三次复现分秒不差）：本机的 WS 会走会话注入的代理，
+    代理对空闲隧道有 **60 秒**超时 ⇒ 不发心跳时，连接拿到 READY 后正好在第
+    60.0 秒天亡，且**没有关闭帧** —— 表现酷似"机器人被别处抢占"，极易误判。
+    加心跳后同一条连接跑满 180 秒稳定在线。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "qq_bot_openid", root / "tools" / "qq_bot_openid.py")
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def _hello(self, ms=41250):
+        return {"op": 10, "d": {"heartbeat_interval": ms}}
+
+    def test_period_comes_from_the_hello_frame(self):
+        """周期取服务端下发的毫秒值 —— 硬编码会在平台改值时踩到"发太晚被踢"。"""
+        self.assertAlmostEqual(self.tool.heartbeat_period(self._hello(41250)),
+                               41.25, places=2)
+        self.assertAlmostEqual(self.tool.heartbeat_period(self._hello(30000)),
+                               30.0, places=2)
+
+    def test_period_falls_back_when_the_frame_is_broken(self):
+        """HELLO 里没有 / 是脏值时不能崩 —— 抓 openid 是一次性操作，崩了还得重来。"""
+        for bad in ({}, {"op": 10}, {"op": 10, "d": {}},
+                    {"op": 10, "d": {"heartbeat_interval": "x"}},
+                    {"op": 10, "d": {"heartbeat_interval": 0}}):
+            with self.subTest(frame=bad):
+                self.assertGreater(self.tool.heartbeat_period(bad), 0)
+
+    def test_heartbeat_fires_before_the_60s_idle_cutoff(self):
+        """⚠ 核心守卫：必须在代理掐隧道（60s）之前**至少发出一次**心跳。
+
+        旧实现的驱动方式是"recv 超时后才检查"，recv 超时 30s + 阈值 40s ⇒
+        第一次真正有机会发心跳的时刻已经是第 60s —— 正好和最晚期限撞在一起，
+        于是**一次都没发出去**。改成主循环里每次先判心跳，不再依赖超时。
+        """
+        period = self.tool.heartbeat_period(self._hello())
+        due = [t for t in range(0, 61) if self.tool.heartbeat_due(0, t, period)]
+        self.assertTrue(due, "60 秒内一次心跳都不发 ⇒ 必被代理掐断")
+        self.assertLess(min(due), 60, "第一次心跳必须早于 60 秒那条死线")
+        # 而且要早于服务端周期本身才算来得及
+        self.assertLess(min(due), 41.25)
+
+    def test_heartbeat_keeps_firing_forever(self):
+        """每 80% 周期一次，长期在线不能出现"发一次就再也不发"。"""
+        period = self.tool.heartbeat_period(self._hello())
+        last = 0.0
+        fired = []
+        now = 0.0
+        while now < 900:                            # 模拟 15 分钟
+            now += 0.5
+            if self.tool.heartbeat_due(last, now, period):
+                fired.append(now)
+                last = now
+        self.assertGreater(len(fired), 10, "15 分钟里至少要发十几次心跳")
+        gaps = [b - a for a, b in zip(fired, fired[1:])]
+        self.assertTrue(all(0 < g <= 41.25 for g in gaps),
+                        "间隔不能超过服务端周期，否则会被判掉线")
+
+    def test_due_tracks_the_period_not_a_hardcoded_constant(self):
+        """⚠ 阈值必须跟着周期走，不能写死 40s。
+
+        写死 40s 在当前（41.25s）下碰巧能过 —— 这正是它危险的地方：一旦平台把
+        间隔调到 20s，心跳就晚于服务端要求，直接判掉线。所以守卫要用**两个不同
+        周期**交叉验证"阈值随周期变化"，只测一个值是测不出来的。
+        """
+        short = self.tool.heartbeat_period(self._hello(20000))     # 20s
+        long_ = self.tool.heartbeat_period(self._hello(41250))     # 41.25s
+        t_short = min(t for t in range(0, 61)
+                      if self.tool.heartbeat_due(0, t, short))
+        t_long = min(t for t in range(0, 61)
+                     if self.tool.heartbeat_due(0, t, long_))
+        self.assertLess(t_short, 20,
+                        "周期 20s 时必须早于 20s 发（写死 40s 就会晚）")
+        self.assertLess(t_short, t_long, "周期越短，心跳必须越早")
+
+    def test_due_is_false_right_after_sending(self):
+        """刚发完不能立刻又说到期 —— 否则会疯狂发心跳刷屏。"""
+        period = self.tool.heartbeat_period(self._hello())
+        self.assertFalse(self.tool.heartbeat_due(100.0, 100.1, period))
+        self.assertTrue(self.tool.heartbeat_due(100.0, 100.0 + 41.25, period))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
