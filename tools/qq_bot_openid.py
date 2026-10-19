@@ -18,9 +18,13 @@ QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超
 ----
 1. QQ 开放平台建机器人 → 拿 AppID / AppSecret；机器人状态需为**已上线**；
    开发设置里开启「**群聊消息**」权限。
-2. 建一个群（只有你一人即可），把机器人拉进群；
+2. 开发设置 → 权限设置：开启 **GROUP_AND_C2C_EVENT (1<<25)**；
+   ⚠ 更隐蔽的是第二步：**开发设置 → 事件订阅里勾选「群@消息」**。
+   只建应用、填凭据是不够的 —— 没勾这里，表现是"连接正常、心跳正常、
+   READY 也收到了，但群里 @ 破天荒不来一个事件"，排查极易跑偏。
+3. 建一个群（只有你一人即可），把机器人拉进群；
    群设置 → 机器人 → 打开「**机器人主动在群聊内发言**」。
-3. 填好 `data/notify.json` 里的 `app_id` / `app_secret`（或命令行传）。
+4. 填好 `data/notify.json` 里的 `app_id` / `app_secret`（或命令行传）。
 
 ⚠ 传输层：别被"连上几秒就断"骗了
 ---------------------------------
@@ -48,9 +52,13 @@ import websocket
 
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 GATEWAY_URL = "https://api.sgroup.qq.com/gateway"
+ME_URL = "https://api.sgroup.qq.com/users/@me"
 # 群聊 + 单聊事件（GROUP_AT_MESSAGE_CREATE 属于这一位）
 INTENT_GROUP_AND_C2C = 1 << 25
 OP_HELLO, OP_IDENTIFY, OP_HEARTBEAT, OP_DISPATCH = 10, 2, 1, 0
+OP_HEARTBEAT_ACK = 11
+# 这些事件会频繁出现且与我们无关，别刷屏；除此之外**一个都不能静默吞**。
+_QUIET_EVENTS = ("READY", "RESUMED")
 
 
 def _opener():
@@ -207,6 +215,15 @@ def _listen_once(ws_url, token, app_id, deadline):
                 if not openid:
                     continue
                 return openid
+            elif op == OP_DISPATCH and t not in _QUIET_EVENTS:
+                # 未知事件必须**打出来**：曾经只认识两种事件名，其余全部静默忽略，
+                # 于是"机器人到底收到没""平台用的是不是别的事件名"这类信息被吞掉，
+                # 排查只能靠猜。⚠ SILENT FAILURE 一律不许再有。
+                print("[..] 事件 %s（未处理，s=%s）keys=%s"
+                      % (t, msg.get("s"), list((msg.get("d") or {}).keys())[:6]))
+            elif op not in (OP_HELLO, OP_HEARTBEAT_ACK, OP_DISPATCH):
+                print("[..] op=%s t=%s %s"
+                      % (op, t, json.dumps(msg, ensure_ascii=False)[:160]))
     except websocket.WebSocketConnectionClosedException:
         peer = "(未知)"
         try:
@@ -269,6 +286,13 @@ def main():
 
     headers = {"Authorization": "QQBot %s" % token, "X-Union-Appid": app_id}
     try:
+        me = _request(ME_URL, headers=headers)
+        print("[OK] 机器人身份：%s（id=%s）"
+              % (str(me.get("username") or "?"), str(me.get("id") or "?")))
+    except Exception as e:                                       # noqa: BLE001
+        # 拿不到身份不影响抓 openid，但少了这条证据排查会多绕一圈
+        print("[!] 查机器人身份失败：%s" % e)
+    try:
         gw = _request(GATEWAY_URL, headers=headers)
         ws_url = str((gw or {}).get("url") or "").strip()
     except Exception as e:                                       # noqa: BLE001
@@ -310,10 +334,13 @@ def main():
         time.sleep(0.5)
 
     print("[X] 等超时了，没收到群内 @消息。")
-    print("    检查：① 机器人是否已加入群 ② 群里 @ 的是不是这个机器人"
-          " ③ 开放平台是否开了「群聊消息」权限 ④ 机器人状态是否「已上线」")
-    print("    ⑤ 群里「机器人主动在群聊内发言」有没有打开"
-          " ⑥ 是不是发成了**私聊**（私聊里取不到群 openid）")
+    print("    ⚠ 连接和心跳都正常却收不到事件，**第一嫌疑永远是「事件订阅没勾」**：")
+    print("     开发设置 → 事件订阅/权限：勾选「群@消息(GROUP_AT_MESSAGE_CREATE)」")
+    print("     —— 只建应用、填凭据是不够的，没勾这里，连接正常、心跳正常、就是没事件。")
+    print("   其次检查：①机器人是否已加入群 ②群里 @ 的是不是这个机器人"
+          " ③机器人是否「已上线」")
+    print("   ⑤群里「机器人主动在群聊内发言」有没有打开"
+          " ⑥是不是发成了**私聊**（私聊里取不到群 openid）")
     return 5
 
 
