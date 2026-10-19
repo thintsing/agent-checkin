@@ -2,9 +2,11 @@
   "_comment": "复制成 data/notify.json 即可开启 QQ 推送（data/ 已被 .gitignore 忽略，凭据不会进仓库）。接收目标填 user_openid（单聊，推荐）或 group_openid（群聊）之一即可，两个都填时以单聊为准。",
   "_steps": [
     "1. 在 QQ 开放平台（q.qq.com）建一个机器人，记下 AppID 与 AppSecret，并把它置为「已上线」",
-    "2. 开发设置里勾选要接收的事件：单聊填 C2C_MESSAGE_CREATE；群聊填 GROUP_AT_MESSAGE_CREATE（还要把机器人拉进群）。只填凭据不勾事件的话，连接正常、心跳正常、就是没消息",
-    "3. 跑 python tools/qq_bot_openid.py，然后按提示给机器人发一条私信（或拉群），脚本会自动把 openid 回写进本文件",
-    "4. 跑一次 python src/checkin/__main__.py --now --only-site <任一站点> 验证收到结论"
+    "2. 机器人还没上架时先开私聊通道：开发管理 → 沙箱配置 → 单独聊天 → 选「在消息列表配置」→ 添加成员（你自己的 QQ）→ 手机 QQ 扫码添加机器人。没做这步，QQ 里找不到这个机器人",
+    "3. 开发设置里勾选要接收的事件：单聊填 C2C_MESSAGE_CREATE；群聊填 GROUP_AT_MESSAGE_CREATE（还要把机器人拉进群）。只填凭据不勾事件的话，连接正常、心跳正常、就是没消息",
+    "4. 跑 python tools/qq_bot_openid.py，然后按提示给机器人发一条私信（或拉群），脚本会自动把 openid 回写进本文件",
+    "5. 跑一次 python src/checkin/__main__.py --now --only-site <任一站点> 验证收到结论",
+    "⚠ 同一 AppID 的 WebSocket 全平台只允许一条：别同时起两个 qq_bot_openid.py，它们会互相挤掉，表现为「一直收不到事件」"
   ],
   "qq_bot": {
     "app_id": "",
