@@ -5,10 +5,15 @@ r"""一次性抓取 QQ 群的 `group_openid`（抓完就再也用不到 WS 了�
 发群消息的接口要的是 `group_openid`，它**不是群号** —— 只能从**机器人收到群内 @消息**
 的事件里取。所以流程是：运行本脚本 → 到群里 @ 一下机器人 → 脚本打印 openid 并回写配置。
 
-为什么用"群聊"而不是私聊
-------------------------
-QQ 官方对**私聊主动消息**限制为**每月 4 条**，每天推必然超限；群聊无此限制（每分钟 20 条）。
-所以请建一个只有你和机器人的群。
+为什么提供两条抓取路径
+----------------------
+1. **`GROUP_ADD_ROBOT`（首选）**：机器人被拉进群的那一刻就带 `group_openid`。
+   不要求群里开任何开关、也不要求 @ —— 只要在监听期间把机器人拉（或重新拉）进群。
+   ⚠ 这是比 @ 可靠得多的入口：@ 依赖群设置/主动发言开关/@ 对对象，拉群不依赖任何一项。
+2. **`GROUP_AT_MESSAGE_CREATE`（兜底）**：群里 @ 机器人一句。
+
+已经拉过群的情况没关系 —— **`GROUP_ADD_ROBOT` 每次重新拉都会再触发一次**，
+移出去再拉回来即可。
 
 ⚠ 这个脚本会**短暂占用该 AppID 的 WebSocket 连接**。如果你用的是 WorkBuddy 里
    正在使用的那同一个机器人，WorkBuddy 的 QQ 通道会在这期间掉线（断开后一般会自动重连）。
@@ -197,7 +202,7 @@ def _listen_once(ws_url, token, app_id, deadline):
                     peer = str(ws.sock.getpeername())
                 except Exception:                              # noqa: BLE001
                     pass
-                print("[OK] 已就绪（第 %d 次）—— 现在到群里 @ 机器人" % ready_n)
+                print("[OK] 已就绪（第 %d 次）—— 现在把机器人拉进群即可" % ready_n)
                 print("     心跳周期 %.2fs（服务端下发）；对端 %s"
                       % (hb_period, peer))
                 if peer.startswith("('127.0.0.1'"):
@@ -305,9 +310,10 @@ def main():
 
     deadline = time.time() + args.timeout
     print("-" * 58)
-    print(">>> 现在到**群里** @ 一下机器人，随便发一句话 <<<")
-    print(">>>   注意是群里 @，不是给机器人发私聊（私聊消息里没有群 openid）<<<")
-    print(">>> 正在等待，最长 %d 秒（断了会自动重连，别管日志里的重连提示）" % args.timeout)
+    print(">>> 首选：把我这个机器人**拉进一个群**（已在群里就移出再拉回来）<<<")
+    print(">>>        GROUP_ADD_ROBOT 事件里就有 group_openid，不必 @     <<<")
+    print(">>> 兜底：群里 @ 机器人一句（**群里** @，别发成私聊）           <<<")
+    print(">>> 正在等待，最长 %d 秒（断了会自动重连，别管重连提示）" % args.timeout)
     print("-" * 58)
 
     attempt = 0
