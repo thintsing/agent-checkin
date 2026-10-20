@@ -16,10 +16,27 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
     return int(h), int(m)
 
 
+def _fallback_window() -> tuple[str, str]:
+    """窗口兜底值 —— 唯一真值是 `ScheduleConfig` 的 dataclass 默认值。
+
+    放在函数里 import：`config` 只在测试/调用时才会被加载，避免模块级循环导入。
+    """
+    from .config import ScheduleConfig
+    return ScheduleConfig.window_start, ScheduleConfig.window_end
+
+
 def window_bounds(now: Optional[datetime] = None) -> tuple[datetime, datetime]:
     ref = now or datetime.now()
-    sh, sm = _parse_hhmm(getattr(_cfg, "window_start", "10:05")) if _cfg else (10, 5)
-    eh, em = _parse_hhmm(getattr(_cfg, "window_end", "12:30")) if _cfg else (12, 30)
+    # 兜底**引用** `ScheduleConfig` 的默认值，不在这里再写一遍字面量 ——
+    # 窗口值曾散在四处（本处 / ScheduleConfig / config.load_config / config.yaml），
+    # 只改一处就会静默失同步：它们只在"配置键缺失"时才生效，正常跑永远看不出差异
+    # （DESIGN_NOTES 记过一次，是最隐蔽的那类坑）。守卫见
+    # tests.test_core.TestScheduleWindowConsistency。
+    fallback_start, fallback_end = _fallback_window()
+    sh, sm = _parse_hhmm(getattr(_cfg, "window_start", fallback_start)) if _cfg \
+        else _parse_hhmm(fallback_start)
+    eh, em = _parse_hhmm(getattr(_cfg, "window_end", fallback_end)) if _cfg \
+        else _parse_hhmm(fallback_end)
     start = ref.replace(hour=sh, minute=sm, second=0, microsecond=0)
     end = ref.replace(hour=eh, minute=em, second=0, microsecond=0)
     if end <= start:  # 非法窗口则退化为 1 小时

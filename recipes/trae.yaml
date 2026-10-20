@@ -208,7 +208,7 @@ client:
 
 reminder:
   # 开窗时刻闸门（HH:MM, UTC+8）。Trae 每日签到按北京时间日切，0 点即刷新
-  # ⇒ 不设额外限制（全局随机窗 10:05–12:30 已在其后）。
+  # ⇒ 不设额外限制（全局随机窗 10:05–11:00 已在其后）。
   not_before: '00:00'
   toast_title: 'Trae CN 每日签到提醒'
   toast_body: '打开 Trae CN → 从桌面快捷方式启动（带调试端口）→ 或运行 python -m checkin --now --only-site trae 补签。'

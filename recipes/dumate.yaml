@@ -185,7 +185,7 @@ client:
 
 reminder:
   # 每日签到按北京时间日切（signInDays 是 `YYYY-MM-DD` 本地日期），0 点即刷新
-  # ⇒ 全局随机窗 10:05–12:30 远在其后，不设额外闸门。
+  # ⇒ 全局随机窗 10:05–11:00 远在其后，不设额外闸门。
   not_before: '00:00'
   toast_title: 'DuMate 每日签到提醒'
   toast_body: '打开 DuMate（百度搭子）→ 从桌面快捷方式启动（带调试端口）→ 或运行 python -m checkin --now --only-site dumate 补签。'

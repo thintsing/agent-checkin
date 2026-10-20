@@ -3989,5 +3989,37 @@ class TestQQOpenidHeartbeat(unittest.TestCase):
         self.assertIsNone(saved["qq_bot"].get("group_openid"))
 
 
+class TestScheduleWindowConsistency(unittest.TestCase):
+    """窗口值**三处必须同步**（2026-10-20 压窗口 10:05–12:30 → 10:05–11:00 时补的守卫）。
+
+    `config.yaml` 的 `schedule.window_*` / `ScheduleConfig` 的 dataclass 默认值 /
+    `scheduler.window_bounds()` 的兜底值 —— 后两者**只在"配置键缺失"时才生效**，
+    正常跑永远看不出差异 ⇒ 不同步是最隐蔽的坑（DESIGN_NOTES 记过一次：
+    "三处默认值失同步是最隐蔽的坑"）。改窗口只改一处，这条守卫立刻变红。
+    """
+
+    def test_three_places_agree_on_the_window(self):
+        import yaml
+        sched = yaml.safe_load(
+            (PROJECT_ROOT / "config.yaml").read_text(encoding="utf-8"))["schedule"]
+        want_start = sched["window_start"]
+        want_end = sched["window_end"]
+
+        self.assertEqual(ScheduleConfig().window_start, want_start,
+                         "config.ScheduleConfig 的 window_start 没跟上 config.yaml")
+        self.assertEqual(ScheduleConfig().window_end, want_end,
+                         "config.ScheduleConfig 的 window_end 没跟上 config.yaml")
+
+        saved = scheduler._cfg
+        scheduler._cfg = None                      # 触发 `window_bounds()` 的兜底分支
+        try:
+            s, e = scheduler.window_bounds(datetime(2026, 10, 20, 8, 0))
+        finally:
+            scheduler._cfg = saved
+        hhmm = lambda d: f"{d.hour:02d}:{d.minute:02d}"      # noqa: E731
+        self.assertEqual(hhmm(s), want_start, "scheduler 兜底 window_start 没跟上")
+        self.assertEqual(hhmm(e), want_end, "scheduler 兜底 window_end 没跟上")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

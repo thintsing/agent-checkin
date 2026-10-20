@@ -51,7 +51,10 @@ class ScheduleConfig:
     """
 
     window_start: str = "10:05"
-    window_end: str = "12:30"
+    window_end: str = "11:00"     # 2026-10-20 压窗口（见 config.yaml 注释）。
+    #   ⚠ 改窗口必须**三处同步**：本默认值、`scheduler.window_bounds()` 的兜底、
+    #   `config.yaml`。它们只在"键缺失"时才生效，正常跑看不出差异 ⇒
+    #   不同步是最隐蔽的坑（DESIGN_NOTES 记过一次）。
     distribute: str = "random"       # random | earliest | latest
     skip_weekends: bool = False
     timezone: str = "Asia/Shanghai"
@@ -107,8 +110,11 @@ def load_config(root: str) -> tuple[AppConfig, List[Recipe]]:
         log_level=lg.get("level", "INFO"),
         redact_keys=lg.get("redact_keys", []),
         schedule=ScheduleConfig(
-            window_start=str(sc.get("window_start", "10:05")),
-            window_end=str(sc.get("window_end", "12:30")),
+            # 兜底**引用** dataclass 默认值，不在这里再写一遍字面量 ——
+            # 窗口值曾经散在四处（本处 / ScheduleConfig / scheduler.window_bounds /
+            # config.yaml），只改一处就会静默失同步（DESIGN_NOTES 记过一次）。
+            window_start=str(sc.get("window_start", ScheduleConfig.window_start)),
+            window_end=str(sc.get("window_end", ScheduleConfig.window_end)),
             distribute=str(sc.get("distribute", "random")),
             skip_weekends=bool(sc.get("skip_weekends", False)),
             timezone=str(sc.get("timezone", "Asia/Shanghai")),
