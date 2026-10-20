@@ -4,19 +4,62 @@
 >
 > *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
+<details>
+<summary><b>English</b> — what this is, in 8 lines</summary>
+
+A Windows scheduler that automates the **daily check-in** of four AI-coding-assistant desktop clients
+(WorkBuddy, Qoder CN, Trae CN, DuMate) — without ever touching your credentials.
+
+- **Recipe-driven.** Every site is one YAML file under `recipes/`. Adding a site needs **zero code changes**,
+  and no product name appears in the source tree.
+- **CDP, not scraping.** It attaches to an already-running client over the Chrome DevTools Protocol and calls
+  the client's *own* bridge (`window.wb.http`, `window.vscode.ipcRenderer`, `electronAPI.bceConsoleRequest`) —
+  the same path the client walks when you click the button yourself.
+- **Credentials never leave the client.** No token reverse-engineering, no password storage, no device-identity
+  forgery — reading `auth.machine-id` / `auth.v1.dat` is explicitly out of scope.
+- **Randomized schedule.** A fixed 09:55 wake-up, then the real moment is sampled from a Beta(2,2) distribution
+  inside the window. Never on the hour; never via the Task Scheduler's own `-RandomDelay`.
+- **Failures are loud.** Desktop toast + optional QQ push. "Done" is never printed next to failures, because
+  a green summary beside a red row is the worst possible notification.
+- **310 offline tests**, ~6 s, no network and no browser.
+
+⚠ Automating check-ins likely **violates those platforms' terms of service**. Use your own single account,
+single device, single network — and read the risk section before you start.
+
+</details>
+
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-229%20passing-brightgreen)](#测试)
-[![Sites](https://img.shields.io/badge/sites-3%20supported-orange)](#支持的平台)
+[![Tests](https://img.shields.io/badge/tests-310%20passing-brightgreen)](#测试)
+[![Sites](https://img.shields.io/badge/sites-4%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
+[![Deps](https://img.shields.io/badge/deps-websocket--client%20%2B%20PyYAML-informational)](#快速开始)
+
+> **当前状态**：4 个站点（WorkBuddy / Qoder CN / Trae CN / DuMate）每日全自动运行中，
+> 连续天数最长 27 天。310 项测试全绿。最后更新 **2026-10-20**。
+
+**目录**
+
+- [先读这段：风险声明](#risk)
+- [这是什么](#这是什么)
+- [五个技术硬骨头](#五个技术硬骨头)
+- [支持的平台](#支持的平台)
+- [快速开始](#快速开始) · [命令](#命令) · [结果通知](#notify)
+- [工作方式](#工作方式) · [目录结构](#目录结构)
+- [多 Agent 协同](#multi-agent)
+- [测试](#测试) · [已知限制](#limits) · [许可](#许可)
+
+> 想看踩坑细节：`DESIGN_NOTES.md`（设计决策与实测）、`HANDOFF.md`（每轮交接日志）、`AGENTS.md`（多 Agent 协作契约）。
 
 ---
 
+<a id="risk"></a>
+
 ## ⚠️ 先读这段：风险声明
 
-**本项目会自动化执行三个平台的每日签到，这可能违反它们的服务条款。请你自己权衡用哪个账号。**
+**本项目会自动化执行四个平台的每日签到，这可能违反它们的服务条款。请你自己权衡用哪个账号。**
 
-- 自动签到**违反 Qoder / WorkBuddy (CodeBuddy) / Trae 的服务条款**。无论做得多"像人"，都存在账号被限制或封禁的风险，**本工具无法保证不封号**。
+- 自动签到**违反 Qoder / WorkBuddy (CodeBuddy) / Trae / DuMate（百度搭子）的服务条款**。无论做得多"像人"，都存在账号被限制或封禁的风险，**本工具无法保证不封号**。
 - 项目内置的降风险设计（见下文）只是把风险**压低**，不是消除。
 - **只用你自己的单一账号、单一设备、单一出口网络**；绝不批量、多号、代理轮换 —— 那才是真正触发风控的模式。
 - 项目**明确不做**的一件事：不读取、不复刻客户端加密的 `auth.machine-id` / `auth.v1.dat` —— 那等于**伪造设备身份**，正踩风控红线。Qoder 走的是"CDP 驱动客户端自己点自己的按钮"，不碰任何接口。
@@ -37,12 +80,12 @@
 真实运行输出：
 
 ```text
-  站点            模式      连续    今日失败    今日
-  --------------------------------------------------------
-  qoder           client    15      0          已完成
-  workbuddy       client    19      0          已完成
-  trae            client     1      0          已完成
-  dumate          client     1      0          已完成
+  站点            模式       连续     今日失败      今日
+  ----------------------------------------------------------
+  dumate        client   1      0         已完成
+  qoder         client   23     0         已完成
+  trae          client   9      0         已完成
+  workbuddy     client   27     0         已完成
 ```
 
 ---
@@ -153,6 +196,12 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 > 配套守卫：`test_bridge_sites_declare_a_reachable_target` —— bridge 站点的 `target_match`
 > 必须非空且为**实测值**（这条守卫就是这次栽出来的）。
 
+> **同一准则第二次奏效（2026-10-20 接入 DuMate）**：它的前端是 `file://` origin，
+> 页面里直接 `fetch` 会被 **CORS 拦掉**，所以"先找桥"不是偏好而是**唯一出路** ——
+> 最终在 preload 里找到 `window.electronAPI.bceConsoleRequest`，正是它日志里
+> `[BceConsoleRequest][fe]` 走的同一条通道。
+> ⇒ 一条准则能被两个独立站点各自验证一次，才值得写进文档。
+
 ---
 
 ## 支持的平台
@@ -162,17 +211,23 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 | **WorkBuddy** (`codebuddy.cn`) | `client` | **CDP bridge**：在客户端页面上下文里调用它自己的 http 通道（`window.wb.http`），走 `/v2` 桌面端前缀 | 免维护登录态 —— **客户端自己持有并续期 token**；网页侧 cookie 只有 **168 小时（7 天）** 就会过期，周期性要求人工重登 |
 | **Qoder CN** | `client` | **CDP 驱动桌面客户端**点它自己的按钮 | 网页入口不存在（见上文 ①）；且不伪造设备指纹 |
 | **Trae CN** | `client` | **CDP bridge**：调客户端自己的 IPC 通道（`window.vscode.ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`） | 签到入口藏在新版 Solo Lite UI 的账号菜单里（点开还会落到付费页）；IPC 是**客户端自己点签到按钮时走的同一条路**，不碰 token / 设备身份文件 |
+| **DuMate**（百度搭子） | `client` | **CDP bridge**：调 preload 暴露的 `window.electronAPI.bceConsoleRequest`（客户端自己的请求通道） | 前端是 `file://` origin，页面里直接 `fetch` 会被 **CORS 拦掉**，必须走它自己的桥；判据是 `loginBonusInfo` 的 `hasIssued`，500 分/天 |
 
 新增站点**不需要改一行代码** —— 在 `recipes/` 放一个 YAML 即可。
 
+> ⚠ **DuMate 有个反直觉的点**：`loginBonus` 返回 `result: true` **不代表今天新领到了** ——
+> 当天已领时再 POST 服务端照样回 `true`，但积分和 `signInDays` 一动不动。
+> 所以判据只能落在「领取后**重读一次状态**」上（驱动 `_claim_via_bridge` 第 3 步就是干这个的）。
+> 只看 claim 的返回值，会每天错误地报告成功。
+
 > `auto`（在已登录浏览器页面上下文里 `fetch`）与 `manual`（只发提醒）两种模式**仍然保留、可用**；
-> 只是**当前三个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
+> 只是**当前四个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
 
 ### 接入一个新站点的两条路（2026-10-12 补）
 
 | 路径 | 适用 | 做法 |
 |---|---|---|
-| **bridge** | 客户端把接口桥在了 renderer 里（WorkBuddy 的 `window.wb.http`、Trae 的 `window.vscode.ipcRenderer`） | 配方写 `client.bridge.status_js` / `claim_js` 两段 JS；驱动只负责执行与判定，**不认识任何产品名** |
+| **bridge** | 客户端把接口桥在了 renderer 里（WorkBuddy 的 `window.wb.http`、Trae 的 `window.vscode.ipcRenderer`、DuMate 的 `window.electronAPI.bceConsoleRequest`） | 配方写 `client.bridge.status_js` / `claim_js` 两段 JS；驱动只负责执行与判定，**不认识任何产品名** |
 | **DOM** | 签到是客户端里一个独立活动页 target（Qoder 的 `growth-page` iframe） | 配方给 `target_match` + `claim_button` + `claimed_markers`，驱动等 target → 点按钮 → 读确认文案 |
 
 ⚠ **bridge 站点的 `target_match` 必须写实测值**。Trae 接入时就栽在这上面：曾凭直觉写成 `workbench.html`，
@@ -186,8 +241,8 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 > 环境：**Windows** + Python 3.9+（脚本会自动建 venv 装依赖）。用 Edge 或 Chrome 均可。
 
 ```bat
-REM 0) client 站点（当前三站都是）：让客户端启动即带上调试端口
-python tools\win_shortcut_args.py --app trae            REM qoder | workbuddy | trae
+REM 0) client 站点（当前四站都是）：让客户端启动即带上调试端口
+python tools\win_shortcut_args.py --app dumate         REM qoder | workbuddy | trae | dumate
 REM    ↑ 改完必须【重启客户端】才生效 —— 调试端口只能在进程启动时绑定
 
 REM 1) 首次：打开"签到专用浏览器"，在里面人工登录一次（登录态长期复用）
@@ -203,7 +258,7 @@ run_checkin.bat --install-task
 - 专用浏览器使用**独立 profile**（`%LOCALAPPDATA%\AgentCheckIn\chrome-profile`），与你日常浏览器完全隔离。
 - 本机没装 Chrome 时会自动退回 Edge —— 属正常降级。
 - 登录成功的硬证据在 cookie 里（`codebuddy.cn` 域下会出现 `KEYCLOUD_SESSION` / `session`）——
-  这一步**只有新增 `auto` 站点时才需要**；当前三个站点都走 `client`，登录态由客户端自己维护。
+  这一步**只有新增 `auto` 站点时才需要**；当前四个站点都走 `client`，登录态由客户端自己维护。
 
 ### 排查用（全部只读，绝不触发签到）
 
@@ -240,6 +295,8 @@ python -m checkin --print-task         # 打印等价的手写注册命令
 > ⚠ **不要给触发器加 `-RandomDelay`**：那会让当日 occurrence 被调度器静默判为 `missed` 后跳次日（2026-10-10 因此真漏签一天，见下）。**随机性必须留在进程内。**
 
 ---
+
+<a id="notify"></a>
 
 ### 结果通知：桌面 toast +（可选）推送到 QQ
 
@@ -309,9 +366,9 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 | 措施 | 实现 |
 |---|---|
 | **凭证不出浏览器** | 不逆向加密 token、不存账号密码；请求在已登录页面上下文里 `fetch`，浏览器自动带鉴权与真实 TLS/HTTP2 指纹（`browser/page_script.py`） |
-| **随机执行时刻** | 计划任务在**固定的 `09:55`**（窗口开始前 10 分钟）唤醒；真正的执行时刻由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待到点。**不是固定整点**。⚠ 刻意**不用**计划任务的 `-RandomDelay` —— 它会让当日 occurrence 被静默跳过（2026-10-10 事故） |
+| **随机执行时刻** | 计划任务在**固定的 `09:55`**（窗口开始前 10 分钟）唤醒；真正的执行时刻由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待到点 —— 向窗口中部聚集、两端稀疏。**不是固定整点**。窗口写在 `config.yaml` 的 `schedule.window_start/end`（当前 `10:05–11:00`，是**唯一真值**，改一处即可）。⚠ 刻意**不用**计划任务的 `-RandomDelay` —— 它会让当日 occurrence 被静默跳过（2026-10-10 事故） |
 | **不弹窗** | 任务用 `pythonw.exe`（无控制台）运行；派生的 `powershell` 子进程一律带 `CREATE_NO_WINDOW`，`sys.stdout/stderr` 为 None 时有兜底 —— **全程无可见窗口**（进程会静默等待，但看不见） |
-| **一天三次机会** | 计划任务三个触发：`09:55`（主）/ `13:00`（兜底）/ `21:00`（收尾）。主触发被判 missed（2026-10-15 真漏一天）或撞上"当天不会自愈"的状态（2026-10-17）时，后面还有机会；已成功的站点被幂等拦下。**全部站点都跳过时不再弹通知** —— 一天三响会把警告淹没 |
+| **一天三次机会** | 计划任务三个触发：`09:55`（主）/ `11:30`（兜底 = 窗口结束 +30min）/ `21:00`（收尾）。主触发被判 missed（2026-10-15 真漏一天）或撞上"当天不会自愈"的状态（2026-10-17）时，后面还有机会；已成功的站点被幂等拦下。**全部站点都跳过时不再弹通知** —— 一天三响会把警告淹没。⚠ **改了窗口必须重跑 `--install-task`**：兜底时刻是从窗口推导的，但它**写死在注册好的任务里**，不会自己跟着变（2026-10-20 压窗口时踩过：任务里还挂着 13:00） |
 | **单实例运行锁** | `core/lock.py`：系统级文件锁，防"计划任务 + 手动双击"并发导致重复打接口；进程退出自动释放。⚠ 进程被杀时 `release()` 不会执行，所以判陈旧**先看持锁 PID 在不在**（`procenv.pid_alive`），不在就立即接管 —— 只按时间戳判的话会白压 30 分钟、期间每次运行都被整轮跳过 |
 | **整轮预算 + 两遍扫描** | `core/models.RunBudget` + `engine.py`：一轮有总预算（默认 30 分钟）。第一遍每个站点最多等 `first_pass_wait_cap_sec`（25s），卡住的**立刻让位**；跑完一遍后用剩余预算回头补领。**这条是 2026-10-17 三站全军覆没的根因修复** —— 那时站点串行，第一个卡住就把后面的全饿死，连通知都发不出来 |
 | **昨日缺口补报** | `StateStore.missed_days()` + `__main__._collect_gaps()`：每天第一次运行会**回头看**上次完成之后到昨天为止有没有洞。计划任务 missed / 程序卡住 / 机器没开机 —— 任何一种都会让"昨天"整体消失，而第二天照常报"今日已完成"，那个洞**永远不提**。现在会明确播报（`昨天漏签了` / `漏签 N 天`），一天只报一次。⚠ 缺口必须在**引擎跑之前**取：今天一签上 `last_done_date` 就变成今天，那时回溯只会得到"没有缺口" |
@@ -339,7 +396,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 │   ├─ qoder_cdp_probe.py     # 只读侦察（定位活动入口，不点击）
 │   ├─ trae_cdp_probe.py      # 只读侦察（穿透 ShadowRoot；VSCode 系 UI 大量藏在里面）
 │   ├─ qoder_cdp_claim.py     # client 驱动的薄封装（launch / status / claim / close）
-│   ├─ qq_bot_openid.py       # 一次性抓 QQ 群标识（抓完就再也用不到长连接）
+│   ├─ qq_bot_openid.py       # 一次性抓接收方 openid（**私信优先**，抓完就再也用不到长连接）
 │   └─ win_shortcut_args.py   # 读写启动入口参数（.lnk + 自启动 Run 键）：让客户端启动即带调试端口（含备份/回滚）
 ├─ src/checkin/
 │   ├─ __main__.py            # 唯一 CLI 入口
@@ -358,6 +415,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 ```
 
 ---
+
+<a id="multi-agent"></a>
 
 ## 多 Agent 协同：这个项目本身的另一条主线
 
@@ -384,27 +443,33 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**229 项，全部离线**（不联网、不开浏览器），约 3–5 秒跑完：
+**310 项（296 单元 + 14 架构守卫），全部离线**（不联网、不开浏览器），约 6 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
-  注入 JS 的转义与脱敏、运行锁互斥、配置加载、引擎各闸门分支、**bridge 路径**（三段判定与降级）。
+  注入 JS 的转义与脱敏、运行锁互斥与**持锁进程判活**、配置加载、引擎各闸门分支、
+  **bridge 路径**（三段判定与降级）、昨日缺口补报、心跳周期。
 - **架构守卫（14 项）**：入口可导入、无孤儿模块、冻结接口签名不漂移、CLI 参数集不变。
+- **读真实配置文件的守卫**：例如 `TestScheduleWindowConsistency` 直接读 `config.yaml`
+  比对 `ScheduleConfig` / `load_config` / `window_bounds` 三方窗口值 —— 只改一处就会红。
+  这类守卫存在的理由：同一个值散写多处时，**失同步只在"键缺失"时才显形**，正常跑永远看不出来。
 - 另有多项**针对实测接口的回归断言**（例如"status 必须 POST、不得使用已废弃的僵尸接口"），
   它们的作用是**防止有人把踩过的坑改回去**。
 
 ---
 
+<a id="limits"></a>
+
 ## 已知限制（诚实记录）
 
 这个项目在文档里保留了**被推翻的中间结论**和**未验证项** —— 我认为这比粉饰更有价值。
 
-1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在三个站点都走 `client`，
+1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在四个站点都走 `client`，
    网页侧浏览器当前没有站点在用。`client` 路径下的写响应**已实测观测**
    （2026-10-06 起 WorkBuddy bridge 路线跑通，`data.status` 业务词表已在真机验证）；
    `auto` 侧仍保留双保险（业务词表 + code 规则），首次真跑前不做额外"验证性"写请求
    （多发一次就多一分风险）。
 2. **Qoder 客户端升级可能改版**：若按钮文案 / DOM 变化，驱动返回 `no_action` 并提示人工查看，
-   **不会静默假成功**。当前 `0.4.4` 已复验通过，后续每次升级都需重新确认。
+   **不会静默假成功**。当前 `0.4.8` 复验通过（2026-10-20），后续每次升级都需重新确认。
 3. **客户端升级会同时动三处**（2026-09-27 实测 `0.4.2 → 0.4.3`；2026-10-08 `5.7.6 → 5.7.7` 又动了一处）：
    - **快捷方式参数**可能被重置：`开始菜单` 那个入口会被应用**回写成无参数版**
      （已加只读保护挡住；升级时它若重建失败属正常，`data/shortcut_backup/` 有原始备份）。
@@ -418,7 +483,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，
    重启客户端也拿不回。所以端口值以各站点配方的 `client.debug_port` 为单一事实源
-   （Qoder=9337 / WorkBuddy=9336 / Trae=9338），换端口是改一行的事。
+   （**Qoder=9340** / WorkBuddy=9336 / Trae=9338 / **DuMate=9341**），换端口是改一行的事。
+   ⚠ 9233/9334/9335/9337 等旧值已作废（被僵尸句柄占过），**不要照抄旧文档**。
 5. **计划任务只在有登录会话时运行**（锁屏算、未登录不算）—— 开浏览器需要桌面会话。
 
 ---
