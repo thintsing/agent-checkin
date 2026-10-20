@@ -42,6 +42,7 @@
   qoder           client    15      0          已完成
   workbuddy       client    19      0          已完成
   trae            client     1      0          已完成
+  dumate          client     1      0          已完成
 ```
 
 ---
@@ -80,7 +81,7 @@ python tools\win_shortcut_args.py --app workbuddy --autostart            REM 给
 python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还原
 ```
 
-端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
+端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae|dumate`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
 
 驱动随之采用**四分支决策**，核心原则是 **不轻易动用户正在用的客户端**
 （2026-10-14 起有**一处窄口例外**，见下表 ③）：
@@ -332,7 +333,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 ├─ recipes/                   # ★ 站点配方：站点知识全部是数据，不是代码
 │   ├─ workbuddy.yaml         #   mode: client（bridge 调客户端 http 通道 + verdict.rules 业务码判定）
 │   ├─ qoder.yaml             #   mode: client（CDP 驱动桌面客户端自己点按钮领）
-│   └─ trae.yaml              #   mode: client（bridge 调客户端 IPC 通道，不点 DOM）
+│   ├─ trae.yaml              #   mode: client（bridge 调客户端 IPC 通道，不点 DOM）
+│   └─ dumate.yaml            #   mode: client（bridge 调 electronAPI.bceConsoleRequest，读 hasIssued 判据）
 ├─ tools/
 │   ├─ qoder_cdp_probe.py     # 只读侦察（定位活动入口，不点击）
 │   ├─ trae_cdp_probe.py      # 只读侦察（穿透 ShadowRoot；VSCode 系 UI 大量藏在里面）
@@ -411,7 +413,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
    - **更难查的一种**：升级时启动器会**自己把应用重启一遍**（`state.ini` 的 `updatedAt`
      与应用的启动时刻重合，且同一刻 `targetVersion` 发生切换），这一次重启**不带**
      透传的调试开关 ⇒ 端口没开，驱动只能走 ③ 降级提醒。
-   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|workbuddy|trae` **以及**
+   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|workbuddy|trae|dumate` **以及**
      `... --app workbuddy --autostart`，**再从快捷方式重启客户端**。
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，

@@ -7,6 +7,78 @@
 
 ---
 
+## [2026-10-20 12:10] WorkBuddy(阿拾) —— 接入 DuMate + **抓到一处整轮崩溃**（客户端一关就炸）
+
+**结果先说**：DuMate（百度搭子）已列为第 4 个站点，今日 `already`（500 分/天）。
+更重要的收获是：为了验证它的自愈链，撞到一个**能让整轮彻底崩掉**的死代码 ——
+只要**任意一个 `client` 站点的客户端没在跑**，`run()` 就会返回 `None`，引擎紧接着
+`last.outcome` 抛 `AttributeError` ⇒ **进程退出码 1 ⇒ 后面的站点全不跑、汇总和推送一条都发不出**。
+用户晚上把客户端关掉，就是这个条件。
+
+### 一、DuMate 配方：`recipes/dumate.yaml`（mode: client）
+
+- 客户端 Electron 43.1.1，userData=`%APPDATA%\qianfan-desktop-app`，日志 `log\electron.log`
+  把每个请求都打了（`[BceConsoleRequest]`），**服务端响应体是取证金矿**。
+- 签到接口（从日志里取证，非逆向）：
+  - `GET /api/dumate/points/loginBonusInfo` → `{totalTimes, totalPoints, hasIssued, signInDays}`
+  - `POST /api/dumate/points/loginBonus` → `{result:true}`
+- **桥**：`window.electronAPI.bceConsoleRequest({path, method})` —— preload 经 contextBridge
+  暴露的**客户端自己的**请求通道（用户点按钮走同一条），不伪造请求、不碰 token/设备身份。
+- ⚠ **`result:true` 不等于"今天新领到"**：实测今日已领再 POST **照样回 true**，
+  但 `totalPoints`/`signInDays` 纹丝不动。判据只能落在 **`hasIssued`（claim 后重读 status）**，
+  驱动的 `_claim_via_bridge` 第 3 步做的正是复核。只信 claim 返回值 = 标准假成功。
+- ⚠ **不配 `log_state`**：日志确实落了响应体，但时间戳在行首 `[2026-10-20 11:35:00.781]`，
+  而 `_log_state_from_file` 只认行内 JSON 的 `"timestamp"` ⇒ 判不了"本窗口内是否已领"。
+  **宁可不配，也不配一个恒 None 的装饰**（那正是本项目反复声讨的"名存实亡"）。
+- 空闲 CPU 基线实测 **0.172 核·秒/5s**（24 核，全套子进程都在），阈值 1.0，约 5.8 倍余量。
+- 启动入口：`tools/win_shortcut_args.py --app dumate` 已写桌面 + 开始菜单两个 .lnk（各有备份）。
+
+### 二、真 bug：`run()` 的 ④「客户端没在跑 → 拉起来」是**死代码**
+
+`ast` 一查就清楚了：
+
+```
+run                  lines 203- 295
+_resume_broken_port  lines 297- 363   ← ④ 就躲在这里面
+```
+
+④ 被错位塞进 `_resume_broken_port()`，且位于该函数**无条件 `return` 之后** ⇒ 永不执行；
+而 `run()` 因此**落到函数末尾返回 `None`**。引擎随后 `last.outcome` → 崩。
+
+- 危害不是"少一个分支"，而是**整轮连坐**：一个站点的驱动违约，把整轮结果与通知全吞了。
+- 触发条件平常得可怕：**用户晚上把客户端关掉**（或客户端升级后没重启）。
+- 修法两处：
+  1. `client_claim.py`：④ 搬回 `run()`，作为"没在跑"的兜底分支；
+  2. `engine.py`：`last is None` 显式记为 `ERROR` 并继续下一站 ——
+     **一个驱动写坏，惩罚必须止步于这个站点**。
+
+### 三、验证（照例"改回去看它变红"）
+
+| 验证 | 结果 |
+|---|---|
+| 新增 3 条守卫 | `test_client_not_running_launches_and_claims`、`test_launch_closes_client_only_when_close_after_true`、`test_driver_returning_none_cannot_kill_the_round` |
+| 把 ④ 再改回 `return None` | 前两条同时变红（`unexpectedly None` / `close_after` 行为不对） |
+| 把引擎兜底关掉 | 第三条变红，报的正是线上那个 `AttributeError: 'NoneType' object has no attribute 'outcome'` |
+| 全量测试门 | **309 绿** |
+| **生产上下文**冷启动（计划任务 + pythonw，DuMate 全关） | 12:01:47 拉起 → 12:01:48 读 bridge → `already`，**1 秒内走完**，日志无 GPU 崩溃 |
+
+### 四、一条环境坑（别误判成程序问题）
+
+在**本工具的会话上下文**里 `spawn` DuMate，GPU 进程会连续崩（`0xC0000005`）、渲染进程跟着崩
+（`child-process-gone: {"type":"GPU","reason":"crashed"}`），表现为"客户端已启动但主窗口不出现"。
+同一份代码走**计划任务**派生就一切正常。⇒ 验证客户端能否被拉起，**必须在生产上下文里验**，
+否则会把环境限制误记成代码缺陷（这一轮差点就这么结案）。排查入口：
+`%APPDATA%\qianfan-desktop-app\log\electron.log` 里的 `[CrashDumper] child-process-gone`。
+
+### 五、遗留
+
+- 计划任务 `DuMateCDPOnboard`（无触发器，当初用来绕开上述 GPU 崩溃拉起 DuMate）仍在。
+  它**没有触发器不会自己跑**；下次 DuMate 关着时可安全删除（现在删会连带它的子进程）。
+- 未验证：`restart_when_portless`（客户端在跑但没端口）这条对 DuMate 的实跑 ——
+  它与 qoder/trae 共用同一段 `_restart_client`，且快捷方式已带端口，优先级低。
+
+---
+
 ## [2026-10-19 14:20] WorkBuddy(阿拾) —— ✅ **QQ 推送全程打通**（卡了六轮的 openid 拿到了）
 
 **结果先说**：`user_openid=003B2CD46F9E6CF10B5D428FE5E35363` 已回填

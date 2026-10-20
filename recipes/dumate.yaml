@@ -1,0 +1,196 @@
+# ============================================================
+#  站点配方 · DuMate（百度搭子）
+#  形态：client —— 驱动桌面客户端自己完成签到（复用客户端持有的登录态与设备身份）。
+#
+#  ---- 2026-10-20 静态取证（只读 app.asar，未逆向、未碰任何鉴权/设备身份文件）----
+#  客户端 1.0.86（Electron 43.1.1，Chromium 150，app-user-model-id=com.baidu.qianfan.desktop）
+#  userData = %APPDATA%\qianfan-desktop-app
+#
+#  签到接口（前端打包在 app.asar，经主进程的 BceConsoleRequest 发出）：
+#      GET  /api/dumate/points/loginBonusInfo   → 今日是否已领
+#      POST /api/dumate/points/loginBonus       → 领取
+#
+#  renderer 侧的桥（**主路径**）：
+#      window.electronAPI.bceConsoleRequest({path, method})
+#        → {statusCode, data:{code, message, success, result}}
+#  这是 preload 经 contextBridge 暴露的**客户端自己的**请求通道 —— 客户端日志里
+#  `[BceConsoleRequest][fe]` 就是它，与用户点按钮走的是同一条路：
+#  不伪造请求、不复刻 token、不碰设备身份。
+#
+#  ---- 2026-10-20 真机实测（端口 9341，端到端三段全通）----
+#    status before : {"statusCode":200,"data":{"code":0,"success":true,"result":
+#                     {"totalTimes":1,"totalPoints":500,"hasIssued":false,
+#                      "signInDays":["2026-10-19"]}}}      ← 服务端日志 11:34:17 同证
+#    claim         : {"statusCode":200,"data":{"code":0,"success":true,"result":true}}
+#    status after  : {"totalTimes":2,"totalPoints":1000,"hasIssued":true,
+#                     "signInDays":["2026-10-19","2026-10-20"]}   ← 服务端铁证 11:35:00
+#
+#  ⇒ 每日 500 分；判据是 `hasIssued`，`signInDays` 可作交叉验证（含今天则已签）。
+#
+#  ⚠⚠ **`result:true` 不等于「今天新领到」**（2026-10-20 实测）：
+#    今日已领的状态下再 POST，服务端**照样回 `result:true`**，而 `totalPoints` 与
+#    `signInDays` 一点没动。只信 claim 的返回值 ⇒ 每天都能"报成功"，是标准的假成功。
+#    ⇒ 唯一可信的判据是 **claim 之后重读 status**。驱动的 `_claim_via_bridge` 第 3 步
+#      做的正是这件事（复核不通过会主动降级 no_action），所以这里不必在 JS 里再查一次。
+#
+#  ⚠ 为什么不用 DOM：前端是 `file://.../app.asar/frontend/index.html` 的本地包，
+#    签到入口在「我的/积分」类面板里且 class 带构建期 hash —— 版本一升就静默失效。
+#    bridge 才是主路径。
+#
+#  ⚠ 刻意**不配 `log_state`**：它的 `log\electron.log` 确实落了响应体（含 `hasIssued`），
+#    但时间戳是行首的 `[2026-10-20 11:35:00.781]`，而 `_log_state_from_file` 只认行内
+#    JSON 的 `"timestamp":"..."` ⇒ 拿不到时刻 ⇒ 判不了"本窗口内是否已领"。
+#    宁可不配，也不配一个恒 None 的装饰（那正是本项目反复声讨的"名存实亡"）。
+# ============================================================
+id: dumate
+name: DuMate（百度搭子）每日签到
+enabled: true              # 2026-10-20 真机验证：status 预检 / claim / 复核 三段全通
+mode: client
+
+verdict:
+  transport: body_code
+  rules:
+    - { code: 0,   result: success }
+    # 未登录/登录过期时桥会带回 401/403，这里显式映射成 need_login，
+    # 否则会落进 unknown → no_action，用户永远看不到"该登录了"。
+    - { code: 401, result: need_login }
+    - { code: 403, result: need_login }
+  unknown_result: no_action
+  # 响应体 data 里表示"**今天**已领"的字段（实测 false → true）。
+  # 有它才能在已签时收手，绝不重复调 claim。
+  checked_in_flag: hasIssued
+
+client:
+  exe: '%LOCALAPPDATA%\Programs\DuMate\DuMate.exe'
+  exe_glob: ''
+  # 调试端口 —— **单一事实源**：tools/win_shortcut_args.py 写快捷方式时读的就是这里。
+  # 台账：9333=网页侧专用浏览器 / 9336=WorkBuddy / 9338=Trae / 9340=Qoder / 9341=本应用。
+  # （9334/9335/9337 已被僵尸监听占死，不可复用。）
+  debug_port: 9341
+  # 按进程名匹配主进程。`_app_running` 会排除 `--type=*` 子进程与 `*app-host.cjs*` 助手，
+  # 这个客户端恰好有 6 个同 exe 名的子进程（renderer/GPU/utility），必须靠这条过滤。
+  process_match: 'DuMate.exe'
+  # 它自己的启动比较慢（要拉起 dumate-main-server / opencode / router / na 等一整套）
+  launch_timeout_sec: 90
+  target_timeout_sec: 30
+
+  # 主窗口 renderer 的 URL（实测只有一个 page target，origin 是 `file://`）
+  target_match: 'app.asar/frontend/index.html'
+  main_target_match: 'app.asar/frontend/index.html'
+
+  # ---- bridge：不点 DOM，直接调客户端自己的请求通道 ----
+  # 表达式**必须返回 JSON 字符串**（跨 CDP 边界用 returnByValue，字符串最稳），
+  # 且驱动只认**顶层 `code`** ⇒ 这里把业务码从 `data.code` 提上来，
+  # `data` 换成 `result` 原样带出，供 `verdict.checked_in_flag` 读取。
+  # ⚠ `statusCode` 不是 `status` —— 这个客户端用的是前者，写错会永远算出 code=0。
+  bridge:
+    status_js: |
+      (async () => {
+        const r = await window.electronAPI.bceConsoleRequest(
+          { path: '/api/dumate/points/loginBonusInfo', method: 'GET' });
+        const sc = r && r.statusCode;
+        const w = (r && r.data) || {};
+        let c = (typeof w.code === 'number') ? w.code : (sc === 200 ? 0 : -1);
+        if (c === 0 && (sc === 401 || sc === 403)) c = sc;
+        const d = w.result || {};
+        return JSON.stringify({ code: c, data: {
+          hasIssued: !!d.hasIssued,
+          signInDays: Array.isArray(d.signInDays) ? d.signInDays : [],
+          totalPoints: d.totalPoints,
+          totalTimes: d.totalTimes,
+          statusCode: sc
+        }});
+      })()
+    claim_js: |
+      (async () => {
+        const r = await window.electronAPI.bceConsoleRequest(
+          { path: '/api/dumate/points/loginBonus', method: 'POST' });
+        const sc = r && r.statusCode;
+        const w = (r && r.data) || {};
+        let c = (typeof w.code === 'number') ? w.code : (sc === 200 ? 0 : -1);
+        if (c === 0 && (sc === 401 || sc === 403)) c = sc;
+        // ⚠ 这里的 `claimed` 只作日志留痕：实测**今日已领也会回 true**，
+        //   真正的判据是驱动随后重读 status 得到的 hasIssued。
+        return JSON.stringify({ code: c, data: {
+          claimed: w.result === true,
+          statusCode: sc
+        }});
+      })()
+
+  # 绝不关用户的客户端：这是用户日常在用的 AI 助手，还托管着 opencode/router 等一组
+  # 后台服务，关掉等于打断他手上的活。（字段必须**显式**写 —— 代码默认是 true，
+  # WorkBuddy 那份配方就因为注释写了 false、字段却漏着，差点误关用户主力工具。）
+  close_after: false
+
+  # 无端口守候：调试端口只能在**启动时**绑定，而这个客户端常常一开就是一整天/好几天。
+  # 端口不通时按此守候，用户中途重启（带上 9341）即接管补领。
+  wait_port_sec: 5400
+
+  # 端口绑定失败（命令行带了端口、端口却连不上 ⇒ 已知不会自愈）⇒ 自动重启并当场补领。
+  restart_on_bind_failure: true
+
+  # ---- 端口的三种坏法，各自的自愈手段 ----
+  #   ① 僵尸 socket ⇒ 自动换端口（写回本文件）。
+  #   ② 命令行完全没有端口参数 ⇒
+  #        repair_launch_entry   把桌面/开始菜单快捷方式改回带端口（只影响**下一次**启动）。
+  #        restart_when_portless 授权"确认空闲后自行重启"并当场补领。
+  # 本站点开启自行重启：它不像 WorkBuddy 那样是宿主进程，重启不会掐断任何会话；
+  # 且必须过下面的忙闲关。
+  repair_launch_entry: true
+  restart_when_portless: true
+
+  # ---- 重启前的"忙闲"把关 ----
+  # 只有判定为**空闲**才放行；忙则挂载监测（最多 wait_busy_sec）；**看不清同样不重启**。
+  #
+  # ⚠ 诚实说明这条判据在本站点的**实际有效性**：`busy_js` 要连着调试端口才能跑，
+  #   而"端口不通"正是我们唯一想重启的场景 ⇒ 两条重启路径上它**必然取不到结论**，
+  #   实际决定权在下面的 CPU 旁证。之所以仍然写它：
+  #     `_safe_to_restart` 在**没配 busy_js 时直接拒绝重启**（连 CPU 旁证都用不上），
+  #     所以它在这里的作用是"解锁"，不是"判定"。
+  #   不要把这条当成"忙闲关已经验过"——真正起作用的是 cpu_window_sec/idle_cpu_sec。
+  #
+  # ⚠ 判据词**刻意不含** execution / progress（Trae 空闲时就带着
+  #   `task-panel-slide-executions`，含了会永远误判为忙）。
+  #   DuMate 的忙态特征**尚未取到样本**，这里用通用词表，取向偏保守。
+  busy_probe:
+    busy_js: |
+      (() => {
+        const vis = el => { try { const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0; } catch (e) { return false; } };
+        const cn = el => { const c = el.className;
+          return typeof c === 'string' ? c : (c && c.baseVal) || ''; };
+        const txt = el => ((el.innerText || el.textContent || '') + '').trim();
+        const CLS = /running|processing|loading|spinner|busy/i;
+        const TXT = /执行中|运行中|进行中|处理中|排队中|等待中|生成中/;
+        for (const el of document.querySelectorAll('*')) {
+          if (!vis(el)) continue;
+          const c = cn(el);
+          if (c && CLS.test(c)) return true;
+          const a = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+          if (a && (CLS.test(a) || TXT.test(a))) return true;
+          const t = txt(el);
+          if (t && t.length < 24 && TXT.test(t)) return true;
+        }
+        return false;
+      })()
+    wait_busy_sec: 1800
+    # CPU 旁证：观测窗 5s 内全部 DuMate 相关进程合计消耗的 CPU（核·秒）。
+    # 2026-10-20 实测空闲基线 = **0.172 核·秒 / 5s**（24 核机器，含 main-server /
+    # opencode / router / na / relay 全套子进程）⇒ 阈值取 1.0，留约 5.8 倍余量。
+    # 取向：宁可判"忙"多等一会儿，也不能把正在给用户干活的实例重启掉。
+    cpu_window_sec: 5.0
+    idle_cpu_sec: 1.0
+
+  data_dir: '%APPDATA%\qianfan-desktop-app'
+
+reminder:
+  # 每日签到按北京时间日切（signInDays 是 `YYYY-MM-DD` 本地日期），0 点即刷新
+  # ⇒ 全局随机窗 10:05–12:30 远在其后，不设额外闸门。
+  not_before: '00:00'
+  toast_title: 'DuMate 每日签到提醒'
+  toast_body: '打开 DuMate（百度搭子）→ 从桌面快捷方式启动（带调试端口）→ 或运行 python -m checkin --now --only-site dumate 补签。'
+  note: '签到入口在积分面板；每日 0 点（UTC+8）刷新一轮，每轮 500 积分。'
+
+schedule_hint:
+  timezone: Asia/Shanghai
+  refresh_hour_utc8: 0

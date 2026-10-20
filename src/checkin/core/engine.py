@@ -246,6 +246,15 @@ class Engine:
                 log.exception("[%s] 驱动异常", sid)
                 last = CheckinResult(sid, Outcome.ERROR, message=f"异常: {e}")
 
+            # 驱动**返回 None** 属于契约违约，但绝不能让整轮因此炸掉。
+            # 2026-10-20 实证：`client` 驱动里一段代码错位，落到函数末尾返回 None，
+            # 下一行 `last.outcome` 抛 AttributeError ⇒ 进程退出码 1 ⇒ 后面的站点
+            # 一个都不跑、汇总和推送也一条都发不出（正是本项目最怕的静默失败）。
+            # 一个站点的驱动写坏了，惩罚必须止步于这个站点。
+            if last is None:
+                log.error("[%s] 驱动返回 None（契约违约），按错误处理，不影响其余站点", sid)
+                last = CheckinResult(sid, Outcome.ERROR, message="驱动未返回结果")
+
             if last.outcome in FAILURE_OUTCOMES and attempts < max_attempts:
                 wait = jitter.backoff_sec(attempts)
                 if budget is not None:

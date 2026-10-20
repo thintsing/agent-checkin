@@ -294,6 +294,30 @@ class ClientDriver(Driver):
                                          "waited_sec": wait_sec,
                                          "pass": budget.pass_index if budget else 0})
 
+        # ④ 客户端**没在跑** → 我们拉起来，领完再关掉（`close_after` 默认 true）。
+        #
+        # ⚠ 2026-10-20 修：这一段原本**错位**在 `_resume_broken_port()` 里、位于一个
+        #   无条件 `return` 之后 ⇒ 从未执行过，且让 run() 落到函数末尾返回 `None`。
+        #   后果不是"少一个分支"，而是**整轮炸掉**：引擎 `last.outcome` 抛 AttributeError
+        #   ⇒ 进程退出码 1 ⇒ 后面的站点全不跑、通知一条都发不出去。
+        #   触发条件极其常见：用户晚上把客户端关了。是最典型的静默失败。
+        exe = self._resolve_exe(c)
+        if not exe:
+            return CheckinResult(sid, Outcome.ERROR,
+                                 message="找不到客户端可执行文件（检查 client.exe / client.exe_glob）")
+        timeout = int(c.get("launch_timeout_sec", 60))
+        log.info("[%s] 客户端未运行，启动客户端: %s", sid, exe)
+        proc = procenv.spawn([exe, f"--remote-debugging-port={port}"])
+        try:
+            if not self._wait_port(port, timeout):
+                return CheckinResult(sid, Outcome.ERROR,
+                                     message=f"客户端已启动但 {timeout}s 内调试端口未就绪",
+                                     detail={"pid": proc.pid})
+            return self._claim(recipe, c, port, match)
+        finally:
+            if bool(c.get("close_after", True)):
+                self._shutdown(port)
+
     def _resume_broken_port(self, recipe: Recipe, cfg, c: Dict[str, Any], port: int,
                             match: str, budget: Optional[RunBudget],
                             cap: Optional[float]) -> CheckinResult:
@@ -343,24 +367,6 @@ class ClientDriver(Driver):
                              message="客户端启动时端口绑定失败，请重启客户端后补领",
                              detail={"reason": "debug_port_bind_failed",
                                      "pass": budget.pass_index if budget else 0})
-
-        # ④ 客户端没在跑 → 我们拉起来，领完再关掉
-        exe = self._resolve_exe(c)
-        if not exe:
-            return CheckinResult(sid, Outcome.ERROR,
-                                 message="找不到客户端可执行文件（检查 client.exe / client.exe_glob）")
-        timeout = int(c.get("launch_timeout_sec", 60))
-        log.info("[%s] 启动客户端: %s", sid, exe)
-        proc = procenv.spawn([exe, f"--remote-debugging-port={port}"])
-        try:
-            if not self._wait_port(port, timeout):
-                return CheckinResult(sid, Outcome.ERROR,
-                                     message=f"客户端已启动但 {timeout}s 内调试端口未就绪",
-                                     detail={"pid": proc.pid})
-            return self._claim(recipe, c, port, match)
-        finally:
-            if bool(c.get("close_after", True)):
-                self._shutdown(port)
 
     def _busy_state(self, port: int, match: str, c: Dict[str, Any],
                     idle_fallback: Optional[Callable[[], Optional[bool]]] = None

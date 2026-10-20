@@ -126,6 +126,19 @@ APPS = {
         # 2026-10-12 实地核查 HKCU\...\Run：无 Trae 项（它不自启，只走快捷方式）。
         "run_key": None,
     },
+    "dumate": {
+        "label": "DuMate（百度搭子）",
+        "recipe": "dumate.yaml",
+        # 2026-10-20 实地核查：桌面 + 开始菜单各一个，文件名就是 DuMate.lnk。
+        "lnks": [
+            r"%USERPROFILE%\Desktop\DuMate.lnk",
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\DuMate.lnk",
+        ],
+        # 未观察到 DuMate 回写快捷方式；没有实测依据就不加只读锁。
+        "lock": None,
+        # 2026-10-20 实地核查 HKCU\...\Run：无 DuMate 项（不自启，只走快捷方式）。
+        "run_key": None,
+    },
 }
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
 

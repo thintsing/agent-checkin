@@ -1222,6 +1222,55 @@ class TestClientDriverLogic(unittest.TestCase):
         self.assertFalse(ok)
         sp.assert_not_called()
 
+    # ------------------ 客户端**没在跑** ⇒ 拉起来（2026-10-20 修的死代码）
+
+    def test_client_not_running_launches_and_claims(self):
+        """回归（2026-10-20 实测抓到的**整轮崩溃**）：
+
+        「客户端没在跑 → 拉起来领完再关」那段 ④ 被错位塞进了
+        `_resume_broken_port()`，且位于该函数的**无条件 return 之后** ⇒ 从未执行。
+        危害不止"少一个分支"：`run()` 一路落到函数末尾返回 **None**，
+        引擎 `last.outcome` 立刻抛 AttributeError ⇒ 进程退出码 1
+        ⇒ **后面的站点一个都不跑、汇总与推送一条都发不出去**。
+        触发条件平常得可怕：用户晚上把客户端关掉。
+        """
+        r = self._run_recipe(debug_port=9338, close_after=False)
+        ok = CheckinResult("workbuddy", Outcome.SUCCESS, message="ok")
+        with mock.patch.object(self.d, "_port_alive", return_value=False), \
+             mock.patch.object(self.d, "_app_running", return_value=""), \
+             mock.patch.object(self.d, "_resolve_exe", return_value="C:/x.exe"), \
+             mock.patch.object(self.d, "_wait_port", return_value=True), \
+             mock.patch.object(self.d, "_claim", return_value=ok) as claim, \
+             mock.patch("checkin.drivers.client_claim.procenv.spawn",
+                        return_value=type("P", (), {"pid": 7})()) as sp:
+            res = self.d.run(r, _cfg())
+        self.assertIsNotNone(res, "客户端没在跑时 run() 绝不能返回 None（会炸掉整轮）")
+        self.assertIs(res, ok)
+        self.assertIn("--remote-debugging-port=9338", sp.call_args[0][0])
+        claim.assert_called_once()
+
+    def test_launch_closes_client_only_when_close_after_true(self):
+        """`close_after` 是**用户主力的工具开关**：默认 true（临时拉起就关），
+        但 WorkBuddy/DuMate 这类日常在用的必须是 false，否则等于替用户关掉他的工具。
+
+        2026-10-20 起 `close_after` 分支被搬到 ④ 里（原位置在死代码中），
+        这条守卫盯着"关/不关"两边的行为，防止搬家时把它弄丢。
+        """
+        ok = CheckinResult("workbuddy", Outcome.SUCCESS, message="ok")
+        for close_after, expect_shutdown in ((False, False), (True, True)):
+            r = self._run_recipe(debug_port=9338, close_after=close_after)
+            with mock.patch.object(self.d, "_port_alive", return_value=False), \
+                 mock.patch.object(self.d, "_app_running", return_value=""), \
+                 mock.patch.object(self.d, "_resolve_exe", return_value="C:/x.exe"), \
+                 mock.patch.object(self.d, "_wait_port", return_value=True), \
+                 mock.patch.object(self.d, "_claim", return_value=ok), \
+                 mock.patch.object(self.d, "_shutdown") as sd, \
+                 mock.patch("checkin.drivers.client_claim.procenv.spawn",
+                            return_value=type("P", (), {"pid": 7})()):
+                self.d.run(r, _cfg())
+            self.assertEqual(sd.called, expect_shutdown,
+                             f"close_after={close_after} 时的关闭行为不对")
+
     # -------- 端口真假的两道判据（2026-10-15 被假端口骗了半天）
 
     class _FakeResp:
@@ -1942,6 +1991,34 @@ class TestEngineGates(unittest.TestCase):
         r = Recipe(id="weird", name="weird", mode="does-not-exist")
         res = Engine(self.cfg, [r]).run(dry_run=True)
         self.assertIs(res[0].outcome, Outcome.NO_ACTION)
+
+    def test_driver_returning_none_cannot_kill_the_round(self):
+        """回归（2026-10-20 真机抓到）：驱动违约返回 `None` 时，引擎紧接着读
+        `last.outcome` 会抛 AttributeError ⇒ 整个进程退出码 1 ⇒ **后面的站点全不跑、
+        汇总与推送一条都发不出去**（当天实证：dumate 的"拉起客户端"分支曾返回 None）。
+
+        引擎的立身之本就是"一个站点不能拖垮整轮"，所以这里必须显式兜住，
+        而且后面那个站点要照常跑完。
+        """
+        class _NoneDriver:
+            def run(self, recipe, cfg, dry_run=False, probe=False, **_):
+                return None
+
+        class _OkDriver:
+            def run(self, recipe, cfg, dry_run=False, probe=False, **_):
+                return CheckinResult(recipe.id, Outcome.SUCCESS, message="ok")
+
+        broken = Recipe(id="broken", name="broken", mode="client")
+        fine = Recipe(id="fine", name="fine", mode="auto")
+        with mock.patch("checkin.core.engine.driver_for",
+                        side_effect=lambda m: _NoneDriver() if m == "client" else _OkDriver()), \
+             mock.patch("checkin.core.engine.jitter.sleep_range", return_value=0.0):
+            res = Engine(self.cfg, [broken, fine]).run(now=True)
+
+        self.assertEqual([x.site_id for x in res], ["broken", "fine"],
+                         "返回 None 的站点之后，其余站点必须照常执行")
+        self.assertIs(res[0].outcome, Outcome.ERROR, "None 应被记为错误，而不是崩掉")
+        self.assertIs(res[1].outcome, Outcome.SUCCESS)
 
     def test_human_like_delay_only_on_real_runs(self):
         """拟人延迟**只**在真跑时施加。
