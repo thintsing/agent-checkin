@@ -3029,6 +3029,71 @@ class TestClientBridge(unittest.TestCase):
         res = self._driver()._claim_via_bridge(r, r.client, 1, "m", r.client["bridge"])
         self.assertEqual(res.outcome, Outcome.SUCCESS)
 
+    # --------------------------------------------- 界面刷新（2026-10-21 新增）
+    #
+    # 背景（用户原话）："百度搭子并没有签到成功"。实际服务端已领（+500，signInDays 含当天），
+    # 但**侧边卡片仍写"立即签到"** —— 客户端 UI 的签到状态只在页面加载时拉一次，
+    # focus / visibilitychange 都不重拉（两个事件都实测过，日志零新增请求）。
+    # 刷新是可选开关，且**忙就一定不刷**：宁可界面滞后，也不打断用户手上的会话。
+
+    def _run_for_refresh(self, busy, switch=True, seq=None):
+        """跑一次 bridge 领取，返回 (result, 页面收到的 evaluate 表达式列表)。"""
+        from checkin.drivers.client_claim import ClientDriver
+        evals = []
+        seq = seq or [{"code": 0, "data": {"today_checked_in": False}},
+                      {"code": 0, "data": {"status": "claimed"}},
+                      {"code": 0, "data": {"today_checked_in": True}}]
+        it = iter(seq)
+
+        class FakePage:
+            def wake(self): pass
+            def close(self): pass
+            def evaluate(self, expr, await_promise=True):
+                evals.append(expr)
+                return True
+
+        r = self._recipe(refresh_ui_after_claim=switch)
+        with mock.patch.object(ClientDriver, "_wait_target",
+                               return_value={"webSocketDebuggerUrl": "ws://x"}), \
+             mock.patch.object(ClientDriver, "_bridge_call",
+                               side_effect=lambda p, e, t: next(it)), \
+             mock.patch.object(ClientDriver, "_cpu_busy", return_value=busy), \
+             mock.patch("checkin.drivers.client_claim.CDPPage",
+                        side_effect=lambda url: FakePage()):
+            res = self._driver()._claim_via_bridge(r, r.client, 1, "m", r.client["bridge"])
+        return res, evals
+
+    def test_new_claim_refreshes_the_ui_when_idle(self):
+        """真的新领取 + 客户端空闲 ⇒ 让页面重载，界面才能显示"已签到"。"""
+        from checkin.core.models import Outcome
+        res, evals = self._run_for_refresh(busy=False)
+        self.assertEqual(res.outcome, Outcome.SUCCESS)
+        self.assertEqual(len(evals), 1, f"应重载一次页面，实际={evals}")
+        self.assertIn("location.reload", evals[0])
+
+    def test_busy_client_is_never_reloaded(self):
+        """客户端在忙 ⇒ **绝不许刷新**（会打断用户正在跑的会话）。"""
+        _, evals = self._run_for_refresh(busy=True)
+        self.assertEqual(evals, [], "忙的时候重载页面 = 打断用户，必须一票否决")
+
+    def test_unknown_busy_state_is_not_reloaded(self):
+        """看不清（None）也算忙 —— 与本项目"看不清就不动手"的口径一致。"""
+        _, evals = self._run_for_refresh(busy=None)
+        self.assertEqual(evals, [], "判不准就得当忙处理，不能赌")
+
+    def test_refresh_is_off_unless_the_recipe_asks(self):
+        """默认不刷新：这是会闪一下页面的动作，必须由配方显式开启。"""
+        _, evals = self._run_for_refresh(busy=False, switch=False)
+        self.assertEqual(evals, [], "没配 refresh_ui_after_claim 就不该动界面")
+
+    def test_already_is_never_refreshed(self):
+        """今日已签（什么都没变）⇒ 不刷新，白闪一下毫无意义。"""
+        from checkin.core.models import Outcome
+        seq = [{"code": 0, "data": {"today_checked_in": True}}]
+        res, evals = self._run_for_refresh(busy=False, seq=seq)
+        self.assertEqual(res.outcome, Outcome.ALREADY)
+        self.assertEqual(evals, [])
+
     def test_status_timeout_is_error_not_success(self):
         """status 无响应（超时/表达式异常）⇒ ERROR。**绝不能默认成成功。**"""
         from checkin.core.models import Outcome

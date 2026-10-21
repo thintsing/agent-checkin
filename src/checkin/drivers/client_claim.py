@@ -875,6 +875,30 @@ class ClientDriver(Driver):
             zh = {Outcome.SUCCESS: "已领取", Outcome.ALREADY: "本窗口已领取"}.get(outcome)
             msg = ("%s（客户端 bridge）" % zh if zh
                    else "客户端 bridge 返回未判定结果（code=%s）" % cl.get("code"))
+
+            # 4) 让**界面**也跟上（可选开关 `refresh_ui_after_claim`，默认关）。
+            #
+            # 为什么需要：客户端 UI 的签到状态是**页面加载时**拉一次的（Dumate 实测：
+            # 组件的 `useEffect` 只在挂载时调 `hydrateStatus()`，之后既不轮询、
+            # focus/visibilitychange 也不重拉 —— 两个事件都实测过，日志里零新增请求）。
+            # 我们在 bridge 里把接口调完了，它的 store 一无所知 ⇒ 用户看到"立即签到"
+            # 还在原地，会以为**根本没签上**（2026-10-21 用户原话："百度搭子并没有签到成功"），
+            # 甚至手动再点一次 —— 而 UI 的 claim 是**本地乐观 +500**，服务端却不会再加，
+            # 于是账面比实际多 500，比"显示滞后"更糟。
+            #
+            # 只在**真的新领取**时刷（already 不刷：UI 本来就没变化，白闪一下）；
+            # 且**忙就跳过**（`_cpu_busy` 返回 None 也算忙）—— 宁可界面滞后，
+            # 也不打断用户正在跑的会话。
+            if outcome == Outcome.SUCCESS and bool(c.get("refresh_ui_after_claim", False)):
+                if self._cpu_busy(c) is False:
+                    try:
+                        page.evaluate("location.reload()", await_promise=False)
+                        log.info("[%s] 界面已重新加载，签到状态随之刷新", sid)
+                    except Exception as e:  # reload 会掐断当前 CDP 连接，属预期
+                        log.info("[%s] 界面刷新已发出（连接随之断开，属预期）: %s", sid, e)
+                else:
+                    log.info("[%s] 客户端正忙或状态不明，跳过界面刷新（服务端已确认领取）", sid)
+
             return CheckinResult(sid, outcome, message=msg, detail=detail)
         finally:
             page.close()

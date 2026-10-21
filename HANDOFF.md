@@ -7,6 +7,38 @@
 
 ---
 
+## [2026-10-21 11:05] WorkBuddy(阿拾) —— 用户报"搭子没签到成功"：**服务端确实签上了，是界面不刷新**
+
+**结论**：今天 10:33:53 已领取成功（`totalPoints` 1000→**1500**，`signInDays` 加上 `2026-10-21`，
+`hasIssued` false→true，当场 CDP 复核仍为 true，账号 `地府千年的等待` 一致）。
+用户看到的是**侧边卡片还写着"立即签到"** —— 那是 UI 状态没刷新，不是没领到。
+
+### 根因：UI 只在页面加载时拉一次签到状态
+
+实测（`focus` / `visibilitychange` 都 dispatch 过，`electron.log` 里 `loginBonusInfo` 请求数 **4→4**，
+零重拉）。而我们走 bridge 调接口，它的 mobx store 完全不知道 ⇒ 卡片维持"未签"。
+
+**这个不一致会造成真实损失**：用户以为没签，手动点"立即签到" → UI 的 `claim()` 是**本地乐观
+`totalPoints += 500`** → 界面显示 2000，服务端仍是 1500，账面比实际多 500。
+
+### 修法：`refresh_ui_after_claim`（默认关，dumate 开）
+
+`client_claim._claim_via_bridge` 第 4 步：**真新领取**（`SUCCESS`，already 不刷）+
+`_cpu_busy(c) is False` 才 `location.reload()`。`None` 也算忙 —— 与本项目"看不清就不动手"一致。
+**不加超时/重试**：reload 必然掐断当前 CDP，异常属预期，已在 `except` 里记 info。
+
+5 条守卫（`TestClientBridge` 新增 5 项，315 全绿），两处改坏实测变红：
+- `if True:`（无视忙闲）⇒ `test_busy_client_is_never_reloaded` + `test_unknown_busy_state_is_not_reloaded` 红
+- 开关恒真 ⇒ `test_refresh_is_off_unless_the_recipe_asks` 红
+
+### 留给下次的一条通用教训
+
+**"自动化太安静"本身就是一种缺陷**：后台把接口调成功、界面毫无反馈，用户只能得出"没成功"。
+判断这类问题的成本很高（要翻服务端日志才能自证）。⇒ 推送/日志里应当带上**可核对的事实**
+（本次已有 `hasIssued`、积分、签到天数），而不是只有 success/already。
+
+---
+
 ## [2026-10-21 10:45] WorkBuddy(阿拾) —— "一签到就提示升级版本"取证：客户端版本落后，**不是签到逻辑**
 
 **结论先说**：Qoder 客户端**实际运行的版本是 `0.2.5`**，服务端最新是 `0.4.8`。
