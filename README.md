@@ -1,27 +1,30 @@
 # 智能体签到 · Agent Check-In
 
-> 让 AI 编程助手的每日签到自动化 —— **站点知识全部外置为数据，凭证永不离开浏览器 / 客户端。**
+> 让 AI 助手（编程类与办公类）的每日签到自动化 —— **站点知识全部外置为数据，凭证永不离开浏览器 / 客户端。**
 >
-> *Automate daily check-ins on AI coding-assistant platforms. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
+> *Automate daily check-ins on AI assistant platforms — coding and office alike. Site knowledge lives in YAML data; credentials never leave the browser or desktop client.*
 
 <details>
-<summary><b>English</b> — what this is, in 8 lines</summary>
+<summary><b>English</b> — what this is, at a glance</summary>
 
-A Windows scheduler that automates the **daily check-in** of four AI-coding-assistant desktop clients
-(WorkBuddy, Qoder CN, Trae CN, DuMate) — without ever touching your credentials.
+A Windows scheduler that automates the **daily check-in** of five AI-assistant desktop clients
+(WorkBuddy, Qoder CN, Trae CN, DuMate, DoubaoWork) — without ever touching your credentials.
 
 - **Recipe-driven.** Every site is one YAML file under `recipes/`. Adding a site needs **zero code changes**,
   and no product name appears in the source tree.
 - **CDP, not scraping.** It attaches to an already-running client over the Chrome DevTools Protocol and calls
   the client's *own* bridge (`window.wb.http`, `window.vscode.ipcRenderer`, `electronAPI.bceConsoleRequest`) —
   the same path the client walks when you click the button yourself.
+- **Opens the page it needs.** When a check-in page only exists after clicking through a menu (Radix
+  dropdowns ignore synthetic clicks), the recipe declares a URL and the driver spawns a tab in the
+  client's own profile via `Target.createTarget` — then closes it by target id, never the user's tab.
 - **Credentials never leave the client.** No token reverse-engineering, no password storage, no device-identity
   forgery — reading `auth.machine-id` / `auth.v1.dat` is explicitly out of scope.
 - **Randomized schedule.** A fixed 09:55 wake-up, then the real moment is sampled from a Beta(2,2) distribution
   inside the window. Never on the hour; never via the Task Scheduler's own `-RandomDelay`.
 - **Failures are loud.** Desktop toast + optional QQ push. "Done" is never printed next to failures, because
   a green summary beside a red row is the worst possible notification.
-- **310 offline tests**, ~6 s, no network and no browser.
+- **319 offline tests**, ~6 s, no network and no browser.
 
 ⚠ Automating check-ins likely **violates those platforms' terms of service**. Use your own single account,
 single device, single network — and read the risk section before you start.
