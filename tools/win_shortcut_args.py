@@ -139,6 +139,20 @@ APPS = {
         # 2026-10-20 实地核查 HKCU\...\Run：无 DuMate 项（不自启，只走快捷方式）。
         "run_key": None,
     },
+    "doubaowork": {
+        "label": "豆包工作（DoubaoWork）",
+        "recipe": "doubaowork.yaml",
+        # 2026-10-21 实地核查：桌面 + 开始菜单各一个，文件名「豆包工作.lnk」，原来不带参数。
+        "lnks": [
+            r"%USERPROFILE%\Desktop\豆包工作.lnk",
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\豆包工作.lnk",
+        ],
+        # 未观察到它回写快捷方式；没有实测依据就不加只读锁。
+        "lock": None,
+        # 2026-10-21 实地核查 HKCU\...\Run：**有**自启动项（值名 doubaowork），
+        # 原值带 `--launch_from=auto_run`，必须保留（见 _other_args_of 的注释）。
+        "run_key": "doubaowork",
+    },
 }
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
 
@@ -329,19 +343,43 @@ def read_run_value(app: str):
         return None
 
 
-def _exe_of(value: str) -> str:
-    """从 Run 值里取出 exe 路径：去掉引号，并去掉我们**自己**加过的端口参数。
+def _strip_our_port(value: str) -> str:
+    """去掉我们**自己**加过的端口参数（保留其它参数不动）。
 
     之所以要"去掉自己加的"，是因为这个函数会被重复调用（重跑工具是常态）——
     否则第二次会把 `"...exe" --remote-debugging-port=9336` 当成 exe 路径，
     拼出 `""...exe" --remote...=9336" --remote...=9336` 这种鬼东西。
     """
-    v = re.sub(r"\s*" + re.escape(DEBUG_ARG_PREFIX) + r"\d+", "", value.strip()).strip()
+    return re.sub(r"\s*" + re.escape(DEBUG_ARG_PREFIX) + r"\d+", "", value.strip()).strip()
+
+
+def _exe_of(value: str) -> str:
+    """从 Run 值里取出 exe 路径（去掉引号与我们自己加过的端口参数）。"""
+    v = _strip_our_port(value)
     if v.startswith('"'):
         end = v.find('"', 1)
         if end > 0:
             return v[1:end]
     return v.split(" ", 1)[0]
+
+
+def _other_args_of(value: str) -> str:
+    """取出 Run 值里**除 exe 与我们加的端口之外**的其它参数，原样保留。
+
+    为什么必须保留（2026-10-21 接豆包工作时发现）：它的自启动值是
+    `"...\\DoubaoWork.exe" --launch_from=auto_run` —— 那个参数是客户端用来区分
+    "我是被开机自启拉起来的"（决定是否静默启动）。旧实现把整串重写成
+    `"exe" --remote-debugging-port=9342`，等于**顺手改掉了它的启动语义**，
+    而这种副作用在"能签到成功"面前完全看不见。
+    """
+    v = _strip_our_port(value)
+    if v.startswith('"'):
+        end = v.find('"', 1)
+        if end > 0:
+            return v[end + 1:].strip()
+        return ""
+    parts = v.split(" ", 1)
+    return parts[1].strip() if len(parts) > 1 else ""
 
 
 def do_autostart(app: str, backup_dir: str, revert: bool = False) -> int:
@@ -376,7 +414,9 @@ def do_autostart(app: str, backup_dir: str, revert: bool = False) -> int:
         print(f"  已还原 {name}\n      值 = [{orig}]")
         return 0
 
-    target = f'"{_exe_of(cur)}" {DEBUG_ARG_PREFIX}{recipe_debug_port(app)}'
+    others = _other_args_of(cur)
+    target = (f'"{_exe_of(cur)}" ' + (others + " " if others else "")
+              + f"{DEBUG_ARG_PREFIX}{recipe_debug_port(app)}")
     if cur.strip() == target:
         print(f"  {name} 已是目标值，跳过\n      值 = [{cur}]")
         return 0

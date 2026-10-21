@@ -7,6 +7,71 @@
 
 ---
 
+## [2026-10-21 21:10] WorkBuddy(阿拾) —— 接入豆包工作（第 5 站），并新增驱动能力 `open_target`
+
+**今天已签，+200 额度**（页面文案实证："已获得 0 点" → "已获得 200 点"）。
+`detail` 接口复核：`total_amount=200`、`daily_signin.task_status=3`。
+
+### 一、它跟前面四站都不一样
+
+- **不是 Electron**：字节自研 **"aha" Chromium 框架**（`DoubaoWork.dll` 323MB，
+  前端是 standalone pak bundle，**没有 app.asar 可翻**），Chromium 147。
+- 客户端 2.33.3，userData = `%LOCALAPPDATA%\DoubaoWork\User Data`。
+- `--remote-debugging-port=9342` 可用，**外层启动器 `Application\DoubaoWork.exe` 会透传**。
+- 页面里只有字节的 `JSBridge` / `_aha_api`，**没有签到能力** ⇒ 签到只能走 HTTP。
+
+### 二、签到入口是个"平时不存在"的活动页
+
+- 入口：左下角头像菜单 →「**免费领额度**」→ 内置浏览器打开
+  `https://www.doubao.com/pc/agent-explore`（文案「从容开工，豆包额度天天送」）。
+- 接口（抓包实录，非逆向）：
+  - `POST /alice/ug/campaign/v3/detail/` body `{campaign_group_code}`
+    → `data.tasks[]` 里 `campaign_code=="daily_signin"` 的 **`task_status`**（3=已签，1=未签）
+    → `data.progress.total_amount` 累计额度
+  - `POST /alice/ug/campaign/landing/checkin` body `{scene:"pc_incentive_task_mvp_v3"}`
+
+### 三、新驱动能力：`open_target`（配方里声明，代码不含产品名）
+
+计划任务跑的时候没人替我们点菜单，所以配方写 `open_target.url`，驱动自己开：
+```
+Target.createTarget(url)   ← 同一个 profile ⇒ 同一份登录态
+  → 等 target 出现在 /json 且**再安静 3 秒**
+  → 按 targetId 连它自己的 ws → 执行 bridge 的 status/claim → closeTarget
+```
+**按 targetId 认领**是关键：同一 URL 上可能还有用户自己开的 webview，靠 URL 匹配
+会认错人、进而把用户的标签页关掉。
+
+配方的 `close_after: false` 让客户端本身不被关（用户日常在用的 AI 工作助手）。
+
+### 四、两个坑（都花了一轮）
+
+1. **createTarget 出来的页面还在导航**：此时 evaluate 进去的表达式可能连执行上下文都没建好
+   —— 表现是"kick 发出去了、槽位永远等不到"，第一次白等 **25s** 超时，重试才成。
+   修法：target 出现后再 `sleep 3`（实测从 32s 降到 **3s** 完成）。
+2. ⚠ **不要自己开一条 CDP 连接去探 `document.readyState`**：试过，探测连接一关，
+   正式连接立刻被掐（`WinError 10053`），三次重试全废。宁可多等 3 秒。
+
+### 五、顺手修掉的一个潜在副作用
+
+`win_shortcut_args.py` 的 Run 键改写原先是
+`f'"{exe}" --remote-debugging-port=N'` —— **会把原有参数整个抹掉**。
+豆包工作的自启动值是 `"…\DoubaoWork.exe" --launch_from=auto_run`，那个参数是客户端用来
+区分"我是被开机自启拉起来的"。已改为 `_other_args_of()` 保留其它参数：
+改前 `--launch_from=auto_run` → 改后 `--launch_from=auto_run --remote-debugging-port=9342`。
+（这类"顺手改掉语义"的副作用，在"能签到成功"面前完全看不见。）
+
+### 六、验证
+
+- 端到端三条：`status` 预检（already，3s）/ `open_target` 失败 → **ERROR 不假成功** /
+  用完按 targetId 关闭。
+- 4 条新守卫（`TestOpenTarget`），**319 测试全绿**；两处改坏实测变红：
+  `target=None`（不认领自己开的）⇒ `test_reuses_its_own_target_and_closes_it` 红；
+  失败分支改成返回 SUCCESS ⇒ `test_open_failure_never_reports_success` 红。
+- 三条"跨配方对称"守卫在我只加配方没加字段时**立刻变红**（`wait_port_sec` /
+  `restart_on_bind_failure` / `busy_probe`）—— 这次它们正常工作，说明那套守卫是有效的。
+
+---
+
 ## [2026-10-21 11:05] WorkBuddy(阿拾) —— 用户报"搭子没签到成功"：**服务端确实签上了，是界面不刷新**
 
 **结论**：今天 10:33:53 已领取成功（`totalPoints` 1000→**1500**，`signInDays` 加上 `2026-10-21`，

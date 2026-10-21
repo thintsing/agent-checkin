@@ -3273,6 +3273,86 @@ class TestClientBridge(unittest.TestCase):
         self.assertIn("签到配置加载失败", "\n".join(cm.output))
 
 
+class TestOpenTarget(unittest.TestCase):
+    """「自己开一个页面」这条路（2026-10-21 接入豆包工作时被逼出来的）。
+
+    背景：那个签到入口是一个**平时根本不存在**的活动页 —— 只有用户点开左下角菜单里的
+    「免费领额度」，内置浏览器才会打开它。计划任务跑的时候没有人替我们点，而那个菜单
+    是 Radix 组件（合成 click() 无效，只能发真实鼠标事件，坐标还随窗口尺寸变）。
+    ⇒ 配方用 `open_target.url` 声明"我自己开"，驱动走 CDP `Target.createTarget`，
+    在同一个 profile（同一份登录态）里开一个，用完按 targetId 关掉。
+    """
+
+    def _recipe(self, **over):
+        from checkin.core.models import Recipe
+        client = {
+            "debug_port": 1,
+            "target_match": "x",
+            "open_target": {"url": "https://example.invalid/p"},
+            "bridge": {"status_js": "S()", "claim_js": "C()"},
+        }
+        client.update(over)
+        return Recipe.from_dict({
+            "id": "t", "name": "T", "mode": "client",
+            "verdict": {"transport": "body_code", "rules": [{"code": 0, "result": "success"}],
+                        "unknown_result": "no_action", "checked_in_flag": "hasIssued"},
+            "client": client,
+        })
+
+    def test_open_failure_never_reports_success(self):
+        """开不出页面 ⇒ ERROR。**绝不能**退回用户已有的标签页去猜，更不能报成功。"""
+        from checkin.core.models import Outcome
+        from checkin.drivers.client_claim import ClientDriver
+        r = self._recipe()
+        with mock.patch("checkin.drivers.client_claim.open_target", return_value=None), \
+             mock.patch.object(ClientDriver, "_claim_via_bridge") as br:
+            res = ClientDriver()._claim(r, r.client, 1, "x")
+        self.assertIs(res.outcome, Outcome.ERROR)
+        br.assert_not_called()
+
+    def test_reuses_its_own_target_and_closes_it(self):
+        """开出来的页面必须**按它自己**去连，用完关掉 —— 不能碰用户开着的那个。"""
+        from checkin.core.models import CheckinResult, Outcome
+        from checkin.drivers.client_claim import ClientDriver
+        r = self._recipe()
+        opened = {"id": "TID", "webSocketDebuggerUrl": "ws://new"}
+        with mock.patch("checkin.drivers.client_claim.open_target", return_value=opened) as op, \
+             mock.patch("checkin.drivers.client_claim.close_target") as cl, \
+             mock.patch.object(ClientDriver, "_claim_via_bridge",
+                               return_value=CheckinResult("t", Outcome.SUCCESS)) as br:
+            res = ClientDriver()._claim(r, r.client, 1, "x")
+        self.assertIs(res.outcome, Outcome.SUCCESS)
+        self.assertEqual(br.call_args.kwargs.get("target"), opened,
+                         "必须把**自己开的** target 传下去，而不是让它按 URL 重新找")
+        op.assert_called_once()
+        cl.assert_called_once()
+        self.assertEqual(cl.call_args[0][1], "TID", "关的必须是新建的那个 targetId")
+
+    def test_close_after_false_keeps_the_tab(self):
+        """`close_after: false` ⇒ 不关（有些人会想留着自己看）。"""
+        from checkin.core.models import CheckinResult, Outcome
+        from checkin.drivers.client_claim import ClientDriver
+        r = self._recipe(open_target={"url": "https://example.invalid/p",
+                                      "close_after": False})
+        with mock.patch("checkin.drivers.client_claim.open_target",
+                        return_value={"id": "TID", "webSocketDebuggerUrl": "ws://new"}), \
+             mock.patch("checkin.drivers.client_claim.close_target") as cl, \
+             mock.patch.object(ClientDriver, "_claim_via_bridge",
+                               return_value=CheckinResult("t", Outcome.ALREADY)):
+            ClientDriver()._claim(r, r.client, 1, "x")
+        cl.assert_not_called()
+
+    def test_sites_declaring_open_target_are_reachable_from_a_recipe(self):
+        """守卫：`open_target` 是**配方数据**，代码里不该出现任何产品名。
+
+        这里只钉住"真实配方里确实有站点用到了它"，避免这条能力变成死代码
+        （本项目已经栽过三次"机制在、路径永远走不到"）。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        users = [r.id for r in recipes if (r.client or {}).get("open_target")]
+        self.assertTrue(users, "没有任何配方使用 open_target ⇒ 这条路径又成了死代码")
+
+
 class TestClientStaleSnapshot(unittest.TestCase):
     """活动页**快照陈旧**造成的静默漏签（2026-10-06 新增）。
 

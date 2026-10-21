@@ -163,3 +163,112 @@ class CDPPage:
             self._ws.close()
         except Exception:
             pass
+
+
+def _browser_ws(port: int) -> str:
+    try:
+        v = _http_json(port, "/json/version")
+    except Exception as e:
+        log.debug("取 browser ws 失败：%s", e)
+        return ""
+    return str(v.get("webSocketDebuggerUrl") or "")
+
+
+def open_target(port: int, url: str, wait_sec: float = 8.0,
+                poll: float = 0.3) -> Optional[Dict[str, Any]]:
+    """在客户端自己的 profile 里**新开一个页面**并等它可用；失败返回 None。
+
+    为什么需要它（2026-10-21 接入豆包工作时被逼出来的）：
+    有些签到入口只在**客户端内置浏览器**里（`https://…/pc/agent-explore` 这类活动页），
+    平时并不存在 —— 计划任务跑的时候没有人替我们点开菜单。而 `Target.createTarget`
+    能在**同一个 profile（同一份登录态）**里开一个页面，用完关掉：
+      · 不必点任何 UI（那个菜单是 Radix 组件，合成 click 无效，只能发真实鼠标事件，
+        而坐标依赖窗口尺寸，脆得很）；
+      · 不必赌"用户此刻正好开着那个标签页"；
+      · 也不去动用户已经打开的那个标签页（我们只关自己开的这个）。
+
+    ⚠ 必须按 **targetId** 认领自己开的那个：同一个 URL 上可能同时存在用户已开的
+    webview target，靠 `url_match` 会认错人，进而把用户的标签页关掉。
+    """
+    wsurl = _browser_ws(port)
+    if not wsurl:
+        return None
+    tid = ""
+    try:
+        ws = websocket.create_connection(wsurl, timeout=20, suppress_origin=True)
+    except Exception as e:
+        log.debug("连 browser ws 失败：%s", e)
+        return None
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Target.createTarget",
+                            "params": {"url": url}}))
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 1:
+                tid = str((msg.get("result") or {}).get("targetId") or "")
+                if not tid:
+                    log.debug("Target.createTarget 失败：%s", msg.get("error"))
+                break
+    except Exception as e:
+        log.debug("Target.createTarget 异常：%s", e)
+        return None
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    if not tid:
+        return None
+    # 等它出现在 /json 里，然后**再让页面安静一会儿**。
+    # 这里刻意**不**自己开一条 CDP 连接去探 `document.readyState`：试过，探测连接关闭后
+    # 正式连接会立刻被掐（`WinError 10053`），三次重试全废。宁可多等 3 秒。
+    # 刚 createTarget 出来的页面还在导航，此刻 evaluate 进去的表达式可能连执行上下文
+    # 都没建好 —— 表现是"kick 发出去了、槽位永远等不到"，直到 bridge 超时
+    # （2026-10-21 实测第一次白等 25s，第二次才成）。
+    tgt = None
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        try:
+            for t in list_targets(port):
+                if t.get("id") == tid and t.get("webSocketDebuggerUrl"):
+                    tgt = t
+                    break
+        except Exception:
+            pass
+        if tgt is not None:
+            break
+        time.sleep(poll)
+    if tgt is None:
+        log.debug("新建的 target %s 在 %.1fs 内没有出现", tid, wait_sec)
+        return None
+    time.sleep(3.0)
+    return tgt
+
+
+def close_target(port: int, target_id: str) -> bool:
+    """关掉 `open_target` 开出来的那个页面。失败只记日志 —— 关不掉不该劣化主流程。"""
+    wsurl = _browser_ws(port)
+    if not wsurl or not target_id:
+        return False
+    try:
+        ws = websocket.create_connection(wsurl, timeout=15, suppress_origin=True)
+    except Exception as e:
+        log.debug("关标签页时连不上 browser ws：%s", e)
+        return False
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Target.closeTarget",
+                            "params": {"targetId": target_id}}))
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 1:
+                return True
+    except Exception as e:
+        log.debug("Target.closeTarget 异常：%s", e)
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    return False

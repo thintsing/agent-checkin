@@ -44,7 +44,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from ..browser.cdp import CDPPage, list_targets
+from ..browser.cdp import CDPPage, close_target, list_targets, open_target
 from ..core import notify, procenv
 from ..core.config import expand
 from ..core.models import CheckinResult, Outcome, Recipe, RunBudget
@@ -655,7 +655,27 @@ class ClientDriver(Driver):
         # bridge 更稳：不依赖 UI 是否渲染、不受 shadow DOM / 服务端下发文案变化影响。
         bridge = c.get("bridge")
         if isinstance(bridge, dict) and bridge.get("status_js"):
-            return self._claim_via_bridge(recipe, c, port, match, bridge)
+            # 有些站点的入口**平时根本不存在**（只在客户端内置浏览器里按需打开的活动页），
+            # 计划任务跑的时候没人替我们点开 ⇒ 配方用 `open_target.url` 声明"我自己开一个"。
+            # 自己开的好处：不点 UI、不依赖用户是否开着、也不会误关用户那个标签页
+            # （按 targetId 认领，见 cdp.open_target 的注释）。
+            opened = None
+            oc = c.get("open_target") if isinstance(c.get("open_target"), dict) else {}
+            if oc.get("url"):
+                opened = open_target(port, str(oc["url"]),
+                                     wait_sec=float(oc.get("wait_sec", 8)))
+                if opened is None:
+                    # 开不出来就是"今天做不了"，**绝不能**退回用户已有的标签页去猜，
+                    # 更不能报 success —— 那是没有证据的成功。
+                    return CheckinResult(sid, Outcome.ERROR,
+                                         message="活动页打不开（createTarget 未就绪）",
+                                         detail={"open_target": str(oc["url"])})
+            try:
+                return self._claim_via_bridge(recipe, c, port, match, bridge,
+                                              target=opened)
+            finally:
+                if opened is not None and bool(oc.get("close_after", True)):
+                    close_target(port, str(opened.get("id") or ""))
         find, click, markers = self._js(c)
         # 「签到 UI 就在客户端主窗口里」—— 与 Qoder 那种**独立活动页 target** 相对。
         # Trae CN 的入口是主工作区里的**账号菜单浮层**，没有自己的 target：
@@ -809,7 +829,8 @@ class ClientDriver(Driver):
     _BRIDGE_SLOT = "__ck_bridge_result"
 
     def _claim_via_bridge(self, recipe: Recipe, c: Dict[str, Any], port: int,
-                          match: str, bridge: Dict[str, Any]) -> CheckinResult:
+                          match: str, bridge: Dict[str, Any],
+                          target: Optional[Dict[str, Any]] = None) -> CheckinResult:
         """在客户端页面上下文里执行配方给的表达式，直接调它自己的接口完成签到。
 
         为什么不点 UI（2026-10-06 WorkBuddy 实测后的选择）：
@@ -825,7 +846,9 @@ class ClientDriver(Driver):
         sid = recipe.id
         timeout = int(c.get("bridge_timeout_sec", 25))
 
-        tgt = self._wait_target(port, match, int(c.get("target_timeout_sec", 25)))
+        # `target` 非空 = 调用方已经自己开好了页面（open_target），直接用它的连接，
+        # 不再按 URL 去 `/json` 里瞎找 —— 同一个 URL 上可能有用户自己开着的那个。
+        tgt = target or self._wait_target(port, match, int(c.get("target_timeout_sec", 25)))
         if tgt is None:
             return CheckinResult(sid, Outcome.NO_ACTION,
                                  message="客户端主窗口未出现（target_match 未命中）",

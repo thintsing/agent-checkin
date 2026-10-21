@@ -29,14 +29,14 @@ single device, single network — and read the risk section before you start.
 </details>
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-310%20passing-brightgreen)](#测试)
-[![Sites](https://img.shields.io/badge/sites-4%20supported-orange)](#支持的平台)
+[![Tests](https://img.shields.io/badge/tests-319%20passing-brightgreen)](#测试)
+[![Sites](https://img.shields.io/badge/sites-5%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
 [![Deps](https://img.shields.io/badge/deps-websocket--client%20%2B%20PyYAML-informational)](#快速开始)
 
-> **当前状态**：4 个站点（WorkBuddy / Qoder CN / Trae CN / DuMate）每日全自动运行中，
-> 连续天数最长 27 天。310 项测试全绿。最后更新 **2026-10-20**。
+> **当前状态**：5 个站点（WorkBuddy / Qoder CN / Trae CN / DuMate / 豆包工作）每日全自动运行中，
+> 连续天数最长 28 天。319 项测试全绿。最后更新 **2026-10-21**。
 
 **目录**
 
@@ -57,9 +57,9 @@ single device, single network — and read the risk section before you start.
 
 ## ⚠️ 先读这段：风险声明
 
-**本项目会自动化执行四个平台的每日签到，这可能违反它们的服务条款。请你自己权衡用哪个账号。**
+**本项目会自动化执行五个平台的每日签到，这可能违反它们的服务条款。请你自己权衡用哪个账号。**
 
-- 自动签到**违反 Qoder / WorkBuddy (CodeBuddy) / Trae / DuMate（百度搭子）的服务条款**。无论做得多"像人"，都存在账号被限制或封禁的风险，**本工具无法保证不封号**。
+- 自动签到**违反 Qoder / WorkBuddy (CodeBuddy) / Trae / DuMate（百度搭子）/ 豆包工作（DoubaoWork）的服务条款**。无论做得多"像人"，都存在账号被限制或封禁的风险，**本工具无法保证不封号**。
 - 项目内置的降风险设计（见下文）只是把风险**压低**，不是消除。
 - **只用你自己的单一账号、单一设备、单一出口网络**；绝不批量、多号、代理轮换 —— 那才是真正触发风控的模式。
 - 项目**明确不做**的一件事：不读取、不复刻客户端加密的 `auth.machine-id` / `auth.v1.dat` —— 那等于**伪造设备身份**，正踩风控红线。Qoder 走的是"CDP 驱动客户端自己点自己的按钮"，不碰任何接口。
@@ -82,10 +82,11 @@ single device, single network — and read the risk section before you start.
 ```text
   站点            模式       连续     今日失败      今日
   ----------------------------------------------------------
-  dumate        client   1      0         已完成
-  qoder         client   23     0         已完成
-  trae          client   9      0         已完成
-  workbuddy     client   27     0         已完成
+  doubaowork    client   1       0         已完成
+  dumate        client   2       0         已完成
+  qoder         client   24      0         已完成
+  trae          client   10      0         已完成
+  workbuddy     client   28      0         已完成
 ```
 
 ---
@@ -124,7 +125,7 @@ python tools\win_shortcut_args.py --app workbuddy --autostart            REM 给
 python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还原
 ```
 
-端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae|dumate`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
+端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae|dumate|doubaowork`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
 
 驱动随之采用**四分支决策**，核心原则是 **不轻易动用户正在用的客户端**
 （2026-10-14 起有**一处窄口例外**，见下表 ③）：
@@ -212,8 +213,17 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 | **Qoder CN** | `client` | **CDP 驱动桌面客户端**点它自己的按钮 | 网页入口不存在（见上文 ①）；且不伪造设备指纹 |
 | **Trae CN** | `client` | **CDP bridge**：调客户端自己的 IPC 通道（`window.vscode.ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`） | 签到入口藏在新版 Solo Lite UI 的账号菜单里（点开还会落到付费页）；IPC 是**客户端自己点签到按钮时走的同一条路**，不碰 token / 设备身份文件 |
 | **DuMate**（百度搭子） | `client` | **CDP bridge**：调 preload 暴露的 `window.electronAPI.bceConsoleRequest`（客户端自己的请求通道） | 前端是 `file://` origin，页面里直接 `fetch` 会被 **CORS 拦掉**，必须走它自己的桥；判据是 `loginBonusInfo` 的 `hasIssued`，500 分/天 |
+| **豆包工作**（DoubaoWork） | `client` | **CDP bridge + 自建页面**：`Target.createTarget` 在客户端同一个 profile 里开活动页（`doubao.com/pc/agent-explore`），在页面里 `fetch` 活动接口，用完关掉 | 签到入口是内置浏览器里的一个**活动页**，平时根本不存在（点菜单「免费领额度」才打开）；判据是 `daily_signin` 任务的 `task_status==3`，200 额度/天 |
 
 新增站点**不需要改一行代码** —— 在 `recipes/` 放一个 YAML 即可。
+
+> ⚠ **豆包工作这条最特别**：它的签到页不是你随便能打开的一个 URL —— 平时它**不存在**，
+> 只有用户点开左下角菜单的「免费领额度」，客户端才会用内置浏览器打开它。
+> 那个菜单是 Radix 组件（**合成 `click()` 无效**，只能发真实鼠标事件，坐标还随窗口尺寸变）。
+> ⇒ 配方用 `open_target.url` 声明"我自己开一个"：驱动走 CDP `Target.createTarget`，
+> 在**同一个 profile（同一份登录态）**里开页面，用完按 targetId 关掉 ——
+> 不点 UI、不赌"用户此刻正好开着那个标签页"、也不会误关用户自己那个。
+> 判据同样是服务端的 `task_status`，不是 claim 的返回值。
 
 > ⚠ **DuMate 有个反直觉的点**：`loginBonus` 返回 `result: true` **不代表今天新领到了** ——
 > 当天已领时再 POST 服务端照样回 `true`，但积分和 `signInDays` 一动不动。
@@ -230,7 +240,7 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 > 判据永远是**服务端**的 `hasIssued`，界面只是显示。
 
 > `auto`（在已登录浏览器页面上下文里 `fetch`）与 `manual`（只发提醒）两种模式**仍然保留、可用**；
-> 只是**当前四个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
+> 只是**当前五个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
 
 ### 接入一个新站点的两条路（2026-10-12 补）
 
@@ -251,7 +261,7 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 
 ```bat
 REM 0) client 站点（当前四站都是）：让客户端启动即带上调试端口
-python tools\win_shortcut_args.py --app dumate         REM qoder | workbuddy | trae | dumate
+python tools\win_shortcut_args.py --app doubaowork     REM qoder | workbuddy | trae | dumate | doubaowork
 REM    ↑ 改完必须【重启客户端】才生效 —— 调试端口只能在进程启动时绑定
 
 REM 1) 首次：打开"签到专用浏览器"，在里面人工登录一次（登录态长期复用）
@@ -267,7 +277,7 @@ run_checkin.bat --install-task
 - 专用浏览器使用**独立 profile**（`%LOCALAPPDATA%\AgentCheckIn\chrome-profile`），与你日常浏览器完全隔离。
 - 本机没装 Chrome 时会自动退回 Edge —— 属正常降级。
 - 登录成功的硬证据在 cookie 里（`codebuddy.cn` 域下会出现 `KEYCLOUD_SESSION` / `session`）——
-  这一步**只有新增 `auto` 站点时才需要**；当前四个站点都走 `client`，登录态由客户端自己维护。
+  这一步**只有新增 `auto` 站点时才需要**；当前五个站点都走 `client`，登录态由客户端自己维护。
 
 ### 排查用（全部只读，绝不触发签到）
 
@@ -400,7 +410,8 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 │   ├─ workbuddy.yaml         #   mode: client（bridge 调客户端 http 通道 + verdict.rules 业务码判定）
 │   ├─ qoder.yaml             #   mode: client（CDP 驱动桌面客户端自己点按钮领）
 │   ├─ trae.yaml              #   mode: client（bridge 调客户端 IPC 通道，不点 DOM）
-│   └─ dumate.yaml            #   mode: client（bridge 调 electronAPI.bceConsoleRequest，读 hasIssued 判据）
+│   ├─ dumate.yaml            #   mode: client（bridge 调 electronAPI.bceConsoleRequest，读 hasIssued 判据）
+│   └─ doubaowork.yaml        #   mode: client（open_target 自建活动页 + bridge 调活动接口，读 task_status）
 ├─ tools/
 │   ├─ qoder_cdp_probe.py     # 只读侦察（定位活动入口，不点击）
 │   ├─ trae_cdp_probe.py      # 只读侦察（穿透 ShadowRoot；VSCode 系 UI 大量藏在里面）
@@ -452,7 +463,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**310 项（296 单元 + 14 架构守卫），全部离线**（不联网、不开浏览器），约 6 秒跑完：
+**319 项（305 单元 + 14 架构守卫），全部离线**（不联网、不开浏览器），约 6 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥与**持锁进程判活**、配置加载、引擎各闸门分支、
@@ -472,7 +483,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 
 这个项目在文档里保留了**被推翻的中间结论**和**未验证项** —— 我认为这比粉饰更有价值。
 
-1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在四个站点都走 `client`，
+1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在五个站点都走 `client`，
    网页侧浏览器当前没有站点在用。`client` 路径下的写响应**已实测观测**
    （2026-10-06 起 WorkBuddy bridge 路线跑通，`data.status` 业务词表已在真机验证）；
    `auto` 侧仍保留双保险（业务词表 + code 规则），首次真跑前不做额外"验证性"写请求
@@ -495,12 +506,13 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
    - **更难查的一种**：升级时启动器会**自己把应用重启一遍**（`state.ini` 的 `updatedAt`
      与应用的启动时刻重合，且同一刻 `targetVersion` 发生切换），这一次重启**不带**
      透传的调试开关 ⇒ 端口没开，驱动只能走 ③ 降级提醒。
-   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|workbuddy|trae|dumate` **以及**
+   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|workbuddy|trae|dumate|doubaowork` **以及**
      `... --app workbuddy --autostart`，**再从快捷方式重启客户端**。
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，
    重启客户端也拿不回。所以端口值以各站点配方的 `client.debug_port` 为单一事实源
-   （**Qoder=9340** / WorkBuddy=9336 / Trae=9338 / **DuMate=9341**），换端口是改一行的事。
+   （**Qoder=9340** / WorkBuddy=9336 / Trae=9338 / **DuMate=9341** / **豆包工作=9342**），
+   换端口是改一行的事。
    ⚠ 9233/9334/9335/9337 等旧值已作废（被僵尸句柄占过），**不要照抄旧文档**。
 5. **计划任务只在有登录会话时运行**（锁屏算、未登录不算）—— 开浏览器需要桌面会话。
 
