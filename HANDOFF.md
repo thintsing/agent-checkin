@@ -7,6 +7,63 @@
 
 ---
 
+## [2026-10-22 11:15] WorkBuddy(阿拾) —— Trae 今天没签上：**客户端长跑把活动配置弄空了**，重启即修
+
+**结果**：早上 4/5 成功（doubaowork 首日真跑也成了），Trae 连续两次
+`Checkin credits is unavailable` ⇒ error。**已重启客户端并补签成功**，现在 5/5。
+
+### 一、错误长什么样
+
+```
+WARNING bridge 表达式异常：Error invoking remote method
+  'vscode:sandbox::main-invoke-fetchCheckinCreditsStatus': Error: Checkin credits is unavailable
+```
+
+注意它不是网络错误、也不是桥断了 —— **是客户端主进程主动抛的**。
+
+### 二、根因（从 `out/main.js` 反查到判定条件）
+
+```js
+if (this.productService.providerCode !== Ds.CN || c?.account.scope !== Dt.MARSCODE)
+    throw new Error("Checkin credits is unavailable");
+```
+`Dt = { BYTEDANCE:"bytedance", MARSCODE:"marscode", SAAS:"saas" }`
+
+逐个排除：
+- **不是改版**：`out/` 里四个 IPC 都还在（fetchCheckinCreditsStatus / claimCheckinCredits /
+  getCheckinLottery / participateCheckinLottery）。
+- **不是账号 scope**：现场读 `getUserInfo` ⇒ `scope: "marscode"`，正常。
+- **不是端口**：9338 一直通，一次都没重启过。
+- **不是我们的调用方式**：同一段 JS 在重启后能拿到正常响应。
+
+真凶在客户端日志里：`[CommercialActivityService] onCommercialActivityInfoUpdate`
+从 10-21 每小时一批 `{"activities":[{activityId:"checkin_credits",…}]}`，
+到 **10-22 01:49:22 变成空 `{}`**，同刻伴随
+`[CNCommercialService] refreshCheckinStatus failed {"error":{"stage":"network"}}`。
+⇒ **一次网络抖动把活动配置刷成空，客户端之后不会自愈**，主进程于是永远认为
+"签到不可用"。那个实例从 **10-21 11:09 起连续跑了 24 小时**，中间没人重启它。
+
+### 三、处置与一个反直觉点
+
+1. 按铁律 7 先过忙闲关（5s CPU 0.16s ⇒ 空闲）→ 关 → 带 9338 拉起。
+2. ⚠ **重启后不是立即恢复**：11:10 刚起来探还是 `unavailable`，**约 1 分钟后**
+   （11:11）`fetchCheckinCreditsStatus` 返回 `{"code":0,"enable":true,"checked_in":false}`、
+   `getCheckinLottery` 返回 `{"checkin":"not_signed","state":{"eligible":true}}`。
+   ⇒ 自愈若要做，**必须带"重启后等 30–60s 再重试"**，否则会误判成"重启没用"。
+3. 补签一次即 success，连续天数回到 11，失败计数清零。
+
+### 四、候选改进（**没做**，等复现一次再动）
+
+现在的自愈只在**端口异常**时重启。今天这种"端口正常但客户端内部状态腐坏"不会被触发。
+可以考虑加配方字段 `restart_on_unavailable`（匹配 bridge 返回的特定错误文案 → 重启 + 等待重试），
+但：
+- 错误文案属于**站点知识**，得写进配方，代码不能认字符串；
+- 需要"重启后等待窗口"与"每天最多重启一次"的双重约束，否则可能反复重启用户主力工具。
+⇒ 先记录，观察明天是否复现。**同一形态出现第二次再动手**，是有依据；出现一次就改，
+很可能改出一个只在今天有效的补丁。
+
+---
+
 ## [2026-10-21 21:10] WorkBuddy(阿拾) —— 接入豆包工作（第 5 站），并新增驱动能力 `open_target`
 
 **今天已签，+200 额度**（页面文案实证："已获得 0 点" → "已获得 200 点"）。
