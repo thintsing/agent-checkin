@@ -4166,5 +4166,36 @@ class TestScheduleWindowConsistency(unittest.TestCase):
         self.assertEqual(hhmm(e), want_end, "scheduler 兜底 window_end 没跟上")
 
 
+class TestPowershellResolution(unittest.TestCase):
+    """`powershell.exe` 必须用**绝对路径**调（2026-10-25 实测）。
+
+    背景：它躺在 `%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\`，而**那个目录不在
+    PATH 里**（PATH 里的是 `System32`）。裸名调用在计划任务的完整环境里碰巧能找到，
+    在裁剪过 PATH 的环境里直接 OSError ⇒ `_app_running` **静默返回空串** ⇒
+    驱动据此判"客户端没在跑"，接着走"直接拉起"甚至报错。
+    这种失败的表现只有一个空字符串，看不出查询压根没跑起来 —— 又一个"名存实亡"。
+    """
+
+    def test_resolves_to_absolute_path(self):
+        import os
+        from checkin.drivers.client_claim import ClientDriver
+        exe = ClientDriver._powershell_exe()
+        self.assertTrue(os.path.isabs(exe),
+                        f"必须给出绝对路径，否则 PATH 一裁剪就静默失效：{exe}")
+        self.assertIn("WindowsPowerShell", exe)
+        self.assertTrue(exe.lower().endswith("powershell.exe"))
+
+    def test_both_subprocess_calls_use_the_resolver(self):
+        """两个子进程调用点都必须走 `_powershell_exe()`，不许退回裸名。"""
+        import inspect
+        from checkin.drivers.client_claim import ClientDriver
+        for fn in (ClientDriver._app_running, ClientDriver._cpu_total):
+            src = inspect.getsource(fn)
+            self.assertIn("_powershell_exe()", src,
+                          f"{fn.__name__} 又用裸名调 powershell 了 —— PATH 一裁剪就静默失效")
+            self.assertNotIn('"powershell"', src,
+                             f"{fn.__name__} 里残留裸名调用")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

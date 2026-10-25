@@ -7,6 +7,65 @@
 
 ---
 
+## [2026-10-25 12:40] WorkBuddy(阿拾) —— 把"重启"挪到凌晨 3 点；顺带修掉两个静默失效
+
+**背景**：WorkBuddy 连续三次因"无调试端口"漏签（10-23 靠用户手动点、10-25 连试 4 次全废）。
+根因不变：端口只能启动时绑定，而它**自己重启**（更新/崩溃恢复/关机重开）不吃启动入口参数。
+10-24 22:47 就是这么把端口弄丢的，第二天必然失败。
+
+### 一、"不重启就签到"：六条路全部排除（实证，别再重走）
+
+| 路 | 结果 |
+|---|---|
+| CDP 直连 | 没端口就没有入口，Chromium 设计如此 |
+| Windows UIA | 客户端没启用 a11y，控件树只有 **9 个无名节点**（重试 5 次） |
+| 本地 HTTP | 主进程 18488 只是 `LocalProbeServer`，只有 `/workbuddy/probe` 探活 |
+| MCP | 本机 68 个工具里**没有任何签到能力** |
+| CLI | `codebuddy --help` 只有 config/mcp/daemon/ps 这类运维命令 |
+| 会话凭据直调 | 拿 MCP 的 Bearer 打 `/v2/billing/meter/checkin-status` → **401**（用途不同） |
+
+⇒ 唯一可行的是**换时间点**：挪到凌晨 3 点，用户不在的时候重启。
+
+### 二、新增 `tools/nightly_restart_client.py` + 计划任务 `AgentCheckinNightlyRestart`
+
+每天 **03:00** 跑：端口已通 ⇒ 立刻退出；客户端没跑 ⇒ 直接带端口拉起；
+**忙就跳过**（自己采样 5s CPU，阈值默认 3.0s，且把**实测值写进日志**）；
+否则复用 `_restart_client()` 做干净重启并等端口。日志 `logs/nightly-restart.log`。
+
+- 为什么自己采样而不用 `_cpu_busy`：后者只回 bool，日志里留不下数值 ——
+  而"夜里到底忙不忙"正是这条路径会不会名存实亡的唯一证据。
+- `pythonw` 下 `sys.stdout is None`，`log()` 已加保护（不加会 AttributeError 打死整轮，老坑）。
+- 计划任务带 `-StartWhenAvailable`：错过 3 点（比如关机）后开机补跑；那时用户在用 ⇒ 被忙闲关挡住。
+
+### 三、两个"名存实亡"（都是这次顺手挖出来的）
+
+1. **`wait_port_sec: 5400` 让整轮白等 25 分钟**（10-25 实测 1499s）。
+   本站排在整轮最后，`_wait_budget` 把剩余预算全给它；而 WorkBuddy 自己**永远不会**
+   在运行中绑端口 ⇒ 期望收益≈0。已收紧到 **120s**（只覆盖"用户恰好在窗口内重启"），
+   没等到立刻让位，11:30 / 21:00 还会再试。
+2. **`idle_cpu_sec: 1.0` 让 WorkBuddy 永远判"忙"**。实测空闲状态 5s 窗就要吃
+   **1.19–2.39 秒**（两次采样）⇒ 阈值 1.0 ⇒ `restart_on_bind_failure` 那条自愈
+   **对本站点一次都没生效过**（判据全对、代码在、守卫绿、路径走不到）。
+   已按实测基线调到 **4.0**（约 1.7 倍余量）。**改动依据是实测，不是"想让它更容易过"。**
+
+### 四、顺带修掉的 PATH 依赖 bug
+
+`_app_running` / `_cpu_total` 用裸名 `powershell` 起子进程 —— 而 `powershell.exe` 在
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\`，**那个目录不在 PATH 里**。
+计划任务的完整环境碰巧能找到，裁剪过 PATH 的环境直接 OSError ⇒ `_app_running`
+**静默返回空串** ⇒ 驱动判"客户端没在跑"（实测复现：`which powershell: None`，
+修前返回 `''`、修后返回正确命令行）。
+⇒ 新增 `ClientDriver._powershell_exe()` 给绝对路径，两处调用点都改过去，加 2 条守卫
+（其中一条 `inspect.getsource` 防回退成裸名，已实测改回裸名即变红）。
+
+### 五、验证
+
+**321 测试全绿**（+2）。`tools/nightly_restart_client.py --dry-run` 三种分支全验过：
+端口通（跳过）/ 忙（跳过，日志有实测 CPU 值）/ 空闲（打印"准备重启"但不执行）。
+`pythonw` 下跑通、日志正常落盘。
+
+---
+
 ## [2026-10-22 11:15] WorkBuddy(阿拾) —— Trae 今天没签上：**客户端长跑把活动配置弄空了**，重启即修
 
 **结果**：早上 4/5 成功（doubaowork 首日真跑也成了），Trae 连续两次

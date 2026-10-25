@@ -400,12 +400,28 @@ class ClientDriver(Driver):
             "if ($ns) { '{0}' -f [int64](($ns | Measure-Object -Sum).Sum) }"
         )
 
+    @staticmethod
+    def _powershell_exe() -> str:
+        r"""`powershell.exe` 的**绝对路径**（找不到才退回裸名）。
+
+        为什么不用裸名（2026-10-25 实测）：`powershell.exe` 躺在
+        `%SystemRoot%\System32\WindowsPowerShell\v1.0\` 下，而**那个目录不在 PATH 里**
+        （PATH 里的是 `System32`）。计划任务的完整环境里碰巧能找到，裁剪过 PATH 的
+        环境（比如从某些 shell 派生的子进程）会直接 OSError ⇒ `_app_running`
+        **静默返回空串** ⇒ 驱动据此判定"客户端没在跑"，接着走"直接拉起"甚至报错。
+        这种失败只表现为一个空字符串，看不出是查询压根没跑起来 —— 正是本项目
+        反复声讨的"名存实亡"。
+        """
+        exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                           "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        return exe if os.path.exists(exe) else "powershell"
+
     def _cpu_total(self, name: str) -> Optional[float]:
         """读一次 CPU 累计秒数；取不到（PowerShell 不可用 / 进程不存在）返回 None。"""
         if not name:
             return None
         try:
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+            out = subprocess.run([self._powershell_exe(), "-NoProfile", "-NonInteractive",
                                   "-Command", self._cpu_script(name)],
                                  capture_output=True, text=True, encoding="utf-8",
                                  errors="replace", timeout=25,
@@ -1272,7 +1288,8 @@ class ClientDriver(Driver):
             return ""
         script = self._app_running_script(name)
         try:
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            out = subprocess.run([self._powershell_exe(), "-NoProfile", "-NonInteractive",
+                                  "-Command", script],
                                  capture_output=True, text=True, encoding="utf-8",
                                  errors="replace", timeout=25,
                                  # pythonw（无控制台）下不声明它，powershell 会新建一个
