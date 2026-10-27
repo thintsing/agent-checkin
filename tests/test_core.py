@@ -4197,5 +4197,71 @@ class TestPowershellResolution(unittest.TestCase):
                              f"{fn.__name__} 里残留裸名调用")
 
 
+class TestPendingAsarApply(unittest.TestCase):
+    r"""「pending-asar」更新布局必须在拉起前**应用**（2026-10-27 实测）。
+
+    背景：新版解压后主包叫 `app.asar.qoder-pending`，等"某个时机"被改名回
+    `app.asar` 才能运行。实测结论：客户端自带的顶层启动器不做这件事（且它
+    版本切换失灵时会回退跑旧版自己 ⇒ 用户看到的「本地数据由更高版本创建」横幅）；
+    直接拉内层 exe 秒退（退出码 1，无会话日志）；优雅关闭也不触发应用。
+    ⇒ 应用这一步只能我们做，且必须有**更新就绪标记**兜底 —— 否则会把更新器
+    写到一半的半截包拉起来。
+    """
+
+    def _make(self, with_marker=True, with_asar=False, with_pending=True):
+        import os, tempfile
+        root = tempfile.mkdtemp(prefix="pending_asar_")
+        vdir = os.path.join(root, "0.5.0")
+        res = os.path.join(vdir, "resources")
+        os.makedirs(res)
+        exe = os.path.join(vdir, "App.exe")
+        open(exe, "w").close()
+        if with_asar:
+            open(os.path.join(res, "app.asar"), "w").close()
+        if with_pending:
+            open(os.path.join(res, "app.asar.qoder-pending"), "w").close()
+        if with_marker:
+            open(os.path.join(root, "0.5.0.qoder-update-ready.json"), "w").close()
+        return exe, res
+
+    def test_applies_pending_when_marker_present(self):
+        from checkin.drivers.client_claim import ClientDriver
+        exe, res = self._make()
+        ClientDriver._ensure_launchable(exe)
+        self.assertTrue(os.path.isfile(os.path.join(res, "app.asar")), "必须被应用（改名）")
+        self.assertFalse(os.path.exists(os.path.join(res, "app.asar.qoder-pending")))
+
+    def test_noop_when_already_applied(self):
+        from checkin.drivers.client_claim import ClientDriver
+        exe, res = self._make(with_asar=True, with_pending=False)
+        ClientDriver._ensure_launchable(exe)
+        self.assertTrue(os.path.isfile(os.path.join(res, "app.asar")))
+        self.assertFalse(os.path.exists(os.path.join(res, "app.asar.qoder-pending")))
+
+    def test_refuses_without_ready_marker(self):
+        """没有就绪标记 = 可能是写了一半的包 ⇒ **绝不能应用**（防半截包上线）。"""
+        from checkin.drivers.client_claim import ClientDriver
+        exe, res = self._make(with_marker=False)
+        ClientDriver._ensure_launchable(exe)
+        self.assertFalse(os.path.exists(os.path.join(res, "app.asar")),
+                         "无就绪标记时绝不允许应用")
+        self.assertTrue(os.path.isfile(os.path.join(res, "app.asar.qoder-pending")))
+
+    def test_noop_when_nothing_pending(self):
+        from checkin.drivers.client_claim import ClientDriver
+        exe, res = self._make(with_pending=False, with_marker=False)
+        ClientDriver._ensure_launchable(exe)
+        self.assertFalse(os.path.exists(os.path.join(res, "app.asar")))
+
+    def test_both_spawn_sites_apply_before_launch(self):
+        """两处 spawn（冷启动 / 重启拉起）都必须先过 `_ensure_launchable`。"""
+        import inspect
+        from checkin.drivers.client_claim import ClientDriver
+        cold = inspect.getsource(ClientDriver.run)
+        restart = inspect.getsource(ClientDriver._restart_client)
+        self.assertIn("_ensure_launchable", cold, "冷启动路径没有应用 pending-asar")
+        self.assertIn("_ensure_launchable", restart, "重启路径没有应用 pending-asar")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

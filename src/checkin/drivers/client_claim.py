@@ -306,6 +306,7 @@ class ClientDriver(Driver):
             return CheckinResult(sid, Outcome.ERROR,
                                  message="找不到客户端可执行文件（检查 client.exe / client.exe_glob）")
         timeout = int(c.get("launch_timeout_sec", 60))
+        exe = self._ensure_launchable(exe)
         log.info("[%s] 客户端未运行，启动客户端: %s", sid, exe)
         proc = procenv.spawn([exe, f"--remote-debugging-port={port}"])
         try:
@@ -1576,7 +1577,8 @@ class ClientDriver(Driver):
 
         # ④ 带端口重新拉起
         try:
-            procenv.spawn([exe, f"--remote-debugging-port={port}"])
+            procenv.spawn([self._ensure_launchable(exe),
+                           f"--remote-debugging-port={port}"])
         except Exception as e:                      # noqa: BLE001
             log.warning("[restart] 拉起失败：%s", e)
             return False
@@ -1710,6 +1712,42 @@ class ClientDriver(Driver):
     def _version_key(path: str) -> tuple:
         m = re.search(r"(\d+(?:\.\d+)*)", path)
         return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+    @staticmethod
+    def _ensure_launchable(exe: str) -> str:
+        r"""「pending-asar」更新布局：新版本解压后主包挂在 ``app.asar.qoder-pending``，
+        要等某个时机被「应用」（改名回 ``app.asar``）才能运行 —— 直接拉起会**秒退**
+        （退出码 1，连会话日志都不留，2026-10-27 实测）。
+
+        实测（同日）：客户端自带的顶层启动器**不做**这个应用 —— 它版本切换失灵时
+        会回退跑旧版自己，于是「本地数据由更高版本创建」的横幅每次重启都出现；
+        优雅关闭（WM_CLOSE）也不会触发应用。⇒ 应用这一步只能我们做。
+
+        安全门：只有当**更新就绪标记**存在（``<版本目录名>.*update-ready*.json``，
+        更新器校验完载荷才会写）才动手 —— 防止把更新器写到一半的半截包拉起来。
+        已应用（app.asar 在）⇒ 原样返回；改动只发生在 exe 自己的版本目录里，
+        且就是官方更新器本来要做的那一次改名。
+        """
+        if not exe or not os.path.isfile(exe):
+            return exe
+        res = os.path.join(os.path.dirname(exe), "resources")
+        if os.path.isfile(os.path.join(res, "app.asar")):
+            return exe
+        pending = os.path.join(res, "app.asar.qoder-pending")
+        if not os.path.isfile(pending):
+            return exe
+        vdir = os.path.dirname(exe)
+        markers = glob.glob(os.path.join(
+            os.path.dirname(vdir), os.path.basename(vdir) + ".*update-ready*.json"))
+        if not markers:
+            log.debug("[launch] %s 是 pending-asar 但无就绪标记，不应用", vdir)
+            return exe
+        try:
+            os.rename(pending, os.path.join(res, "app.asar"))
+            log.info("[launch] 应用待生效更新（pending-asar → app.asar）：%s", vdir)
+        except OSError as e:
+            log.warning("[launch] 应用 pending-asar 失败（照常尝试拉起）：%s", e)
+        return exe
 
     @staticmethod
     def _js(c: Dict[str, Any]):
