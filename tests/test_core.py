@@ -1446,6 +1446,9 @@ class TestClientDriverLogic(unittest.TestCase):
                 self.val = None
             def evaluate(self, expr, await_promise=True):
                 return self.val
+            def press_escape(self):
+                pass
+
             def close(self):
                 pass
 
@@ -1548,6 +1551,9 @@ class TestClientDriverLogic(unittest.TestCase):
                         return "dispatched"
                 return "no-button"
 
+            def press_escape(self):
+                pass
+
             def close(self):
                 pass
 
@@ -1576,6 +1582,9 @@ class TestClientDriverLogic(unittest.TestCase):
                     return "no-button"      # 主工作区：该按钮不存在
                 seen.append("entry-hit")
                 return "dispatched"
+
+            def press_escape(self):
+                pass
 
             def close(self):
                 pass
@@ -1617,6 +1626,9 @@ class TestClientDriverLogic(unittest.TestCase):
                 calls["n"] += 1
                 return "no-button" if calls["n"] < 3 else "dispatched"
 
+            def press_escape(self):
+                pass
+
             def close(self):
                 pass
 
@@ -1637,6 +1649,9 @@ class TestClientDriverLogic(unittest.TestCase):
             def evaluate(self, js, await_promise=False):
                 calls["n"] += 1
                 return "no-button"
+
+            def press_escape(self):
+                pass
 
             def close(self):
                 pass
@@ -1690,6 +1705,9 @@ class TestClientDriverLogic(unittest.TestCase):
                 calls["reload"] += 1
                 return True
 
+            def press_escape(self):
+                pass
+
             def close(self):
                 pass
 
@@ -1718,6 +1736,9 @@ class TestClientDriverLogic(unittest.TestCase):
             def reload(self, wait):
                 calls["reload"] += 1
                 return True
+
+            def press_escape(self):
+                pass
 
             def close(self):
                 pass
@@ -4261,6 +4282,80 @@ class TestPendingAsarApply(unittest.TestCase):
         restart = inspect.getsource(ClientDriver._restart_client)
         self.assertIn("_ensure_launchable", cold, "冷启动路径没有应用 pending-asar")
         self.assertIn("_ensure_launchable", restart, "重启路径没有应用 pending-asar")
+
+
+class TestOpenEntryMenuPath(unittest.TestCase):
+    """0.4.11 把礼物入口从用量面板搬进了**用户菜单 → 权益中心**（2026-10-29 实测）。
+
+    背景：当天 qoder 三轮 no_action，实地侦察发现旧兜底入口『打开 Rewards』
+    在 0.4.11 里已不存在（礼物图标搬进了『打开用户菜单』的下拉菜单，菜单项
+    『权益中心』可领时才有 aria）。实测：合成事件序列能开用户菜单、能触发
+    菜单项 onSelect 调出活动 Surface —— 沿用驱动原有的入口点击机器即可。
+    """
+
+    def test_qoder_recipe_uses_menu_path(self):
+        """守卫直接**读真实配方** —— 判据要按真实数据写，不能按测试里的便利写。"""
+        import os
+        import yaml
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "recipes", "qoder.yaml")
+        with open(path, encoding="utf-8") as fh:
+            d = yaml.safe_load(fh)
+        labels = list((d.get("client") or {}).get("open_entry_labels") or [])
+        self.assertIn("打开用户菜单", labels,
+                      "配方缺『打开用户菜单』—— 0.4.11 起礼物入口在用户菜单里")
+        self.assertIn("权益中心", labels,
+                      "配方缺『权益中心』—— 那是调出活动 Surface 的菜单项")
+
+    def test_entry_click_js_falls_back_to_text_match(self):
+        """『权益中心』不可领时**没有 aria**，入口匹配必须落到文本精确匹配。"""
+        from checkin.drivers import client_claim as m
+        self.assertIn("innerText", m._JS_CLICK_ARIA,
+                      "_JS_CLICK_ARIA 缺文本匹配兜底 —— 不可领日入口会永远 no-button")
+
+    def test_open_entry_presses_escape_before_labels(self):
+        """弹出层是 toggle 语义：入口点击前必须先 ESC 归零，且标签按顺序尝试。"""
+        from unittest.mock import MagicMock, patch
+        from checkin.drivers import client_claim as m
+        from checkin.drivers.client_claim import ClientDriver
+        drv = ClientDriver()
+        c = {"open_entry_labels": ["打开用户菜单", "权益中心"],
+             "main_target_match": "renderer/index.html",
+             "entry_delay_sec": 0.0, "entry_timeout_sec": 0.5,
+             "home_labels": []}
+        with patch.object(ClientDriver, "_main_target",
+                          return_value={"webSocketDebuggerUrl": "ws://x"}), \
+             patch.object(m, "CDPPage") as cls:
+            page = cls.return_value
+            page.evaluate.return_value = "dispatched"
+            drv._open_entry(9340, c)
+            page.press_escape.assert_called_once()
+            exprs = [call.args[0] for call in page.evaluate.call_args_list]
+            self.assertTrue(any("打开用户菜单" in e for e in exprs),
+                            "第一个入口标签没有被尝试")
+            self.assertTrue(any("权益中心" in e for e in exprs),
+                            "第二个入口标签没有被尝试")
+
+
+    def test_dismiss_surface_never_uses_close_target(self):
+        """活动 Surface 与主窗口**共用 BrowserWindow**（日志里两者 webContentsId 同为 2）
+        —— `Target.closeTarget` 会把主窗口一起销毁（2026-10-29 实测，app 缩进托盘）。
+        收 Surface 只允许走主窗口 ESC。
+        """
+        import inspect
+        from checkin.drivers.client_claim import ClientDriver
+        src = inspect.getsource(ClientDriver._dismiss_surface)
+        self.assertNotIn("close_target", src,
+                         "_dismiss_surface 用了 closeTarget —— 会把主窗口一起关掉")
+        self.assertIn("press_escape", src)
+
+    def test_claim_dismisses_surface_on_already(self):
+        """入口改走菜单后，**不可领日**驱动也会调出 Surface —— 判 ALREADY 后必须收掉，
+        否则它天天残留在用户屏幕上。"""
+        import inspect
+        from checkin.drivers.client_claim import ClientDriver
+        self.assertIn("_dismiss_surface", inspect.getsource(ClientDriver._claim),
+                      "_claim 的 ALREADY / no-button 出口没有收 Surface")
 
 
 if __name__ == "__main__":

@@ -98,13 +98,17 @@ _JS_CLICK = r"""
 """
 
 # 「把活动入口点出来」用的点击脚本。与 _JS_CLICK 只差**找元素的方式**：
-# 活动页里的领取按钮有固定文案，而客户端外壳上的入口只有 aria-label 可依。
+# 客户端外壳上的入口有的只有 aria-label（『打开用户菜单』），有的只有文本
+# （『权益中心』菜单项 —— 可领时才有 aria，不可领时只有 innerText，
+# 2026-10-29 在 0.4.11 实测），所以两条路都试：先 aria 子串，再文本精确。
 # 事件序列必须与 _JS_CLICK 完全一致 —— 同一个 UI 框架，同样绑 pointerdown。
 _JS_CLICK_ARIA = r"""
 (() => {
   const label = __LABEL__;
   const b = [...document.querySelectorAll('[aria-label]')].find(
-    x => ((x.getAttribute('aria-label') || '')).includes(label));
+    x => ((x.getAttribute('aria-label') || '')).includes(label))
+    || [...document.querySelectorAll('button,[role="menuitem"],[role="button"],a')].find(
+    x => (((x.innerText || '') + '').trim()) === label);
   if (!b) return 'no-button';
   b.scrollIntoView({block: 'center'});
   const r = b.getBoundingClientRect();
@@ -753,17 +757,20 @@ class ClientDriver(Driver):
 
             if not pre.get("found"):
                 if any(m in body for m in markers):
+                    self._dismiss_surface(port, c)
                     return CheckinResult(sid, Outcome.ALREADY, message="界面显示本窗口已领取",
                                          detail={"body": body[:200]})
                 if "登录" in body:
                     return CheckinResult(sid, Outcome.NEED_LOGIN,
                                          message="客户端未登录，请先登录后重试",
                                          detail={"body": body[:200]})
+                self._dismiss_surface(port, c)
                 return CheckinResult(sid, Outcome.NO_ACTION,
                                      message="活动页里找不到领取按钮（客户端可能已升级改版）",
                                      detail={"body": body[:300]})
 
             if pre.get("disabled"):
+                self._dismiss_surface(port, c)
                 return CheckinResult(sid, Outcome.ALREADY,
                                      message="领取按钮已置灰（本窗口已领取）",
                                      detail={"body": body[:200]})
@@ -782,6 +789,7 @@ class ClientDriver(Driver):
             if confirmed:
                 return CheckinResult(sid, Outcome.SUCCESS, message="已点击领取并确认到账", detail=detail)
             # 点下去了但读不到确认文案：**不能报成功**。宁可报"不确定"，让人去看一眼。
+            # （此时**不收** Surface —— 留着给人工核对，收了就什么都看不到了。）
             return CheckinResult(sid, Outcome.NO_ACTION,
                                  message="已点击领取，但未读到确认文案，请人工核对",
                                  detail=detail)
@@ -1446,7 +1454,8 @@ class ClientDriver(Driver):
                 log.debug("返回主工作区失败：%s", e)
 
     def _open_entry(self, port: int, c: Dict[str, Any]) -> None:
-        """从客户端外壳把活动入口**点出来**（入口平时藏在用量面板后面）。
+        """从客户端外壳把活动入口**点出来**（0.4.11 起藏在**用户菜单 → 权益中心**，
+        旧版藏在用量面板的礼物图标后面，两条路径按配方顺序都试）。
 
         为什么必须做：入口是否在启动时自动打开，由**启动那一刻**的服务端状态决定。
         客户端整天开着（实测 uptime 13 小时）时，开窗后入口不会自己出现 ——
@@ -1477,6 +1486,10 @@ class ClientDriver(Driver):
             # 先确保在主工作区：客户端可能停在设置页等子页面，那一层没有活动入口
             # （2026-10-11 实测：重启后落在设置页 ⇒ 所有入口 no-button ⇒ 当天漏签）
             self._back_to_home(page, c, settle)
+            # 弹出层是 toggle 语义：上一轮尝试留在打开态的用户菜单/面板，会让这一轮
+            # 的第一次入口点击变成"关闭"（2026-10-29）。先 ESC 归零，幂等。
+            page.press_escape()
+            time.sleep(settle)
             for label in labels:
                 js = _JS_CLICK_ARIA.replace(
                     "__LABEL__", json.dumps(str(label), ensure_ascii=False))
@@ -1495,6 +1508,25 @@ class ClientDriver(Driver):
                         log.info("点击入口 %r → 未出现（已等 %.0fs）", label, budget)
                         break
                     time.sleep(0.5)
+        finally:
+            page.close()
+
+    def _dismiss_surface(self, port: int, c: Dict[str, Any]) -> None:
+        """ESC 收掉**我们调出的**活动 Surface（幂等；没有 Surface 在开时什么也不做）。
+
+        为什么必须做（2026-10-29）：入口改走「用户菜单 → 权益中心」后，**不可领日**
+        驱动也会把 Surface 调出来读"已领取" —— 不收的话它天天残留在用户屏幕上。
+
+        ⚠ 绝不能用 `Target.closeTarget` 关它：实测（同日）活动 Surface 与主窗口
+        **共用同一个 BrowserWindow**（客户端日志里两者的 webContentsId 都是 2），
+        closeTarget 会把主窗口一起销毁，app 缩进托盘、主 UI 直接没了。
+        """
+        main = self._main_target(port, str(c.get("main_target_match") or ""))
+        if main is None:
+            return
+        page = CDPPage(main["webSocketDebuggerUrl"])
+        try:
+            page.press_escape()
         finally:
             page.close()
 

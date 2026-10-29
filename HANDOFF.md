@@ -7,6 +7,41 @@
 
 ---
 
+## [2026-10-29 12:30] WorkBuddy(阿拾) —— Qoder 0.4.11 UI 改版：礼物入口搬进用户菜单；今日 qoder 实际已领（人工）
+
+**今日状态**：4/5 success（doubaowork / dumate / trae / workbuddy），qoder 三轮 no_action。
+**深挖后确认：qoder 今天的 100 Credits 实际已领到** —— 10:53:52 QQ 推送 no_action 后，
+10:54:14 活动 Surface 以 `source:"settings_menu"` 被打开（人工），10:54:16 `claimable→false`，
+用量快照 `addOnQuota.total` 从 10:49 的 **2900 → 11:41 的 3000**（+100 铁证）。已用
+`StateStore.record('qoder','already')` 如实入账，streak 34→35，明天不会误报"昨天漏签"。
+
+**当日排查时间线（全部落在客户端 main.log，UTC）**：
+- 10:49:27 旧实例整点复查 `hasClaimableCampaign:true` —— 活动其实**可领**，但
+  `shouldShowCampaignPopup:false`（弹窗只在**启动那一刻**判定，复查不弹）⇒ 10:48/10:52 两轮接管扑空；
+- 三轮 no_action 的真因：**0.4.11 把礼物图标从用量面板删了**，`open_entry_labels` 的
+  『打开 Rewards』兜底名存实亡（配方写了、代码在、守卫绿，UI 上这条路已经不存在）；
+- 翻 0.4.11 app.asar 钉死新入口：`openFromMenu()` 由**用户菜单里的『权益中心』菜单项**触发
+  （i18n `profile.rewardsCenter`，可领时 aria=`权益中心，有权益待领取`，不可领时只有 innerText）。
+
+**修法（真机端到端验证，331 测试全绿，+TestOpenEntryMenuPath 5 条守卫）**：
+1. `recipes/qoder.yaml` `open_entry_labels` 改为：打开用户菜单 → 权益中心 → 查看我的用量 → 打开 Rewards（后两条留作旧版兜底）；
+2. `client_claim._JS_CLICK_ARIA` 匹配扩展：**aria 子串 → 文本精确** 两级（『权益中心』不可领日没有 aria）；
+3. `_open_entry` 开场先 **ESC**（弹出层是 toggle 语义，上一轮留在打开态会让这一轮第一次点击变成"关闭"）；`cdp.py` 新增 `CDPPage.press_escape()`（Input 域受信任事件）；
+4. `client_claim` 新增 `_dismiss_surface()`：判 ALREADY / no-button 后 **ESC 收掉 Surface** —— 否则改版后不可领日天天把 Surface 调出来又留着。真机冒烟：`ALREADY` + Surface 残留 0。
+
+**⚠ 两条新的血泪（给后来者）**：
+- **绝不能用 `Target.closeTarget` 关活动 Surface**：实测 Surface 与主窗口**共用同一个
+  BrowserWindow**（日志里两者 webContentsId 同为 2），closeTarget 把主窗口一起销毁，
+  app 缩进托盘、`windows:[]`、/json 里主 target 变空 URL。当日我关探测残留的 Surface
+  时踩中，已用驱动重启 + 临时计划任务（Interactive）恢复。收 Surface 只能**主窗口 ESC**。
+- **会话内直接 spawn Qoder 仍会秒退**（无会话目录、进程消失）—— 与 10-20 DuMate 同一类
+  环境限制。要拉起必须走**计划任务（Interactive）**，别在 Agent 会话里裸 spawn 后误判代码缺陷。
+
+**改动的共管文件**：`recipes/qoder.yaml`、`src/checkin/drivers/client_claim.py`、
+`src/checkin/browser/cdp.py`（+press_escape）、`tests/test_core.py`（+5 守卫）。
+
+---
+
 ## [2026-10-27 11:00] WorkBuddy(阿拾) —— Qoder「本地数据由更高版本创建」横幅根因：我们的重启把它降级回 0.2.5
 
 **用户报**：每次签到完 Qoder 都弹「本地数据由更高本版创建，部分功能可能不兼容」。

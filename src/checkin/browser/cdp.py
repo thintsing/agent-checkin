@@ -127,6 +127,25 @@ class CDPPage:
         except Exception as e:
             log.debug("唤醒页面失败（忽略，由上层超时兜底）: %s", e)
 
+    def press_escape(self) -> None:
+        """发一次真实 Escape 键事件（keyDown + keyUp，走 Input 域 = 受信任事件）。
+
+        为什么需要（2026-10-29）：客户端外壳的**弹出层**（用户菜单 / 用量面板）
+        是 toggle 语义 —— 上一轮尝试把菜单留在打开态时，这一轮再点同一个入口
+        会把它**关上**，后面的菜单项就全都不存在了。每轮入口点击前先 ESC 归零；
+        幂等：没有弹出层时它什么也不做。
+        """
+        for params in (
+            {"type": "keyDown", "key": "Escape", "code": "Escape",
+             "windowsVirtualKeyCode": 27, "nativeVirtualKeyCode": 27},
+            {"type": "keyUp", "key": "Escape", "code": "Escape",
+             "windowsVirtualKeyCode": 27, "nativeVirtualKeyCode": 27},
+        ):
+            try:
+                self._cmd("Input.dispatchKeyEvent", params)
+            except Exception as e:                          # noqa: BLE001
+                log.debug("dispatchKeyEvent 失败（忽略）: %s", e)
+
     def reload(self, wait_sec: float = 3.0) -> bool:
         """重新加载当前页面（让页面重新向服务端要一次状态）。
 
