@@ -358,3 +358,31 @@ claim : {"status":200,"data":{"code":0,"message":"success"}}
 - `close_after: true`（用户 2026-10-12 选「自动拉起，签完关掉」）——
   只作用于**我们拉起的实例**，用户在用的实例永不关。
 
+
+### 豆包工作 / doubao.com（2026-10-21 接入 · 2026-11-02 补充）
+
+**接口**（活动页 `https://www.doubao.com/pc/agent-explore` 自己发的，抓包实录）：
+
+```
+POST /alice/ug/campaign/v3/detail/      body {campaign_group_code:"pc_incentive_task_mvp_v3"}
+     → data.tasks[] 里 campaign_code=="daily_signin" 的 task_status（3=已签 1=未签）
+     → 2026-11-02 观察：新增嵌套层 data.tasks[].daily_checkin{checked_in_today,
+       continuous_days, last_checkin_date, reward}（旧扁平字段仍在，判据未动）
+POST /alice/ug/campaign/landing/checkin body {scene:"pc_incentive_task_mvp_v3"}
+     → data{checked_in, checkin_date, continuous_days, reward_amount}
+```
+
+**业务码 710010702 = "每日签到尚未开放"（2026-10-31 起）**：
+
+- status 预检正常（task_status=1 未签），claim 被服务端以此码拒绝；
+- 掐点实测（11-02）：10:45 仍拒、**10:55 即放行**（claim `code:0`，+400 到账）；
+  10-31 更晚——11:34 仍未开放。**每日开放时刻逐日漂移**；
+- detail 只有活动整体起止（start 2025-07-01 / end ~2030），**没有每日开放字段**，
+  无法预报，只能定时重试覆盖 ⇒ 计划任务 2026-11-02 起四个触发器
+  （09:55 / 11:30 / **15:00 午后补试** / 21:00），配方头注释同步登记；
+- 上午回合拿到 710010702 属**预期行为**，不是故障；司机台日志现在会把服务端
+  `message` 一起带出来（`client_claim.py` 未知码分支）。
+
+**判据**：`checked_in_flag: hasIssued`（status_js 从 tasks[] 提上来的 task_status==3）。
+**入口**：活动页平时不存在，驱动走 `open_target`（CDP createTarget，同一 profile
+同登录态）自己开，用完按 targetId 关。

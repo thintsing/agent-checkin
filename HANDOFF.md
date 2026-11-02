@@ -7,6 +7,38 @@
 
 ---
 
+## [2026-11-02 11:20] WorkBuddy(阿拾) —— doubaowork 710010702 根因（服务端后移每日开放时刻）；计划任务加 15:00 午后补试
+
+**今日状态**：5/5 全部落实。qoder 靠 10-29 新菜单路径**首次全自动成功**；doubaowork 上午两轮
+no_action（710010702），**10:55 排查中实测 claim 放行、+400 到账**（continuous_days 13），
+已 `StateStore.record('doubaowork','already')` 入账，streak 13→14。
+
+**根因（三天日志 + 一次掐点实测钉死）**：豆包工作**服务端把每日签到开放时刻后移且逐日漂移**——
+10-22~10-30 上午窗口全成功；10-31 起 status 预检正常但 claim 被业务码 **710010702** 拒
+（"每日签到尚未开放"）；11-02 掐点：10:45 拒 → 10:55 放行。detail 里只有活动整体起止
+（2025-07~2030），**没有每日开放字段，不可预报，只能定时重试**。此前全靠用户看 QQ 推送后手动领。
+
+**修法**：
+1. 计划任务 **三触发器 → 四**（09:55 / 11:30 / **15:00 午后补试** / 21:00），已 `--install-task`
+   重装并核对 Triggers 生效；`_afternoon_hint()` 刻意固定 15:00（同收尾触发的解耦逻辑）；
+2. `client_claim` 未知业务码的日志/推送**带上服务端 message**（本次 710010702 的语义
+   靠三天日志才拼出来，其实 message 一直在响应里）；claim_js 本就回传了 `message` 字段；
+3. 配方头注释 + `DESIGN_NOTES.md` 新增「豆包工作」小节，登记 710010702 语义与证据链；
+   上午回合拿到此码属**预期**，不是故障。
+
+**⚠ 未登记改动，替对方补登记**：`recipes/qoder.yaml` `debug_port: 9340 → 9343`（文件时间
+10-31 10:48）—— 是**驱动的僵尸端口自愈自己回写的**（当日日志："端口 9340 已被僵尸 socket
+占死，换用 9343"），已稳定工作 3 天（streak 39）。按「以文件现主为准」原样提交；
+**注意**：工作记忆里的端口台账 9340=Qoder 已过时，现为 **9343**。
+
+**守卫**：`test_has_three_triggers_covering_the_whole_day` 升级为四触发器版 + 钉死
+`_afternoon_hint()=="15:00"`；332 全绿。
+
+**改动的共管文件**：`src/checkin/__main__.py`、`src/checkin/drivers/client_claim.py`、
+`recipes/doubaowork.yaml`、`recipes/qoder.yaml`、`DESIGN_NOTES.md`、`tests/test_core.py`。
+
+---
+
 ## [2026-10-29 12:30] WorkBuddy(阿拾) —— Qoder 0.4.11 UI 改版：礼物入口搬进用户菜单；今日 qoder 实际已领（人工）
 
 **今日状态**：4/5 success（doubaowork / dumate / trae / workbuddy），qoder 三轮 no_action。

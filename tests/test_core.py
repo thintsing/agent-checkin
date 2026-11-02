@@ -30,6 +30,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from checkin.__main__ import (                                # noqa: E402
+    _afternoon_hint,
     _fallback_hint,
     _install_script,
     _print_task,
@@ -2776,15 +2777,18 @@ class TestTaskInstall(unittest.TestCase):
                 self.assertIn(f"-At {_psq(_wake_hint(start))}", _install_script(cfg))
                 self.assertNotIn("-RandomDelay", _install_script(cfg))
 
-    def test_has_three_triggers_covering_the_whole_day(self):
-        """必须有三个触发器：主触发 + 窗口结束后的兜底 + 当夜收尾。
+    def test_has_four_triggers_covering_the_whole_day(self):
+        """必须有四个触发器：主触发 + 兜底 + 午后补试 + 当夜收尾。
 
-        **三个都有血案在身：**
+        **个个都有血案在身：**
         · 兜底（t2）—— 2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默
           判 missed，程序**根本没启动**（当天连日志文件都没有，`NumberOfMissedRuns=1`）。
           只靠 `-StartWhenAvailable` 救不了未登录场景 ⇒ 必须有第二次机会。
-        · 收尾（t3）—— 2026-10-17：前两次都撞上"客户端还在无端口形态"（自升级后自重启
-          留下来的），那是**当天不会自愈**的状态；到夜里再试一次才可能自己了结。
+        · 午后补试（t3）—— 2026-10-31 起：豆包工作每日签到开放时刻被服务端后移，
+          上午与兜底回合全被业务码 710010702 拒领（11-02 掐点实测 10:45 拒、
+          10:55 放行），当天全靠用户手动领 ⇒ 15:00 补一次程序自己的机会。
+        · 收尾（t4）—— 2026-10-17：前几次都可能撞上"客户端还在无端口形态"
+          （自升级后自重启留下来的），那是**当天不会自愈**的状态；夜里再试才可能了结。
         已成功的站点由程序自身幂等拦下，不会重复签到。
         """
         for start, end in (("10:05", "12:30"), ("07:40", "11:20"), ("09:00", "09:30")):
@@ -2792,9 +2796,10 @@ class TestTaskInstall(unittest.TestCase):
                 s = _install_script(_cfg(start, end))
                 self.assertIn(f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(_wake_hint(start))}", s)
                 self.assertIn(f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(_fallback_hint(end))}", s)
-                self.assertIn(f"$t3=New-ScheduledTaskTrigger -Daily -At {_psq(_closing_hint(end))}", s)
-                self.assertIn("$t=@($t1,$t2,$t3)", s,
-                              "三个触发器必须都注册，漏注册就不会真的生效")
+                self.assertIn("$t3=New-ScheduledTaskTrigger -Daily -At '15:00'", s)
+                self.assertIn(f"$t4=New-ScheduledTaskTrigger -Daily -At {_psq(_closing_hint(end))}", s)
+                self.assertIn("$t=@($t1,$t2,$t3,$t4)", s,
+                              "四个触发器必须都注册，漏注册就不会真的生效")
 
     def test_closing_trigger_lands_in_the_evening(self):
         """收尾触发必须落在傍晚之后 —— 它要的是"距离最后一次失败已经过去很久"。
@@ -2803,6 +2808,15 @@ class TestTaskInstall(unittest.TestCase):
         """
         self.assertEqual(_closing_hint("12:30"), "21:00")
         self.assertEqual(_closing_hint("19:00"), "21:00")
+
+    def test_afternoon_retry_is_fixed_at_15(self):
+        """午后补试**刻意固定** 15:00（与窗口解耦，同收尾触发一个道理）。
+
+        它要吃下的是"豆包工作每日签到开放时刻后移"（2026-10-31 起，
+        业务码 710010702）——开放时刻逐日漂移且接口不可预报，只能定时重试。
+        改这个值之前先重看 2026-11-02 的日志与 DESIGN_NOTES 取证。
+        """
+        self.assertEqual(_afternoon_hint(), "15:00")
         self.assertEqual(_closing_hint("21:30"), "22:30")
         self.assertEqual(_closing_hint("坏值"), "21:00")
 

@@ -921,8 +921,15 @@ class ClientDriver(Driver):
             detail = {"source": "client_bridge", "claim_code": cl.get("code"),
                       "claim_status": cdata.get("status")}
             zh = {Outcome.SUCCESS: "已领取", Outcome.ALREADY: "本窗口已领取"}.get(outcome)
-            msg = ("%s（客户端 bridge）" % zh if zh
-                   else "客户端 bridge 返回未判定结果（code=%s）" % cl.get("code"))
+            if zh:
+                msg = "%s（客户端 bridge）" % zh
+            else:
+                # 未知业务码必须把**服务端自己的话**带出来 —— 豆包工作 710010702 一案
+                # （2026-10-31 起"每日签到尚未开放"）最初只记 code，语义靠三天日志
+                # 加掐点实测才拼出来；message 一直就在响应里，只是没人带出来。
+                extra = str(cdata.get("message") or "").strip()
+                msg = "客户端 bridge 返回未判定结果（code=%s%s）" % (
+                    cl.get("code"), ("，server: " + extra) if extra else "")
 
             # 4) 让**界面**也跟上（可选开关 `refresh_ui_after_claim`，默认关）。
             #
