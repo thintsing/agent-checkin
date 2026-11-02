@@ -7,8 +7,8 @@
 <details>
 <summary><b>English</b> — what this is, at a glance</summary>
 
-A Windows scheduler that automates the **daily check-in** of five AI-assistant desktop clients
-(WorkBuddy, Qoder CN, Trae CN, DuMate, DoubaoWork) — without ever touching your credentials.
+A Windows scheduler that automates the **daily check-in** of six AI-assistant desktop clients
+(WorkBuddy, Qoder CN, Qoder International, Trae CN, DuMate, DoubaoWork) — without ever touching your credentials.
 
 - **Recipe-driven.** Every site is one YAML file under `recipes/`. Adding a site needs **zero code changes**,
   and no product name appears in the source tree.
@@ -24,7 +24,7 @@ A Windows scheduler that automates the **daily check-in** of five AI-assistant d
   inside the window. Never on the hour; never via the Task Scheduler's own `-RandomDelay`.
 - **Failures are loud.** Desktop toast + optional QQ push. "Done" is never printed next to failures, because
   a green summary beside a red row is the worst possible notification.
-- **319 offline tests**, ~6 s, no network and no browser.
+- **333 offline tests**, ~6 s, no network and no browser.
 
 ⚠ Automating check-ins likely **violates those platforms' terms of service**. Use your own single account,
 single device, single network — and read the risk section before you start.
@@ -32,7 +32,7 @@ single device, single network — and read the risk section before you start.
 </details>
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-319%20passing-brightgreen)](#测试)
+[![Tests](https://img.shields.io/badge/tests-333%20passing-brightgreen)](#测试)
 [![Sites](https://img.shields.io/badge/sites-6%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
@@ -468,7 +468,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-**319 项（305 单元 + 14 架构守卫），全部离线**（不联网、不开浏览器），约 6 秒跑完：
+**333 项（319 单元 + 14 架构守卫），全部离线**（不联网、不开浏览器），约 6 秒跑完：
 
 - **单元测试**：业务码与状态位判定、随机时刻分布、幂等 / 熔断 / 连续天数、退避抖动、
   注入 JS 的转义与脱敏、运行锁互斥与**持锁进程判活**、配置加载、引擎各闸门分支、
@@ -488,7 +488,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 
 这个项目在文档里保留了**被推翻的中间结论**和**未验证项** —— 我认为这比粉饰更有价值。
 
-1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在五个站点都走 `client`，
+1. **`auto`（网页 cookie 路径）的写接口响应仍未直接观测过** —— 现在六个站点都走 `client`，
    网页侧浏览器当前没有站点在用。`client` 路径下的写响应**已实测观测**
    （2026-10-06 起 WorkBuddy bridge 路线跑通，`data.status` 业务词表已在真机验证）；
    `auto` 侧仍保留双保险（业务词表 + code 规则），首次真跑前不做额外"验证性"写请求
