@@ -33,13 +33,13 @@ single device, single network — and read the risk section before you start.
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-319%20passing-brightgreen)](#测试)
-[![Sites](https://img.shields.io/badge/sites-5%20supported-orange)](#支持的平台)
+[![Sites](https://img.shields.io/badge/sites-6%20supported-orange)](#支持的平台)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#许可)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#快速开始)
 [![Deps](https://img.shields.io/badge/deps-websocket--client%20%2B%20PyYAML-informational)](#快速开始)
 
-> **当前状态**：5 个站点（WorkBuddy / Qoder CN / Trae CN / DuMate / 豆包工作）每日全自动运行中，
-> 连续天数最长 28 天。319 项测试全绿。最后更新 **2026-10-21**。
+> **当前状态**：6 个站点（WorkBuddy / Qoder CN / Qoder 国际版 / Trae CN / DuMate / 豆包工作）每日全自动运行中，
+> 连续天数最长 40 天。333 项测试全绿。最后更新 **2026-11-02**。
 
 **目录**
 
@@ -85,11 +85,12 @@ single device, single network — and read the risk section before you start.
 ```text
   站点            模式       连续     今日失败      今日
   ----------------------------------------------------------
-  doubaowork    client   1       0         已完成
-  dumate        client   2       0         已完成
-  qoder         client   24      0         已完成
-  trae          client   10      0         已完成
-  workbuddy     client   28      0         已完成
+  doubaowork    client   14      0         已完成
+  dumate        client   14      0         已完成
+  qoder-intl    client   1       0         已完成
+  qoder         client   39      0         已完成
+  trae          client   22      0         已完成
+  workbuddy     client   40      0         已完成
 ```
 
 ---
@@ -128,7 +129,7 @@ python tools\win_shortcut_args.py --app workbuddy --autostart            REM 给
 python tools\win_shortcut_args.py --app workbuddy --autostart --revert   REM 还原
 ```
 
-端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|workbuddy|trae|dumate|doubaowork`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
+端口值**不写死在工具里** —— 以各站点配方的 `client.debug_port` 为**单一事实源**（换端口 = 改配方 → 重跑 `--app <站点>`；工具已泛化为 `--app qoder|qoder-intl|workbuddy|trae|dumate|doubaowork`，旧的 `--qoder` 仍兼容；`--autostart` 同样读配方）。备份**只取最早那一份**（不会被二次改造覆盖），所以任何一次改造都能 `--revert` 回到真正干净的状态。**改完必须重启客户端才生效。**
 
 驱动随之采用**四分支决策**，核心原则是 **不轻易动用户正在用的客户端**
 （2026-10-14 起有**一处窄口例外**，见下表 ③）：
@@ -214,6 +215,7 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 |---|---|---|---|
 | **WorkBuddy** (`codebuddy.cn`) | `client` | **CDP bridge**：在客户端页面上下文里调用它自己的 http 通道（`window.wb.http`），走 `/v2` 桌面端前缀 | 免维护登录态 —— **客户端自己持有并续期 token**；网页侧 cookie 只有 **168 小时（7 天）** 就会过期，周期性要求人工重登 |
 | **Qoder CN** | `client` | **CDP 驱动桌面客户端**点它自己的按钮 | 网页入口不存在（见上文 ①）；且不伪造设备指纹 |
+| **Qoder 国际版**（`qoder.sh`） | `client` | 同国区，但走**英文 UI**：用户菜单（`Open user menu`）→ `Rewards center` → `Claim` | 与国区同因（活动页是宿主注入 token 的 OOPIF，独立打开收不到消息）；**判据与文案全在配方里** —— 国际版 UI 是英文，照抄国区中文入口会每天静默漏签 |
 | **Trae CN** | `client` | **CDP bridge**：调客户端自己的 IPC 通道（`window.vscode.ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`） | 签到入口藏在新版 Solo Lite UI 的账号菜单里（点开还会落到付费页）；IPC 是**客户端自己点签到按钮时走的同一条路**，不碰 token / 设备身份文件 |
 | **DuMate**（百度搭子） | `client` | **CDP bridge**：调 preload 暴露的 `window.electronAPI.bceConsoleRequest`（客户端自己的请求通道） | 前端是 `file://` origin，页面里直接 `fetch` 会被 **CORS 拦掉**，必须走它自己的桥；判据是 `loginBonusInfo` 的 `hasIssued`，500 分/天 |
 | **豆包工作**（DoubaoWork） | `client` | **CDP bridge + 自建页面**：`Target.createTarget` 在客户端同一个 profile 里开活动页（`doubao.com/pc/agent-explore`），在页面里 `fetch` 活动接口，用完关掉 | 签到入口是内置浏览器里的一个**活动页**，平时根本不存在（点菜单「免费领额度」才打开）；判据是 `daily_signin` 任务的 `task_status==3`，200 额度/天 |
@@ -243,7 +245,7 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 > 判据永远是**服务端**的 `hasIssued`，界面只是显示。
 
 > `auto`（在已登录浏览器页面上下文里 `fetch`）与 `manual`（只发提醒）两种模式**仍然保留、可用**；
-> 只是**当前五个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
+> 只是**当前六个站点都走 `client`** —— 桌面客户端的登录态由客户端自己续期，免维护，最省心。
 
 ### 接入一个新站点的两条路（2026-10-12 补）
 
@@ -280,7 +282,7 @@ run_checkin.bat --install-task
 - 专用浏览器使用**独立 profile**（`%LOCALAPPDATA%\AgentCheckIn\chrome-profile`），与你日常浏览器完全隔离。
 - 本机没装 Chrome 时会自动退回 Edge —— 属正常降级。
 - 登录成功的硬证据在 cookie 里（`codebuddy.cn` 域下会出现 `KEYCLOUD_SESSION` / `session`）——
-  这一步**只有新增 `auto` 站点时才需要**；当前五个站点都走 `client`，登录态由客户端自己维护。
+  这一步**只有新增 `auto` 站点时才需要**；当前六个站点都走 `client`，登录态由客户端自己维护。
 
 ### 排查用（全部只读，绝不触发签到）
 
@@ -340,7 +342,7 @@ REM 2) 抓接收方标识（运行后按提示给机器人发一条**私信**即
 ```
 
 > 配好之后，"**今天有没有需要我处理的**"会自己推到你手机上 —— 不用再翻日志。
-> 一天三次机会里只有在**真的做了动作**时才通知：全部站点都已完成的补跑不会重复打扰。
+> 一天四次机会里只有在**真的做了动作**时才通知：全部站点都已完成的补跑不会重复打扰。
 
 之后每天签到跑完，你会收到一条这样的消息：
 
@@ -390,7 +392,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
 | **凭证不出浏览器** | 不逆向加密 token、不存账号密码；请求在已登录页面上下文里 `fetch`，浏览器自动带鉴权与真实 TLS/HTTP2 指纹（`browser/page_script.py`） |
 | **随机执行时刻** | 计划任务在**固定的 `09:55`**（窗口开始前 10 分钟）唤醒；真正的执行时刻由 `core/scheduler.py` 在窗口内按 **Beta(2,2)** 采样后等待到点 —— 向窗口中部聚集、两端稀疏。**不是固定整点**。窗口写在 `config.yaml` 的 `schedule.window_start/end`（当前 `10:05–11:00`，是**唯一真值**，改一处即可）。⚠ 刻意**不用**计划任务的 `-RandomDelay` —— 它会让当日 occurrence 被静默跳过（2026-10-10 事故） |
 | **不弹窗** | 任务用 `pythonw.exe`（无控制台）运行；派生的 `powershell` 子进程一律带 `CREATE_NO_WINDOW`，`sys.stdout/stderr` 为 None 时有兜底 —— **全程无可见窗口**（进程会静默等待，但看不见） |
-| **一天三次机会** | 计划任务三个触发：`09:55`（主）/ `11:30`（兜底 = 窗口结束 +30min）/ `21:00`（收尾）。主触发被判 missed（2026-10-15 真漏一天）或撞上"当天不会自愈"的状态（2026-10-17）时，后面还有机会；已成功的站点被幂等拦下。**全部站点都跳过时不再弹通知** —— 一天三响会把警告淹没。⚠ **改了窗口必须重跑 `--install-task`**：兜底时刻是从窗口推导的，但它**写死在注册好的任务里**，不会自己跟着变（2026-10-20 压窗口时踩过：任务里还挂着 13:00） |
+| **一天四次机会** | 计划任务四个触发：`09:55`（主）/ `11:30`（兜底 = 窗口结束 +30min）/ `15:00`（午后补试）/ `21:00`（收尾）。主触发被判 missed（2026-10-15 真漏一天）或撞上"当天不会自愈"的状态（2026-10-17）时，后面还有机会；`15:00` 专门吃"服务端每日开放时刻后移"（豆包工作 2026-10-31 起，业务码 710010702）；已成功的站点被幂等拦下。**全部站点都跳过时不再弹通知** —— 一天几响会把警告淹没。⚠ **改了窗口必须重跑 `--install-task`**：兜底时刻是从窗口推导的，但它**写死在注册好的任务里**，不会自己跟着变（2026-10-20 压窗口时踩过：任务里还挂着 13:00） |
 | **单实例运行锁** | `core/lock.py`：系统级文件锁，防"计划任务 + 手动双击"并发导致重复打接口；进程退出自动释放。⚠ 进程被杀时 `release()` 不会执行，所以判陈旧**先看持锁 PID 在不在**（`procenv.pid_alive`），不在就立即接管 —— 只按时间戳判的话会白压 30 分钟、期间每次运行都被整轮跳过 |
 | **整轮预算 + 两遍扫描** | `core/models.RunBudget` + `engine.py`：一轮有总预算（默认 30 分钟）。第一遍每个站点最多等 `first_pass_wait_cap_sec`（25s），卡住的**立刻让位**；跑完一遍后用剩余预算回头补领。**这条是 2026-10-17 三站全军覆没的根因修复** —— 那时站点串行，第一个卡住就把后面的全饿死，连通知都发不出来 |
 | **昨日缺口补报** | `StateStore.missed_days()` + `__main__._collect_gaps()`：每天第一次运行会**回头看**上次完成之后到昨天为止有没有洞。计划任务 missed / 程序卡住 / 机器没开机 —— 任何一种都会让"昨天"整体消失，而第二天照常报"今日已完成"，那个洞**永远不提**。现在会明确播报（`昨天漏签了` / `漏签 N 天`），一天只报一次。⚠ 缺口必须在**引擎跑之前**取：今天一签上 `last_done_date` 就变成今天，那时回溯只会得到"没有缺口" |
@@ -509,7 +511,7 @@ verdict:                # 把业务码映射到统一语义，而不是看 HTTP 
    - **更难查的一种**：升级时启动器会**自己把应用重启一遍**（`state.ini` 的 `updatedAt`
      与应用的启动时刻重合，且同一刻 `targetVersion` 发生切换），这一次重启**不带**
      透传的调试开关 ⇒ 端口没开，驱动只能走 ③ 降级提醒。
-   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|workbuddy|trae|dumate|doubaowork` **以及**
+   ⇒ 升级后：重跑 `python tools/win_shortcut_args.py --app qoder|qoder-intl|workbuddy|trae|dumate|doubaowork` **以及**
      `... --app workbuddy --autostart`，**再从快捷方式重启客户端**。
 4. **调试端口是一次性资源**：被僵尸句柄占住后（症状：`netstat` 显示 `LISTENING`，
    但**连不上也绑不了**，`netstat` 里记的 PID 已不存在）**只能换端口或重启机器**，

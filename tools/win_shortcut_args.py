@@ -100,6 +100,20 @@ APPS = {
         # 2026-10-10 实地核查：Run 键里没有 Qoder 的项。
         "run_key": None,
     },
+    "qoder-intl": {
+        # 2026-11-02 新接入（国际版 qoder.sh，与国区**并存**）。
+        # 它装在 Program Files\Qoder，没有 .qoder-versions 版本目录；
+        # 启动入口只有开始菜单一个（桌面只有国区的 Qoder CN.lnk）。
+        "label": "Qoder 国际版",
+        "recipe": "qoder-intl.yaml",
+        "lnks": [
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Qoder.lnk",
+        ],
+        # 未观察到它回写快捷方式；没有实测依据就不加只读锁。
+        "lock": None,
+        # 2026-11-02 实地核查 HKCU\...\Run：**无**国际版项（它不自启）。
+        "run_key": None,
+    },
     "workbuddy": {
         "label": "WorkBuddy",
         "recipe": "workbuddy.yaml",

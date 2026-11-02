@@ -1,0 +1,142 @@
+# ============================================================
+#  站点配方 · Qoder 国际版（Qoder / qoder.sh）
+#  形态：client —— 驱动桌面客户端自己的 UI 完成领取。
+#
+#  ---- 2026-11-02 17:20 真机取证（阿拾；全程只读 + 一次真实点击）----
+#  安装：C:\Program Files\Qoder\Qoder.exe（0.5.1，Electron；**无** .qoder-versions
+#        版本目录，更新走 %LOCALAPPDATA%\Qoder\Qoder Launcher，故 exe_glob 留空）
+#  userData：%APPDATA%\com.qoder.app.stable（国区是 com.qodercn.app.stable）
+#  渲染页：qoder-app://renderer/index.html（国区是 qoder-cn-app://）⇒ 主窗口特征串
+#         'renderer/index.html' 两边通用。
+#  活动页：https://openapi.qoder.sh/growth-page/activity-iframe（国区 openapi.qoder.com.cn）
+#         ⇒ target_match 'growth-page' 两边通用。
+#
+#  ---- 与国区配方的三处真实差异（都实测过，别照抄国区）----
+#   ① **UI 是英文**：系统是 zh-CN，国际版照样全英文。
+#      '打开用户菜单' 不存在；真实入口 aria = **`Open user menu`**；
+#      菜单项文案 = **`Rewards center`**（国区『权益中心』）。
+#      菜单里另有促销行 `Rewards center, benefits available` —— 故入口用
+#      **文本精确匹配**（驱动已是 "aria 子串 → 文本精确" 两级），不会点错。
+#   ② 领取按钮 = **`Claim`**（国区『领取』）。同页还有标题
+#      `Claim 100 Credits Daily`，驱动按 innerText **全等**匹配 ⇒ 安全。
+#   ③ 忙闲判据要带英文词：国区那套 `执行中/运行中/...` 在国际版上一字不中，
+#      照抄等于「永远空闲」= 授权过的重启会在用户跑任务时动手。见 busy_probe。
+#
+#  ---- 活动机制（与国区同源，实测一致）----
+#    main.log：`[Campaign] 通知状态已更新 {"hasClaimableCampaign":true,
+#    "shouldShowCampaignPopup":false,...}`（2026-11-02 17:20 实例）
+#      · hasClaimableCampaign=true  ⇒ 今天可领（未领）
+#      · shouldShowCampaignPopup=false ⇒ **弹窗只在启动那一刻判定一次**，
+#        常开客户端不会自己冒出来 ⇒ 必须靠 open_entry_labels 把 Surface 点出来
+#    Surface 正文（实测）：`Claim 100 Credits Daily` / `Daily reset: 10:00 (UTC+8)` /
+#      `Valid for 30 days after claiming.` / 按钮 `Claim`（enabled）
+#      ⇒ 与国区同一个活动（每日 10:00 开新一轮，100 Credits）。
+#
+#  ---- 为什么不用 bridge（不走接口）----
+#    与国区同因：活动页是宿主注入 token 后渲染的 OOPIF，独立打开时
+#    `window.parent === window` ⇒ 忽略所有 postMessage，永远等不到数据；
+#    而复刻设备指纹（Cosy-MachineId/Token）属伪造设备身份，坚决不做。
+#    ⇒ 只能在客户端里点它自己的按钮（同 recipes/qoder.yaml 头注释的完整取证）。
+# ============================================================
+id: qoder-intl
+name: Qoder 国际版 每日 100 Credits
+enabled: true
+mode: client
+
+client:
+  # 国际版是「一个 Program Files 目录 + 独立 Launcher」的布局，没有版本目录，
+  # 更新直接替换 exe ⇒ 无 exe_glob（`_resolve_exe` 会回落到 exe）。
+  exe: '%ProgramFiles%\Qoder\Qoder.exe'
+  exe_glob: ''
+  # 端口台账：9333=网页 / 9336=WorkBuddy / 9338=Trae / 9341=DuMate / 9342=豆包工作 /
+  #           9343=Qoder CN / **9344=本应用**
+  debug_port: 9344
+  # 活动页在 /json 里的 target url 特征串（与国区同串）
+  target_match: 'growth-page'
+  # 领取按钮文本 —— 驱动按 innerText **全等**匹配，故不会被标题
+  # `Claim 100 Credits Daily` 干扰（实测页面上两个元素并存）
+  claim_button: 'Claim'
+  # 视为「已领取」的界面文案。只用于「找不到按钮时」的辅助判定，
+  # 判之前会先做陈旧快照复核（重载页面重新取状态）。
+  # ⚠ 首次领取后按真机返回校准；`Claim` 置灰也算（驱动另有 disabled 分支）。
+  claimed_markers: ['Claimed', 'Already claimed', 'Credits claimed']
+  # 定位「客户端是否在跑」：国际版进程名是 Qoder.exe（国区是 Qoder CN.exe），
+  # 两者**不互相命中**，可安全共存。
+  process_match: 'Qoder.exe'
+  # 客户端 userData 目录（零打扰预检：读 logs/<session>/main.log 的 claimable）
+  data_dir: '%APPDATA%\com.qoder.app.stable'
+  launch_timeout_sec: 90
+  target_timeout_sec: 25
+  # 把活动 Surface 从客户端外壳里调出来的入口（按顺序试；值 = aria 子串 / 文本精确）
+  #   'Open user menu'  —— 恒存在（实测 aria）
+  #   'Rewards center'  —— 菜单项；文本精确匹配，避开促销行
+  #     `Rewards center, benefits available` 那一条（实测同屏并存）
+  open_entry_labels:
+    - 'Open user menu'
+    - 'Rewards center'
+  # 主窗口 url 特征 —— 入口点击必须在主文档里做，不能在活动 OOPIF 里
+  main_target_match: 'renderer/index.html'
+  # 入口点击时序：点中一个入口后的静默期（等下一层渲染）
+  entry_delay_sec: 3.0
+  entry_timeout_sec: 20
+  # 只关「我们自己拉起的」实例；用户在用的实例永不关
+  close_after: true
+
+  # 无端口守候：调试端口只能在启动时绑定。2026-11-02 实测本机常态是
+  # **用户自己开机启动、不带端口**（当日 09:16 起的实例就是这样）——
+  # 靠 repair_launch_entry 修好入口，下一次启动即带端口。
+  # 守候取 120s 而非国区的 5400s：真正能救的是「用户中途重启」，长等没有额外收益。
+  wait_port_sec: 120
+
+  # 端口绑定失败（带了参数却连不上 ⇒ 不会自愈）⇒ 重启并当场补领
+  restart_on_bind_failure: true
+  # 无端口形态 ⇒ 修入口（只影响下次启动）+ 授权重启（必须过忙闲关）
+  repair_launch_entry: true
+  restart_when_portless: true
+
+  # ---- 重启前的忙闲把关 ----
+  # ⚠ 国际版 UI 是英文 ⇒ 判据词**必须双语**。只写中文 = 永远判空闲（名存实亡）。
+  #   判据词刻意不含 execution / progress / task 这类词：空闲态也会出现。
+  busy_probe:
+    busy_js: |
+      (() => {
+        const vis = el => { try { const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0; } catch (e) { return false; } };
+        const cn = el => { const c = el.className;
+          return typeof c === 'string' ? c : (c && c.baseVal) || ''; };
+        const txt = el => ((el.innerText || el.textContent || '') + '').trim();
+        const deepAll = (root, sel, out, depth) => {
+          out = out || []; depth = depth || 0; if (depth > 12) return out;
+          let list = []; try { list = root.querySelectorAll(sel); } catch (e) { return out; }
+          for (const el of list) out.push(el);
+          let kids = []; try { kids = root.querySelectorAll('*'); } catch (e) { return out; }
+          for (const el of kids) if (el.shadowRoot) deepAll(el.shadowRoot, sel, out, depth + 1);
+          return out;
+        };
+        const CLS = /running|processing|loading|spinner|busy/i;
+        const TXT = /执行中|运行中|进行中|处理中|排队中|等待中|生成中|停止生成|Working|Thinking|Generating|Running|Processing|Queued|Waiting|Stop generating/i;
+        for (const el of deepAll(document, '*')) {
+          if (!vis(el)) continue;
+          const c = cn(el);
+          if (c && CLS.test(c)) return true;
+          const a = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+          if (a && (CLS.test(a) || TXT.test(a))) return true;
+          const t = txt(el);
+          if (t && t.length < 24 && TXT.test(t)) return true;
+        }
+        return false;
+      })()
+    wait_busy_sec: 1800
+    cpu_window_sec: 5.0
+    idle_cpu_sec: 1.0
+
+reminder:
+  open_target: ''
+  not_before: '10:00'
+  toast_title: 'Qoder 国际版每日签到提醒'
+  toast_body: '打开 Qoder 国际版 → 左下角用户菜单 → Rewards center → 领取 100 Credits。每日 10:00（UTC+8）开新一轮。'
+  note: '活动页自述：Daily reset: 10:00 (UTC+8)，领取后 30 天有效；与国际版主进程日志 hasClaimableCampaign 一致。'
+
+schedule_hint:
+  timezone: Asia/Shanghai
+  refresh_hour_utc8: 10

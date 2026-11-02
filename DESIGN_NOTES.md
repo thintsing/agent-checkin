@@ -386,3 +386,37 @@ POST /alice/ug/campaign/landing/checkin body {scene:"pc_incentive_task_mvp_v3"}
 **判据**：`checked_in_flag: hasIssued`（status_js 从 tasks[] 提上来的 task_status==3）。
 **入口**：活动页平时不存在，驱动走 `open_target`（CDP createTarget，同一 profile
 同登录态）自己开，用完按 targetId 关。
+
+### Qoder 国际版 / qoder.sh（2026-11-02 接入 · 活体实测）
+
+与国区**同源不同壳**，四处差异全部实测（国区见上一条 Qoder 小节）：
+
+| 维度 | 国区 | 国际版 |
+|---|---|---|
+| 安装 | `%LOCALAPPDATA%\Programs\Qoder CN\` + `.qoder-versions\*`（内层 exe） | `C:/Program Files\Qoder\Qoder.exe`（**无**版本目录，更新走 Launcher） |
+| userData | `%APPDATA%\com.qodercn.app.stable` | `%APPDATA%\com.qoder.app.stable` |
+| 渲染协议 | `qoder-cn-app://renderer/index.html` | `qoder-app://renderer/index.html` |
+| 进程名 | `Qoder CN.exe` | `Qoder.exe`（两者互不命中，可并存） |
+| 活动域名 | `openapi.qoder.com.cn` | `openapi.qoder.sh` |
+| **UI 语言** | 中文 | **英文**（系统 zh-CN 也一样） |
+| 入口 | 用户菜单 →『权益中心』 | `Open user menu` → `Rewards center` |
+| 领取按钮 | 『领取』 | `Claim` |
+
+**实测证据（2026-11-02 17:20~17:24）**：
+
+- `main.log`：`[Campaign] 通知状态已更新 {"hasClaimableCampaign":true,"shouldShowCampaignPopup":false}` ——
+  `true` 说明今天可领；`false` 说明**弹窗已在启动那一刻判过一次**，整天开着的实例不会再自己弹
+  ⇒ 与国区同一条结构性缺口，必须靠 `open_entry_labels` 把 Surface 点出来；
+- Surface 正文：`Claim 100 Credits Daily` / `Daily reset: 10:00 (UTC+8)` /
+  `Valid for 30 days after claiming.` / 按钮 `Claim` ⇒ **同一个每日 100 Credits 活动**；
+- 驱动端到端：`SUCCESS`，界面 `Claimed successfully. Credits have been added.`，
+  服务端 `hasClaimableCampaign: true → false`（09:23:20Z，与点击同刻）；
+- 复跑：`ALREADY`（菜单 → Surface → 按钮已变 `Claimed`），Surface 被 ESC 收掉、残留 0。
+
+**两条容易照抄错的细节**：
+
+1. **`Claim` 与标题 `Claim 100 Credits Daily` 同屏并存** —— 驱动按 `innerText` **全等**匹配
+   才能只点中按钮（`_JS_PROBE` 实现如此）；若哪天改成"包含匹配"就会点错，守卫
+   `test_qoder_intl_recipe_uses_english_ui_labels` 钉住了这条。
+2. **忙闲判据必须双语**：只留中文 `执行中/运行中/...`，在国际版上一字不中 ⇒ 永远判空闲 ⇒
+   授权过的重启会在用户正跑任务时动手（正是 2026-10-17「名存实亡」那一类）。

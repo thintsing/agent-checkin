@@ -13,7 +13,8 @@
 
 ## 一、这个项目是干什么的
 
-三个平台（WorkBuddy / Qoder CN / Trae CN）的每日签到：用 CDP 接管一个**已登录的专用 Chrome**
+六个平台（WorkBuddy / Qoder CN / Qoder 国际版 / Trae CN / DuMate / 豆包工作）的每日签到：
+站点清单以 `recipes/*.yaml` 为准（本行只是概览，新增站点不需要改本文件）。用 CDP 接管一个**已登录的专用 Chrome**
 （`auto`）或**已运行的桌面客户端**（`client`），驱动它们**自己**完成签到。
 站点知识全部外置在 `recipes/*.yaml`，代码里不出现产品名。
 

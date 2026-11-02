@@ -848,6 +848,38 @@ class TestConfig(unittest.TestCase):
         for p in ports:
             self.assertTrue(1024 < int(p) < 65536, f"端口号越界: {p}")
 
+    def test_qoder_intl_recipe_uses_english_ui_labels(self):
+        """国际版 UI 是**英文**（系统 zh-CN 也一样）—— 照抄国区那套中文入口 = 每天静默漏签。
+
+        2026-11-02 真机取证（见 recipes/qoder-intl.yaml 头注释）：
+          · 用户菜单 aria = `Open user menu`（国区是『打开用户菜单』）
+          · 菜单项文案   = `Rewards center`（国区是『权益中心』）
+          · 领取按钮     = `Claim`（国区是『领取』；同页另有标题
+            `Claim 100 Credits Daily`，驱动按 innerText 全等匹配故不会误点）
+          · 进程名       = `Qoder.exe`（国区是 `Qoder CN.exe`，互不命中）
+        守卫要防的是"复制国区配方改个 id 就上线"—— 那种配方跑起来全是 `no-button`，
+        日志看起来"正常失败了"，实际一个入口都没点中。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        r = next(x for x in recipes if x.id == "qoder-intl")
+        c = r.client
+        self.assertEqual(r.mode, "client")
+        self.assertEqual(c["claim_button"], "Claim")
+        labels = list(c["open_entry_labels"])
+        self.assertIn("Open user menu", labels)
+        self.assertIn("Rewards center", labels)
+        for lb in labels:
+            self.assertFalse(any("\u4e00" <= ch <= "\u9fff" for ch in str(lb)),
+                             f"国际版入口文案不该含中文：{lb!r}（一个都不会命中）")
+        self.assertEqual(c["process_match"], "Qoder.exe")
+        self.assertEqual(c["data_dir"], r"%APPDATA%\com.qoder.app.stable")
+        # 忙闲判据必须**双语**：只留中文词在国际版上一字不中 = 永远判空闲 ⇒
+        # 授权过的重启会在用户正跑任务时动手（正是 2026-10-17 那类"名存实亡"）。
+        js = str(c["busy_probe"]["busy_js"])
+        self.assertTrue(any(w in js for w in ("Working", "Generating", "Running")),
+                        "国际版忙闲判据必须带英文词，否则永远判空闲")
+        self.assertIn("执行中", js, "中文词要保留：客户端偶尔也会输出中文状态")
+
 
 # ----------------------------------------------------------------------
 # 进程环境清洗（client 驱动的地基）

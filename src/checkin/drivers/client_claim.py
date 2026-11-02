@@ -1634,7 +1634,8 @@ class ClientDriver(Driver):
         """
         try:
             subprocess.run(["taskkill", "/IM", name, "/F", "/T"],
-                           capture_output=True, text=True, timeout=30,
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30,
                            creationflags=procenv.NO_WINDOW)   # pythonw 下不加会闪黑框
         except (OSError, subprocess.SubprocessError) as e:
             log.debug("[restart] taskkill 失败：%s", e)

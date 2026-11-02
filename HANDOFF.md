@@ -7,6 +7,54 @@
 
 ---
 
+## [2026-11-02 17:30] WorkBuddy(阿拾) —— 新接入第 6 站：Qoder 国际版（英文 UI，端口 9344）
+
+**今日状态**：6/6 全部落实。国际版今天的 100 Credits **由本次接入实测当场领到**
+（界面 `Claimed successfully.` + 服务端 `hasClaimableCampaign: true → false`，17:23:20），
+已 `StateStore.record('qoder-intl','success')` 入账，streak 1。
+
+**新站点事实（全部实测，详见 `recipes/qoder-intl.yaml` 头注释与 `DESIGN_NOTES.md`）**：
+
+| 维度 | 国区 | 国际版 |
+|---|---|---|
+| 安装 | `%LOCALAPPDATA%\Programs\Qoder CN\` + `.qoder-versions\*` | `C:\Program Files\Qoder\Qoder.exe`（无版本目录） |
+| userData | `com.qodercn.app.stable` | `com.qoder.app.stable` |
+| 进程名 | `Qoder CN.exe` | `Qoder.exe`（互不命中，**可并存**） |
+| UI 语言 | 中文 | **英文**（系统 zh-CN 也一样） |
+| 入口 | 用户菜单 →『权益中心』 | `Open user menu` → `Rewards center` |
+| 按钮 | 『领取』 | `Claim` |
+| 活动域名 | `openapi.qoder.com.cn` | `openapi.qoder.sh` |
+| 端口 | 9343 | **9344** |
+
+**改动清单**：
+1. `recipes/qoder-intl.yaml`（新）—— 入口两条英文标签、`claim_button: Claim`、
+   `process_match: Qoder.exe`、`data_dir: %APPDATA%\com.qoder.app.stable`、
+   **忙闲判据双语**（只留中文 = 永远判空闲 = 会在用户跑任务时重启）；
+2. `tools/win_shortcut_args.py` —— `--app` 白名单加 `qoder-intl`（不加的话驱动的
+   `repair_launch_entry` 会静默失效）。已实跑写入开始菜单 `Qoder.lnk`：
+   `[] → [--remote-debugging-port=9344]`，备份在 `data/shortcut_backup/Programs__Qoder.lnk`；
+3. `client_claim._kill_by_name` 的 `taskkill` 补 `errors="replace"`：
+   本次重启时冒出 `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb3`
+   （Python 3.13 UTF-8 模式下 text 模式默认 utf-8，而 taskkill 输出是 GBK）。
+   不影响结果但会污染日志、并可能让 stdout 丢空；
+4. 守卫 `test_qoder_intl_recipe_uses_english_ui_labels`（钉住英文标签 + 进程名 +
+   双语忙闲判据）；端口唯一性守卫自动覆盖 9344；**333 全绿**；
+5. 文档：README（6 站、平台表新增一行、`--app` 示例、四次机会）、DESIGN_NOTES
+   （国际版对照表 + 取证）、AGENTS.md 第一句站点数（原写"三个平台"，早已过时）。
+
+**流程踩坑（给后来者）**：
+- **Agent 会话内 spawn 国际版同样秒退**（与国区同因，进程消失、无新会话目录）
+  ⇒ 拉起必须走**临时计划任务（Interactive）**，已验。
+- 本次重启**先杀了用户正在用的实例**（用户已授权，且事先采了 CPU 判空闲：
+  5s 窗口判定 `busy=False`）。重启失败的那 4 分钟里用户的客户端是关着的 —— 已当场恢复。
+- 活动 Surface 的 target 是 `type=iframe`（OOPIF），**不是 page**；关闭一律走主窗口 ESC，
+  绝不 `closeTarget`（国区 10-29 的血案同款）。
+
+**待确认**：`README.md` 的「五个技术硬骨头」小节标题未改成"六"，属叙事性文案，
+不影响执行；下次顺手统一即可。
+
+---
+
 ## [2026-11-02 11:20] WorkBuddy(阿拾) —— doubaowork 710010702 根因（服务端后移每日开放时刻）；计划任务加 15:00 午后补试
 
 **今日状态**：5/5 全部落实。qoder 靠 10-29 新菜单路径**首次全自动成功**；doubaowork 上午两轮
