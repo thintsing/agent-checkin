@@ -7,6 +7,33 @@
 
 ---
 
+## [2026-11-03 13:50] WorkBuddy(阿拾) —— doubaowork 上午被服务端拒（710010702 / system error），下午自行恢复；无代码改动
+
+**今日状态**：6/6 落实，连续天数 doubaowork 15 / dumate 15 / qoder-intl 2 / qoder 40 / trae 23 / workbuddy 41。
+
+**现象**：doubaowork 在 10:52 / 11:01 / 11:30 / 11:34 四个回合全被拒，日志原话
+`code=710010702，server: system error`（**服务端 message 是 11-02 那次加的，今天第一次派上用场**）。
+
+**取证（13:44 当场实测）**：
+- `detail` 接口正常：`code:0`，`task_status:1`（今天确实还没签）⇒ **不是我们判不出来**；
+- `claim` 接口当场成功：`checked_in:true / reward_amount:200 / continuous_days:14 / idempotent:false`，
+  随后 `task_status:3` ⇒ 服务端在上午那段就是不可领，下午自行恢复；
+- 抓了活动页自身的加载请求：只有 `/biz/get_campaign/v3/status/` 与 `/alice/ug/campaign/v3/detail/`，
+  **没有**"先创建/领任务"之类的初始化前置 ⇒ 排除"我们抢跑在页面初始化之前"的解释；
+- 客户端自己的日志（`%LOCALAPPDATA%\DoubaoWork\User Data\sdk_storage\log`）里没有这个接口的痕迹，
+  不构成旁证（它只记自己的请求）。
+
+**处置**：当场补领成功，`StateStore.record('doubaowork','already')` 入账（14→15）。
+**15:00 午后补试触发本来就会兜住**（昨日 11-02 15:00 触发器已实跑验证过：`15:00:01` 启动、幂等跳过），
+今天只是省了 76 分钟。**本轮无代码改动** —— 覆盖机制已经在位，改代码属于多余动作。
+
+**观察（留给后续判断）**：豆包工作的每日开放时刻连续四天往后漂：10-30 `10:28` 可领 →
+11-02 `10:45` 拒 / `10:55` 放 → 11-03 `11:34` 仍拒 / `13:44` 放。若哪天漂过 15:00，
+还有 21:00 收尾兜底；真漂到 21:00 之后才需要重排触发时刻（届时改 `_afternoon_hint` 与
+`_install_script` 并重跑 `--install-task`）。
+
+---
+
 ## [2026-11-02 17:30] WorkBuddy(阿拾) —— 新接入第 6 站：Qoder 国际版（英文 UI，端口 9344）
 
 **今日状态**：6/6 全部落实。国际版今天的 100 Credits **由本次接入实测当场领到**
