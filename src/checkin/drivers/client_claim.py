@@ -921,15 +921,24 @@ class ClientDriver(Driver):
             detail = {"source": "client_bridge", "claim_code": cl.get("code"),
                       "claim_status": cdata.get("status")}
             zh = {Outcome.SUCCESS: "已领取", Outcome.ALREADY: "本窗口已领取"}.get(outcome)
+            claim_code = cl.get("code")
+            # 「时间闸门未开」不是故障：服务端每天在**不固定的时刻**才放开签到，
+            # 配方用 `defer_codes` 声明这个码（豆包工作 710010702，2026-11-05 实测：
+            # 11:36 仍拒、11:50 即放行；跨日跨度 10:20–13:44）。措辞必须与真失败区分，
+            # 否则推送读起来像 bug，用户每天都要来问一次。
+            defer = {str(x).strip() for x in (c.get("defer_codes") or [])}
             if zh:
                 msg = "%s（客户端 bridge）" % zh
+            elif str(claim_code) in defer:
+                detail["deferred"] = True
+                msg = "服务端暂未开放（code=%s），留待后续窗口重试" % claim_code
             else:
                 # 未知业务码必须把**服务端自己的话**带出来 —— 豆包工作 710010702 一案
                 # （2026-10-31 起"每日签到尚未开放"）最初只记 code，语义靠三天日志
                 # 加掐点实测才拼出来；message 一直就在响应里，只是没人带出来。
                 extra = str(cdata.get("message") or "").strip()
                 msg = "客户端 bridge 返回未判定结果（code=%s%s）" % (
-                    cl.get("code"), ("，server: " + extra) if extra else "")
+                    claim_code, ("，server: " + extra) if extra else "")
 
             # 4) 让**界面**也跟上（可选开关 `refresh_ui_after_claim`，默认关）。
             #

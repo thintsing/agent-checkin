@@ -31,6 +31,7 @@ if str(SRC) not in sys.path:
 
 from checkin.__main__ import (                                # noqa: E402
     _afternoon_hint,
+    _midday_hint,
     _fallback_hint,
     _install_script,
     _print_task,
@@ -847,6 +848,28 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(len(ports), len(set(ports)), f"调试端口重复: {ports}")
         for p in ports:
             self.assertTrue(1024 < int(p) < 65536, f"端口号越界: {p}")
+
+    def test_doubaowork_declares_its_defer_code(self):
+        """豆包工作的 710010702 必须登记为 `defer_codes`（= 时间没到，不是故障）。
+
+        证据（2026-11-05 掐点）：同一条 claim 请求 11:36 回 710010702
+        （message 还写着极具误导性的 `system error`）、11:50 就成功（+200，
+        continuous_days 16）；11-03 是 11:34 拒 / 13:44 放。detail 全程正常
+        （task_status=1）⇒ 这是**服务端每日开放时刻不固定**，不是我们请求有问题。
+
+        这条守卫盯两件事：
+        1) 配方声明了这个码 —— 否则驱动只能报"未判定结果（code=…）"，
+           推送读起来像 bug，用户每天都要来问一次；
+        2) 声明的是**字符串**形式 —— 驱动的比对口径是 `str(code)`。
+        """
+        _, recipes = load_config(str(PROJECT_ROOT))
+        r = next(x for x in recipes if x.id == "doubaowork")
+        defer = list(r.client.get("defer_codes") or [])
+        self.assertIn("710010702", [str(x) for x in defer],
+                      "710010702 必须登记进 client.defer_codes")
+        for x in defer:
+            self.assertIsInstance(x, str,
+                                  "defer_codes 用字符串登记：驱动按 str(code) 比对")
 
     def test_qoder_intl_recipe_uses_english_ui_labels(self):
         """国际版 UI 是**英文**（系统 zh-CN 也一样）—— 照抄国区那套中文入口 = 每天静默漏签。
@@ -2809,17 +2832,18 @@ class TestTaskInstall(unittest.TestCase):
                 self.assertIn(f"-At {_psq(_wake_hint(start))}", _install_script(cfg))
                 self.assertNotIn("-RandomDelay", _install_script(cfg))
 
-    def test_has_four_triggers_covering_the_whole_day(self):
-        """必须有四个触发器：主触发 + 兜底 + 午后补试 + 当夜收尾。
+    def test_has_five_triggers_covering_the_whole_day(self):
+        """必须有五个触发器：主触发 + 兜底 + 午间补试 + 午后补试 + 当夜收尾。
 
         **个个都有血案在身：**
         · 兜底（t2）—— 2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默
           判 missed，程序**根本没启动**（当天连日志文件都没有，`NumberOfMissedRuns=1`）。
           只靠 `-StartWhenAvailable` 救不了未登录场景 ⇒ 必须有第二次机会。
-        · 午后补试（t3）—— 2026-10-31 起：豆包工作每日签到开放时刻被服务端后移，
-          上午与兜底回合全被业务码 710010702 拒领（11-02 掐点实测 10:45 拒、
-          10:55 放行），当天全靠用户手动领 ⇒ 15:00 补一次程序自己的机会。
-        · 收尾（t4）—— 2026-10-17：前几次都可能撞上"客户端还在无端口形态"
+        · 午间补试（t3，2026-11-05 新增）—— 豆包工作的签到闸门每天在**不固定时刻**
+          开放（实测跨度 10:20–13:44，业务码 710010702）。没有它时，闸门若在 11:30
+          之后开就要白等到 15:00（11-05 实测：11:36 仍拒、11:50 放行）。
+        · 午后补试（t4）—— 吃掉"午后才开"的日子（11-03：11:34 拒、13:44 放行）。
+        · 收尾（t5）—— 2026-10-17：前几次都可能撞上"客户端还在无端口形态"
           （自升级后自重启留下来的），那是**当天不会自愈**的状态；夜里再试才可能了结。
         已成功的站点由程序自身幂等拦下，不会重复签到。
         """
@@ -2828,10 +2852,11 @@ class TestTaskInstall(unittest.TestCase):
                 s = _install_script(_cfg(start, end))
                 self.assertIn(f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(_wake_hint(start))}", s)
                 self.assertIn(f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(_fallback_hint(end))}", s)
-                self.assertIn("$t3=New-ScheduledTaskTrigger -Daily -At '15:00'", s)
-                self.assertIn(f"$t4=New-ScheduledTaskTrigger -Daily -At {_psq(_closing_hint(end))}", s)
-                self.assertIn("$t=@($t1,$t2,$t3,$t4)", s,
-                              "四个触发器必须都注册，漏注册就不会真的生效")
+                self.assertIn("$t3=New-ScheduledTaskTrigger -Daily -At '12:30'", s)
+                self.assertIn("$t4=New-ScheduledTaskTrigger -Daily -At '15:00'", s)
+                self.assertIn(f"$t5=New-ScheduledTaskTrigger -Daily -At {_psq(_closing_hint(end))}", s)
+                self.assertIn("$t=@($t1,$t2,$t3,$t4,$t5)", s,
+                              "五个触发器必须都注册，漏注册就不会真的生效")
 
     def test_closing_trigger_lands_in_the_evening(self):
         """收尾触发必须落在傍晚之后 —— 它要的是"距离最后一次失败已经过去很久"。
@@ -2841,12 +2866,23 @@ class TestTaskInstall(unittest.TestCase):
         self.assertEqual(_closing_hint("12:30"), "21:00")
         self.assertEqual(_closing_hint("19:00"), "21:00")
 
+    def test_midday_retry_is_fixed_at_1230(self):
+        """午间补试**刻意固定** 12:30：切开 11:30～15:00 那 3.5 小时空档。
+
+        豆包工作的签到闸门每天开放时刻不固定（实测 10:20–13:44）。两个补试窗口的分工：
+        12:30 吃"上午晚开"，15:00 吃"午后才开"，21:00 收尾。
+        改这个值之前先重看 2026-11-05 的掐点记录（11:36 拒 / 11:50 放行）。
+        """
+        self.assertEqual(_midday_hint(), "12:30")
+        # 顺序必须成立：兜底(11:30) < 午间(12:30) < 午后(15:00) < 收尾(21:00)
+        self.assertLess(_midday_hint(), _afternoon_hint())
+
     def test_afternoon_retry_is_fixed_at_15(self):
         """午后补试**刻意固定** 15:00（与窗口解耦，同收尾触发一个道理）。
 
-        它要吃下的是"豆包工作每日签到开放时刻后移"（2026-10-31 起，
+        它要吃下的是"豆包工作签到闸门午后开放"（2026-10-31 起，
         业务码 710010702）——开放时刻逐日漂移且接口不可预报，只能定时重试。
-        改这个值之前先重看 2026-11-02 的日志与 DESIGN_NOTES 取证。
+        改这个值之前先重看 2026-11-02 / 11-03 的日志与 DESIGN_NOTES 取证。
         """
         self.assertEqual(_afternoon_hint(), "15:00")
         self.assertEqual(_closing_hint("21:30"), "22:30")

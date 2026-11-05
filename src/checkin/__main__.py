@@ -159,6 +159,21 @@ def _afternoon_hint() -> str:
     return "15:00"
 
 
+def _midday_hint() -> str:
+    """午间补试触发时刻：**固定 12:30**，与窗口无关。
+
+    为什么要第五次（2026-11-05 定型）：豆包工作的"签到闸门"每天在**不固定的时刻**
+    开放，实测跨度 **10:20–13:44**（见 recipes/doubaowork.yaml 的 defer_codes 注释）。
+    原有窗口只在 10:05–11:00（随机）、11:30、15:00 各有一次机会 ⇒ 闸门若在
+    11:30 之后打开，就要一直空等到 15:00（今天实测：11:36 仍拒、11:50 放行，
+    等于白等 3 小时）。12:30 这一次把"11:30～15:00"之间 3.5 小时的空档切开。
+
+    它与 15:00 的分工：12:30 吃掉"上午晚开"，15:00 吃掉"午后开"。更晚的还有
+    21:00 收尾。已完成的站点被程序自身幂等拦下，不会重复签到。
+    """
+    return "12:30"
+
+
 def _plan(cfg) -> int:
     reason = scheduler.should_skip_today(cfg)
     if reason:
@@ -260,6 +275,7 @@ def _print_task(cfg) -> int:
     fallback = _fallback_hint(cfg.schedule.window_end)
     closing = _closing_hint(cfg.schedule.window_end)
     afternoon = _afternoon_hint()
+    midday = _midday_hint()
 
     print("")
     print("  推荐：直接装（自动处理路径与编码）\n")
@@ -270,9 +286,10 @@ def _print_task(cfg) -> int:
     print(f"         -Argument '\"{entry}\"' -WorkingDirectory \"{_ROOT}\"")
     print(f"    $t1 = New-ScheduledTaskTrigger -Daily -At {hint}")
     print(f"    $t2 = New-ScheduledTaskTrigger -Daily -At {fallback}   # 兜底：窗口结束后 30min")
-    print(f"    $t3 = New-ScheduledTaskTrigger -Daily -At {afternoon}  # 午后补试：吃下\"每日开放时刻后移\"")
-    print(f"    $t4 = New-ScheduledTaskTrigger -Daily -At {closing}   # 收尾：当夜最后一次机会")
-    print("    $t = @($t1, $t2, $t3, $t4)")
+    print(f"    $t3 = New-ScheduledTaskTrigger -Daily -At {midday}   # 午间补试：吃掉\"上午晚开\"")
+    print(f"    $t4 = New-ScheduledTaskTrigger -Daily -At {afternoon}  # 午后补试：吃掉\"午后开\"")
+    print(f"    $t5 = New-ScheduledTaskTrigger -Daily -At {closing}   # 收尾：当夜最后一次机会")
+    print("    $t = @($t1, $t2, $t3, $t4, $t5)")
     print("    $s = New-ScheduledTaskSettingsSet -StartWhenAvailable `")
     print("         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd")
     print("    $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME `")
@@ -287,9 +304,10 @@ def _print_task(cfg) -> int:
     print(f"  另有一个 {fallback} 的**兜底触发**：主触发 missed 时（如开机未登录会话，")
     print("  2026-10-15 就这么漏了一整天）再给一次机会；当天已成功的站点会被")
     print("  程序自身幂等拦下，不会重复签到。")
-    print(f"  {afternoon} 有一次**午后补试**：豆包工作的每日签到开放时刻被服务端后移后")
-    print("  （2026-10-31 起，业务码 710010702），上午与兜底回合都可能被拒领 ——")
-    print("  这次让程序自己在午后吃下\"开放时刻漂移\"，不必等用户动手。")
+    print(f"  {midday} 有一次**午间补试**、{afternoon} 有一次**午后补试**：豆包工作的")
+    print("  签到闸门每天在**不固定的时刻**开放（实测跨度 10:20–13:44，业务码 710010702），")
+    print("  只有上午那几次机会时，闸门若在 11:30 之后开就要白等到 15:00。")
+    print("  这两次把 11:30～15:00 的空档切开，程序自己吃下\"开放时刻不固定\"。")
     print(f"  {closing} 还有一次**收尾触发**：前面几次都可能撞上\"客户端还在无端口形态\"")
     print("  这种当天不会自愈的状态；夜里再试一次，就够了结绝大多数当天缺口。")
     print("  各次机会都说\"今日已完成\"时**不会重复弹通知**（否则一天几响，人也麻了）。")
@@ -327,6 +345,7 @@ def _install_script(cfg) -> str:
     fallback = _fallback_hint(cfg.schedule.window_end)
     closing = _closing_hint(cfg.schedule.window_end)
     afternoon = _afternoon_hint()
+    midday = _midday_hint()
     return (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute {_psq(_task_python())} "
@@ -335,21 +354,23 @@ def _install_script(cfg) -> str:
         # -At <固定时刻>，**刻意不带 -RandomDelay**：
         #   随机时刻由程序自己在窗口内采样（RandomDelay 会让当日 occurrence
         #   被静默跳过，见本函数 docstring 与 _wake_hint）
-        # **四个触发器**（2026-11-02 定型）：
+        # **五个触发器**（2026-11-05 定型）：
         #   t1 主触发 09:55  窗口开始前 10 分钟唤醒，由程序在窗口内随机采样后执行
         #   t2 兜底          主触发 missed 时（如开机未登录会话，2026-10-15 就这么漏了
         #                    一整天，当天连日志文件都没有）再给一次机会
-        #   t3 午后补试 15:00 豆包工作每日签到开放时刻被服务端后移（2026-10-31 起，
-        #                    业务码 710010702），上午与兜底回合都可能被拒领；
-        #                    午后补一次，程序自己吃下"开放时刻漂移"
-        #   t4 收尾 21:00    前几次都可能撞上"客户端还在无端口形态"这种当天不会自愈的
+        #   t3 午间补试 12:30 豆包工作的签到闸门每天在**不固定时刻**开放（实测跨度
+        #                    10:20–13:44，业务码 710010702）；闸门若在 11:30 之后开，
+        #                    只有 15:00 的话要白等 3.5 小时。12:30 把空档切开。
+        #   t4 午后补试 15:00 吃掉"午后才开"的日子
+        #   t5 收尾 21:00    前几次都可能撞上"客户端还在无端口形态"这种当天不会自愈的
         #                    状态；到夜里再试一次，覆盖用户白天手动重启过客户端的情形
         # 已成功的站点会被程序自身幂等拦下（skip_when_done_today），不会有重复签到。
         f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(hint)};"
         f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(fallback)};"
-        f"$t3=New-ScheduledTaskTrigger -Daily -At {_psq(afternoon)};"
-        f"$t4=New-ScheduledTaskTrigger -Daily -At {_psq(closing)};"
-        "$t=@($t1,$t2,$t3,$t4);"
+        f"$t3=New-ScheduledTaskTrigger -Daily -At {_psq(midday)};"
+        f"$t4=New-ScheduledTaskTrigger -Daily -At {_psq(afternoon)};"
+        f"$t5=New-ScheduledTaskTrigger -Daily -At {_psq(closing)};"
+        "$t=@($t1,$t2,$t3,$t4,$t5);"
         # -StartWhenAvailable       错过唤醒时刻（休眠/关机）后，开机自动补跑一次
         # -AllowStartIfOnBatteries  笔记本不在电源上也要跑（签到本身极轻）
         # -DontStopIfGoingOnBatteries / -DontStopOnIdleEnd
