@@ -30,8 +30,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from checkin.__main__ import (                                # noqa: E402
-    _afternoon_hint,
-    _midday_hint,
+    _retry_grid,
     _fallback_hint,
     _install_script,
     _print_task,
@@ -2310,6 +2309,35 @@ class TestNotify(unittest.TestCase):
         self.assertTrue(self.toast.called, "应当发出一条通知")
         return self.toast.call_args[0][:2]          # (title, body)
 
+    def test_same_conclusion_is_not_notified_twice_a_day(self):
+        """同日同内容只发一次（2026-11-08：重试网格让一天跑十几次）。
+
+        不去重的话，一天十几条 QQ 全说同一句话 —— 比不推还糟。原则同全局：
+        **通知要么有信息量，要么别发**。内容真变了（比如 doubaowork 终于领到）
+        必须照常推，否则"终于成功"这件事就被静默吞掉了。
+        """
+        root = tempfile.mkdtemp(prefix="ck-notify-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        before = [self._r("doubaowork", Outcome.NO_ACTION, "服务端暂未开放"),
+                  self._r("workbuddy", Outcome.SUCCESS, "已领取")]
+        after = [self._r("doubaowork", Outcome.SUCCESS, "已领取"),
+                 self._r("workbuddy", Outcome.SUCCESS, "已领取")]
+        with mock.patch.object(notify, "_push_qq") as push:
+            notify.notify_results(before, root=root)
+            notify.notify_results(before, root=root)      # 一字不差 → 静默
+            self.assertEqual(self.toast.call_count, 1)
+            self.assertEqual(push.call_count, 1)
+            notify.notify_results(after, root=root)       # 结论变了 → 照推
+            self.assertEqual(self.toast.call_count, 2)
+            self.assertEqual(push.call_count, 2)
+
+    def test_dedupe_is_off_when_root_is_none(self):
+        """`root=None`（老调用方 / 桌面提醒路径）不得因为去重而改变行为。"""
+        r = [self._r("workbuddy", Outcome.SUCCESS, "已领取")]
+        notify.notify_results(r)
+        notify.notify_results(r)
+        self.assertEqual(self.toast.call_count, 2)
+
     # --- 分类的完整性 -------------------------------------------------
 
     def test_every_outcome_is_classified(self):
@@ -2832,31 +2860,48 @@ class TestTaskInstall(unittest.TestCase):
                 self.assertIn(f"-At {_psq(_wake_hint(start))}", _install_script(cfg))
                 self.assertNotIn("-RandomDelay", _install_script(cfg))
 
-    def test_has_five_triggers_covering_the_whole_day(self):
-        """必须有五个触发器：主触发 + 兜底 + 午间补试 + 午后补试 + 当夜收尾。
+    def test_triggers_cover_the_day_with_a_retry_grid(self):
+        """必须有「主触发 + 11:00–15:00 每 30 分钟的重试网格 + 当夜收尾」。
 
-        **个个都有血案在身：**
-        · 兜底（t2）—— 2026-10-15 真漏签一天：主触发 09:55 因"开机未登录会话"被静默
-          判 missed，程序**根本没启动**（当天连日志文件都没有，`NumberOfMissedRuns=1`）。
-          只靠 `-StartWhenAvailable` 救不了未登录场景 ⇒ 必须有第二次机会。
-        · 午间补试（t3，2026-11-05 新增）—— 豆包工作的签到闸门每天在**不固定时刻**
-          开放（实测跨度 10:20–13:44，业务码 710010702）。没有它时，闸门若在 11:30
-          之后开就要白等到 15:00（11-05 实测：11:36 仍拒、11:50 放行）。
-        · 午后补试（t4）—— 吃掉"午后才开"的日子（11-03：11:34 拒、13:44 放行）。
-        · 收尾（t5）—— 2026-10-17：前几次都可能撞上"客户端还在无端口形态"
-          （自升级后自重启留下来的），那是**当天不会自愈**的状态；夜里再试才可能了结。
-        已成功的站点由程序自身幂等拦下，不会重复签到。
+        **为什么从 5 个固定窗口改成网格（2026-11-08）：**
+        豆包工作的签到闸门每天在**随机时刻**开放，取客户端自己的
+        `checkin_bubble_show` 时间戳作证：11-06 `11:01` / 11-08 `13:28` / 11-07 `14:32`。
+        旧窗口（09:55 / 11:30 / 12:30 / 15:00 / 21:00）粒度太粗，闸门一开就要等
+        1.5～3 小时 —— 而用户看到客户端气泡顺手就点了，**11-06～11-08 连续三天
+        都是用户手动领的**，程序一次没抢到。30 分钟一格把最坏滞后压到半小时。
+
+        同时保留两条老教训：
+        · 主触发 09:55 —— 2026-10-15 主触发被判 missed 漏签一整天 ⇒ 必须有后续机会；
+        · 收尾 21:00 —— 2026-10-17 前几次撞上"客户端无端口形态"这种当天不会自愈的状态。
         """
         for start, end in (("10:05", "12:30"), ("07:40", "11:20"), ("09:00", "09:30")):
             with self.subTest(window=f"{start}-{end}"):
                 s = _install_script(_cfg(start, end))
-                self.assertIn(f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(_wake_hint(start))}", s)
-                self.assertIn(f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(_fallback_hint(end))}", s)
-                self.assertIn("$t3=New-ScheduledTaskTrigger -Daily -At '12:30'", s)
-                self.assertIn("$t4=New-ScheduledTaskTrigger -Daily -At '15:00'", s)
-                self.assertIn(f"$t5=New-ScheduledTaskTrigger -Daily -At {_psq(_closing_hint(end))}", s)
-                self.assertIn("$t=@($t1,$t2,$t3,$t4,$t5)", s,
-                              "五个触发器必须都注册，漏注册就不会真的生效")
+                hints = ([_wake_hint(start)] + _retry_grid()
+                         + [_closing_hint(end)])
+                for i, h in enumerate(hints, 1):
+                    self.assertIn(f"$t{i}=New-ScheduledTaskTrigger -Daily -At {_psq(h)}", s)
+                self.assertIn("$t=@(" + ",".join(
+                    f"$t{i}" for i in range(1, len(hints) + 1)) + ")", s,
+                    "触发器必须全部注册，漏注册就不会真的生效")
+
+    def test_retry_grid_is_thirty_minutes_from_11_to_15(self):
+        """网格的口径：11:00 起、30 分钟一格、到 15:00 止（含端点）。
+
+        这三个值是拿真实开窗时刻校准的：11:01 / 13:28 / 14:32 都能被 ≤30 分钟覆盖。
+        改动前先重看 HANDOFF 2026-11-08 的取证表。
+        """
+        grid = _retry_grid()
+        self.assertEqual(grid[0], "11:00")
+        self.assertEqual(grid[-1], "15:00")
+        self.assertIn("13:30", grid)
+        self.assertIn("14:30", grid)
+        self.assertEqual(len(grid), 9, "11:00–15:00 每 30 分钟 = 9 格")
+        self.assertEqual(grid, sorted(grid))
+        for a, b in zip(grid, grid[1:]):
+            ha, ma = (int(x) for x in a.split(":"))
+            hb, mb = (int(x) for x in b.split(":"))
+            self.assertEqual((hb * 60 + mb) - (ha * 60 + ma), 30)
 
     def test_closing_trigger_lands_in_the_evening(self):
         """收尾触发必须落在傍晚之后 —— 它要的是"距离最后一次失败已经过去很久"。
@@ -2865,26 +2910,6 @@ class TestTaskInstall(unittest.TestCase):
         """
         self.assertEqual(_closing_hint("12:30"), "21:00")
         self.assertEqual(_closing_hint("19:00"), "21:00")
-
-    def test_midday_retry_is_fixed_at_1230(self):
-        """午间补试**刻意固定** 12:30：切开 11:30～15:00 那 3.5 小时空档。
-
-        豆包工作的签到闸门每天开放时刻不固定（实测 10:20–13:44）。两个补试窗口的分工：
-        12:30 吃"上午晚开"，15:00 吃"午后才开"，21:00 收尾。
-        改这个值之前先重看 2026-11-05 的掐点记录（11:36 拒 / 11:50 放行）。
-        """
-        self.assertEqual(_midday_hint(), "12:30")
-        # 顺序必须成立：兜底(11:30) < 午间(12:30) < 午后(15:00) < 收尾(21:00)
-        self.assertLess(_midday_hint(), _afternoon_hint())
-
-    def test_afternoon_retry_is_fixed_at_15(self):
-        """午后补试**刻意固定** 15:00（与窗口解耦，同收尾触发一个道理）。
-
-        它要吃下的是"豆包工作签到闸门午后开放"（2026-10-31 起，
-        业务码 710010702）——开放时刻逐日漂移且接口不可预报，只能定时重试。
-        改这个值之前先重看 2026-11-02 / 11-03 的日志与 DESIGN_NOTES 取证。
-        """
-        self.assertEqual(_afternoon_hint(), "15:00")
         self.assertEqual(_closing_hint("21:30"), "22:30")
         self.assertEqual(_closing_hint("坏值"), "21:00")
 

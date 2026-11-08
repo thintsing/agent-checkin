@@ -10,12 +10,14 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import subprocess
 import urllib.error
 import urllib.request
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from . import procenv
@@ -133,6 +135,64 @@ def _done_line(results: List[CheckinResult]) -> str:
     return " · ".join(parts)
 
 
+_PUSH_STATE_REL = os.path.join("data", "notify_state.json")
+
+
+def _digest(text: str) -> str:
+    """同日去重用的短指纹（只存哈希，不把站点文案原文写进状态文件）。"""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _emitted_today(root: Optional[str], key: str) -> bool:
+    """今天是否已经发过**一模一样**的通知。
+
+    为什么需要（2026-11-08）：豆包工作的重试改成 30 分钟网格后一天要跑十几次，
+    而每次的结论往往一字不差（"已签到 5 个 · 待你手动 doubaowork"）。
+    不去重就是一天十几条 QQ —— 比不推还糟。原则同全局：**通知要么有信息量，
+    要么别发**。`root` 为空（老调用方/单测）时不去重，行为一字不变。
+    """
+    if not root:
+        return False
+    try:
+        with open(os.path.join(root, _PUSH_STATE_REL), encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if str(state.get("date") or "") != _today():
+        return False
+    return key in (state.get("keys") or [])
+
+
+def _remember_emitted(root: Optional[str], key: str) -> None:
+    if not root:
+        return
+    path = os.path.join(root, _PUSH_STATE_REL)
+    state: Dict[str, Any] = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh) or {}
+    except (OSError, ValueError):
+        state = {}
+    if str(state.get("date") or "") != _today():
+        state = {"date": _today(), "keys": []}
+    keys = list(state.get("keys") or [])
+    if key not in keys:
+        keys.append(key)
+    state["keys"] = keys
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.debug("写通知去重状态失败（忽略）：%s", e)
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def notify_results(results: List[CheckinResult],
                    root: Optional[str] = None,
                    gaps: Optional[Dict[str, List[str]]] = None) -> None:
@@ -143,6 +203,11 @@ def notify_results(results: List[CheckinResult],
 
     `gaps` = {站点: [漏签日期…]}，由 `StateStore.missed_days` 回溯得到。
     缺省 None ⇒ 不做缺口播报（老调用方行为不变）。
+
+    **同日同内容只发一次**（2026-11-08 新增）：豆包工作的重试改成 30 分钟网格后
+    一天要跑十几次，而结论往往一字不差（"已签到 5 个 · 待你手动 doubaowork"）。
+    不去重就是一天十几条 QQ —— 比不推还糟。`root` 为空时不去重（
+    老调用方/单测的行为一字不变）。
     """
     print(summary(results))
     gap = gap_line(gaps)
@@ -150,6 +215,15 @@ def notify_results(results: List[CheckinResult],
         print("  [缺口] " + gap)
     if not results:
         return
+
+    def _emit(title: str, body: str) -> None:
+        key = _digest(title + "\x00" + body + "\x00" + text)
+        if _emitted_today(root, key):
+            log.debug("同日同内容已通知过，跳过：%s", title)
+            return
+        _toast(title, body)
+        _push_qq(root, text)
+        _remember_emitted(root, key)
 
     problems = [r for r in results if r.outcome in _PROBLEM]
     text = _qq_message(results, problems, gaps)
@@ -167,9 +241,8 @@ def notify_results(results: List[CheckinResult],
             parts.append("出错 " + "、".join(r.site_id for r in broken))
         hint = ("跑 run_checkin.bat --login 处理登录"
                 if need_login else "详情见 logs/ 里今天的日志")
-        _toast("签到我处理不了",
-               " · ".join(parts) + (f"；{gap}" if gap else "") + f"（{hint}）")
-        _push_qq(root, text)
+        _emit("签到我处理不了",
+              " · ".join(parts) + (f"；{gap}" if gap else "") + f"（{hint}）")
         return
 
     # 今天没事、但昨天有洞：也要换标题。"每日签到完成"会让用户以为一切正常，
@@ -178,12 +251,10 @@ def notify_results(results: List[CheckinResult],
     # 拦成 skipped 时走到，那时"补上了"是假的。今天到底怎么样，交给 `_done_line`
     # 原样说，别替它下结论。
     if gap:
-        _toast(_gap_title(gaps), _done_line(results) + " · " + gap)
-        _push_qq(root, text)
+        _emit(_gap_title(gaps), _done_line(results) + " · " + gap)
         return
 
-    _toast("每日签到完成", _done_line(results))
-    _push_qq(root, text)
+    _emit("每日签到完成", _done_line(results))
 
 
 # ── QQ 机器人推送（2026-10-14 新增）────────────────────────────────

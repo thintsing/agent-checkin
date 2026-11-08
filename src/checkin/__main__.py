@@ -140,38 +140,36 @@ def _closing_hint(window_end: str) -> str:
     return "21:00" if hour < 20 else f"{(hour + 1) % 24:02d}:{mm or '00'}"
 
 
-def _afternoon_hint() -> str:
-    """午后补试触发时刻：**固定 15:00**，与窗口无关。
+def _retry_grid(start: str = "11:00", end: str = "15:00",
+                step_min: int = 30) -> List[str]:
+    """午间重试网格：11:00–15:00 每 30 分钟一次（含两端点）。
 
-    为什么要第四次（2026-11-02 定型）：豆包工作的每日签到开放时刻被**服务端后移** ——
+    **为什么改成网格（2026-11-08 定案，直接原因是"连续三天都被用户手动领掉"）：**
 
-    · 10-22～10-30：上午窗口内（10:13～10:50）全部成功；
-    · 10-31 起：上午与兜底回合（10:39/10:45/11:30/11:34）一律被业务码
-      **710010702** 拒领（status 预检正常、claim 被拒 ⇒ "每日签到尚未开放"）；
-    · 11-02 实测掐点：10:45 仍拒、**10:55 即放行** —— 开放时刻漂在上午末端之后，
-      且逐日不定（10-31 到 11:34 仍未开放）。detail 接口里只有活动整体起止
-      （2025-07 → 2030），**没有**每日开放时刻字段，无法预报，只能靠重试覆盖。
+    豆包工作的签到闸门每天在**随机时刻**开放。三次实证（取客户端自己的
+    `checkin_bubble_show` 时间戳，那就是闸门开的瞬间）：
 
-    当时全靠用户看到 QQ 推送后手动领取。在兜底（11:30）与收尾（21:00）之间
-    补一次午后机会，程序自己吃下"开放时刻后移"，不必等用户动手。
-    已完成的站点被程序自身幂等拦下，无重复签到。
+    | 日期 | 气泡（=闸门开） | 当时的窗口 | 结果 |
+    |---|---|---|---|
+    | 11-06 | 11:01 | 11:30 | 用户先领，程序 11:30 只判到 already |
+    | 11-08 | 13:28 | 12:30 / 15:00 | 同上，15:00 才判到 already |
+    | 11-07 | 14:32 | 12:30 / 15:00 | 同上，15:00 才判到 already |
+
+    ⇒ 旧的 5 个固定窗口（09:55 / 11:30 / 12:30 / 15:00 / 21:00）粒度太粗：
+    闸门一开就要等 1.5～3 小时，而用户看到客户端气泡提示顺手就点了。
+    30 分钟一格 ⇒ 最坏滞后 30 分钟，上面三个已知开放时刻全覆盖。
+
+    代价：一天多跑 9 次（每次只处理还没完成的站点，其余被幂等拦下），
+    推送则由 `notify` 的**同日同内容去重**保证不会变成 9 条噪音。
     """
-    return "15:00"
-
-
-def _midday_hint() -> str:
-    """午间补试触发时刻：**固定 12:30**，与窗口无关。
-
-    为什么要第五次（2026-11-05 定型）：豆包工作的"签到闸门"每天在**不固定的时刻**
-    开放，实测跨度 **10:20–13:44**（见 recipes/doubaowork.yaml 的 defer_codes 注释）。
-    原有窗口只在 10:05–11:00（随机）、11:30、15:00 各有一次机会 ⇒ 闸门若在
-    11:30 之后打开，就要一直空等到 15:00（今天实测：11:36 仍拒、11:50 放行，
-    等于白等 3 小时）。12:30 这一次把"11:30～15:00"之间 3.5 小时的空档切开。
-
-    它与 15:00 的分工：12:30 吃掉"上午晚开"，15:00 吃掉"午后开"。更晚的还有
-    21:00 收尾。已完成的站点被程序自身幂等拦下，不会重复签到。
-    """
-    return "12:30"
+    sh, sm = (int(x) for x in str(start).split(":"))
+    eh, em = (int(x) for x in str(end).split(":"))
+    out: List[str] = []
+    cur = sh * 60 + sm
+    while cur <= eh * 60 + em:
+        out.append("%02d:%02d" % (cur // 60, cur % 60))
+        cur += int(step_min)
+    return out
 
 
 def _plan(cfg) -> int:
@@ -272,10 +270,9 @@ def _print_task(cfg) -> int:
     py = _task_python()
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
     hint = _wake_hint(cfg.schedule.window_start)
-    fallback = _fallback_hint(cfg.schedule.window_end)
     closing = _closing_hint(cfg.schedule.window_end)
-    afternoon = _afternoon_hint()
-    midday = _midday_hint()
+    grid = _retry_grid()
+    hints = [hint] + grid + [closing]
 
     print("")
     print("  推荐：直接装（自动处理路径与编码）\n")
@@ -284,12 +281,9 @@ def _print_task(cfg) -> int:
     print("  等价的手写 PowerShell（可整段粘贴）：\n")
     print(f'    $a = New-ScheduledTaskAction -Execute "{py}" `')
     print(f"         -Argument '\"{entry}\"' -WorkingDirectory \"{_ROOT}\"")
-    print(f"    $t1 = New-ScheduledTaskTrigger -Daily -At {hint}")
-    print(f"    $t2 = New-ScheduledTaskTrigger -Daily -At {fallback}   # 兜底：窗口结束后 30min")
-    print(f"    $t3 = New-ScheduledTaskTrigger -Daily -At {midday}   # 午间补试：吃掉\"上午晚开\"")
-    print(f"    $t4 = New-ScheduledTaskTrigger -Daily -At {afternoon}  # 午后补试：吃掉\"午后开\"")
-    print(f"    $t5 = New-ScheduledTaskTrigger -Daily -At {closing}   # 收尾：当夜最后一次机会")
-    print("    $t = @($t1, $t2, $t3, $t4, $t5)")
+    for i, h in enumerate(hints, 1):
+        print(f"    $t{i} = New-ScheduledTaskTrigger -Daily -At {h}")
+    print("    $t = @(" + ", ".join(f"$t{i}" for i in range(1, len(hints) + 1)) + ")")
     print("    $s = New-ScheduledTaskSettingsSet -StartWhenAvailable `")
     print("         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd")
     print("    $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME `")
@@ -301,16 +295,13 @@ def _print_task(cfg) -> int:
     print(f"  {cfg.schedule.window_start}–{cfg.schedule.window_end} 之间的某时刻执行，")
     print("  所以「每天几点签到」在系统层面看不出来。")
     print("")
-    print(f"  另有一个 {fallback} 的**兜底触发**：主触发 missed 时（如开机未登录会话，")
-    print("  2026-10-15 就这么漏了一整天）再给一次机会；当天已成功的站点会被")
-    print("  程序自身幂等拦下，不会重复签到。")
-    print(f"  {midday} 有一次**午间补试**、{afternoon} 有一次**午后补试**：豆包工作的")
-    print("  签到闸门每天在**不固定的时刻**开放（实测跨度 10:20–13:44，业务码 710010702），")
-    print("  只有上午那几次机会时，闸门若在 11:30 之后开就要白等到 15:00。")
-    print("  这两次把 11:30～15:00 的空档切开，程序自己吃下\"开放时刻不固定\"。")
+    print(f"  之后是 {grid[0]}–{grid[-1]} 每 30 分钟一次的**重试网格**（{len(grid)} 次）：")
+    print("  豆包工作的签到闸门每天在**随机时刻**开放（客户端气泡实证：11:01 / 13:28 /")
+    print("  14:32），窗口太稀就必然慢一步 —— 11-06～11-08 连续三天都是用户看到气泡")
+    print("  自己点的。30 分钟一格把最坏滞后压到半小时。")
     print(f"  {closing} 还有一次**收尾触发**：前面几次都可能撞上\"客户端还在无端口形态\"")
     print("  这种当天不会自愈的状态；夜里再试一次，就够了结绝大多数当天缺口。")
-    print("  各次机会都说\"今日已完成\"时**不会重复弹通知**（否则一天几响，人也麻了）。")
+    print("  同一天内容相同的结论**只推一次**（notify 里有同日去重），所以多跑几次不吵。")
     print("  · 唤醒时刻没开机 → -StartWhenAvailable 会在开机后补跑一次")
     print("  · 只在有登录会话时运行（锁屏算、未登录不算）—— 开浏览器需要桌面会话")
     print("  · 本机 schtasks.exe 被程序黑名单封了，所以走 PowerShell cmdlet")
@@ -342,10 +333,12 @@ def _install_script(cfg) -> str:
     """
     entry = os.path.join(_ROOT, "src", "checkin", "__main__.py")
     hint = _wake_hint(cfg.schedule.window_start)
-    fallback = _fallback_hint(cfg.schedule.window_end)
     closing = _closing_hint(cfg.schedule.window_end)
-    afternoon = _afternoon_hint()
-    midday = _midday_hint()
+    grid = _retry_grid()
+    hints = [hint] + grid + [closing]
+    trig = "".join(f"$t{i}=New-ScheduledTaskTrigger -Daily -At {_psq(h)};"
+                   for i, h in enumerate(hints, 1))
+    arr = "$t=@(" + ",".join(f"$t{i}" for i in range(1, len(hints) + 1)) + ");"
     return (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute {_psq(_task_python())} "
@@ -354,23 +347,18 @@ def _install_script(cfg) -> str:
         # -At <固定时刻>，**刻意不带 -RandomDelay**：
         #   随机时刻由程序自己在窗口内采样（RandomDelay 会让当日 occurrence
         #   被静默跳过，见本函数 docstring 与 _wake_hint）
-        # **五个触发器**（2026-11-05 定型）：
-        #   t1 主触发 09:55  窗口开始前 10 分钟唤醒，由程序在窗口内随机采样后执行
-        #   t2 兜底          主触发 missed 时（如开机未登录会话，2026-10-15 就这么漏了
-        #                    一整天，当天连日志文件都没有）再给一次机会
-        #   t3 午间补试 12:30 豆包工作的签到闸门每天在**不固定时刻**开放（实测跨度
-        #                    10:20–13:44，业务码 710010702）；闸门若在 11:30 之后开，
-        #                    只有 15:00 的话要白等 3.5 小时。12:30 把空档切开。
-        #   t4 午后补试 15:00 吃掉"午后才开"的日子
-        #   t5 收尾 21:00    前几次都可能撞上"客户端还在无端口形态"这种当天不会自愈的
-        #                    状态；到夜里再试一次，覆盖用户白天手动重启过客户端的情形
-        # 已成功的站点会被程序自身幂等拦下（skip_when_done_today），不会有重复签到。
-        f"$t1=New-ScheduledTaskTrigger -Daily -At {_psq(hint)};"
-        f"$t2=New-ScheduledTaskTrigger -Daily -At {_psq(fallback)};"
-        f"$t3=New-ScheduledTaskTrigger -Daily -At {_psq(midday)};"
-        f"$t4=New-ScheduledTaskTrigger -Daily -At {_psq(afternoon)};"
-        f"$t5=New-ScheduledTaskTrigger -Daily -At {_psq(closing)};"
-        "$t=@($t1,$t2,$t3,$t4,$t5);"
+        # **主触发 + 重试网格 + 收尾**（2026-11-08 定型，网格见 _retry_grid）：
+        #   t1        09:55  窗口开始前 10 分钟唤醒，由程序在窗口内随机采样后执行
+        #   t2..tN    11:00–15:00 每 30 分钟一次：豆包工作的签到闸门每天随机开放
+        #             （客户端气泡实证 11:01 / 13:28 / 14:32），窗口太稀就必然
+        #             慢一步 —— 11-06～11-08 连续三天都是用户看到气泡自己点的。
+        #             一次触发同时兼任"主触发 missed 时的兜底"（2026-10-15 教训）。
+        #   tN+1      21:00 收尾：前几次都可能撞上"客户端还在无端口形态"这种
+        #             当天不会自愈的状态；夜里再试一次。
+        # 已成功的站点会被程序自身幂等拦下（skip_when_done_today），不会有重复签到；
+        # 推送由 notify 做**同日同内容去重**，多跑几次不会变成一串噪音。
+        + trig
+        + arr
         # -StartWhenAvailable       错过唤醒时刻（休眠/关机）后，开机自动补跑一次
         # -AllowStartIfOnBatteries  笔记本不在电源上也要跑（签到本身极轻）
         # -DontStopIfGoingOnBatteries / -DontStopOnIdleEnd
@@ -378,7 +366,7 @@ def _install_script(cfg) -> str:
         #                           不能因拔电源或"空闲结束"被杀
         # -ExecutionTimeLimit 6h    够容纳"等到窗口末端"，又不至于挂死一整天
         # -MultipleInstances IgnoreNew  程序自己也有 run.lock，这里是第二道
-        "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd "
+        + "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd "
         "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-ExecutionTimeLimit (New-TimeSpan -Hours 6) -MultipleInstances IgnoreNew;"
         # 查 `-DontStopOnIdleEnd` 是否生效要看 `Settings.IdleSettings.StopOnIdleEnd`
