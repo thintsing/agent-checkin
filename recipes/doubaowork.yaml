@@ -78,18 +78,33 @@ client:
   target_match: 'doubaowork-chat'
   main_target_match: 'doubaowork-chat'
 
-  # 「签到闸门未开」的业务码 —— 命中它属于**时间没到**，不是故障。
-  # 服务端每天的开放时刻**随机**，客户端自己的气泡日志（`checkin_bubble_show`）
-  # 给了精确旁证：11-06 11:01 / 11-08 13:28 / 11-07 14:32。
-  # 而 detail 接口全程正常（task_status=1），只有 claim 被拒、message 还写着
-  # `system error`（极具误导性）。驱动命中此码时把措辞改成"暂未开放"，
-  # 避免每天推送读起来像 bug。值 = 业务码字符串。
-  #   2026-11-05 掐点实证：11:36 仍拒 → 11:50 放行（+200，continuous_days 16）
-  #   2026-11-03：11:34 仍拒 → 13:44 放行
-  #   2026-11-02：10:45 仍拒 → 10:55 放行
-  # ⇒ 计划任务为此配了 11:00–15:00 每 30 分钟的重试网格（见 __main__._retry_grid），
-  #   把"闸门开了但我们上一轮刚好跑过"的最坏滞后压到 30 分钟。
+  # 「领取被拒」的业务码 —— 命中它**先当成"可重试"**，不是故障（message 写着
+  # `system error`，极具误导性）。2026-11-09 查明：真因是**我们的裸 fetch 缺
+  # SDK 才会填的 `AgwCommonParam`/`biz_params`**，服务端按非法请求拒
+  # （同分钟里点页面「立即签到」就能签上，证据与代码见 DESIGN_NOTES 本站点小节）。
+  # 真正的修复是下面的 `claim_button_labels`（让页面自己发请求）；
+  # 这个码的作用只剩"措辞"：把日志/推送从"未判定结果（code=…）"改成"暂未开放…重试"。
+  #   2026-11-05 掐点：11:36 拒 → 11:50 放行（+200，continuous_days 16）
+  #   2026-11-03：11:34 拒 → 13:44 放行
+  #   2026-11-02：10:45 拒 → 10:55 放行
   defer_codes: ['710010702']
+
+  # ---- 按钮兜底（2026-11-09 新增，这条是真正的修复）----
+  # bridge 直连接口被服务端拒（NO_ACTION/ERROR）时，改点**活动页自己的按钮**再试一次。
+  #
+  # 硬证据（2026-11-09 11:55 vs 11:56，同一分钟级）：
+  #   · 直连 POST /alice/ug/campaign/landing/checkin，body 只有 {scene}
+  #     → code 710010702（message 写着 system error）；
+  #   · 点页面自己的「立即签到」→ 真签上了：task_status 1→3、continuous_days 20，
+  #     界面弹「签到成功」。
+  # 翻活动页 JS 找到原因：页面的领取函数是
+  #     DailyCheckIn(e) → data: { scene, biz_params, AgwCommonParam }
+  # 后两个字段由它的 SDK 自动填（AGW 网关参数，含会话/风控上下文）。
+  # 我们裸 fetch 只带 scene ⇒ 被当非法请求拒。
+  # **复刻 AgwCommonParam = 伪造设备/会话签名，坚决不做**，所以正确的路是让页面自己发。
+  #
+  # 值的匹配口径与 claim_button 一致：**innerText 全等**（不是子串），按顺序试。
+  claim_button_labels: ['立即签到', '签到']
 
   # 绝不关用户的客户端：这是用户日常在用的 AI 工作助手（还托管着定时任务/云电脑/
   # skill 运行时），关掉等于打断他手上的活。字段必须**显式**写 —— 代码默认 true，

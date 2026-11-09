@@ -7,6 +7,53 @@
 
 ---
 
+## [2026-11-09 12:05] WorkBuddy(阿拾) —— 找到豆包"总签不上"的真因：裸请求缺 SDK 网关参数；改为**点页面自己的按钮**（已实测签上）
+
+**今日状态**：6/6。doubaowork 是**这次排查中我用按钮兜底领的**（`task_status` 1→3、
+`continuous_days:20`，周一翻倍 400），已 `record('already')`，streak 20→21。
+
+**真因（这次是硬证据，不再是"时间窗"推断）**：
+
+| 时刻 | 做法 | 结果 |
+|---|---|---|
+| 11:55:36 | 驱动直连 `POST /alice/ug/campaign/landing/checkin`，body 只有 `{scene}` | `710010702` / `system error` |
+| 11:56~11:57 | 点活动页自己的「立即签到」（合成 pointer 事件） | **真签上了**（status 1→3） |
+
+翻活动页 JS（`2198.*.js`）拿到页面的领取函数：
+
+```js
+t.DailyCheckIn = function(e, t) {
+  var n = e || {}, r = this.genBaseURL("/alice/ug/campaign/landing/checkin"),
+      a = { scene: n.scene, biz_params: n.biz_params, AgwCommonParam: n.AgwCommonParam };
+  ...
+}
+```
+
+⇒ 页面调这个接口时带 **`biz_params` + `AgwCommonParam`**（后者是 SDK 自动填的 AGW
+网关参数，含会话/风控上下文）。我们裸 fetch 只带 `scene` ⇒ 被当非法请求拒。
+**复刻 AgwCommonParam = 伪造设备/会话签名，红线，不做。**
+
+**修法（已真机验证）**：
+1. `recipes/doubaowork.yaml` 新增 `claim_button_labels: ['立即签到', '签到']`；
+2. `client_claim._claim_by_clicking_page()`：bridge 直连返回 NO_ACTION/ERROR 时，
+   改点页面自己的按钮，然后**轮询 status 复核**（3×2s），只有服务端确认已签才报 SUCCESS，
+   否则老实报"已点击但未确认"（绝不因为"点了没报错"就报成功）；
+3. 305 行的 `defer_codes` 保留，但语义降级为"措辞"（把 system error 说成人话）。
+
+**顺带纠正的旧结论**（重要，别再照着做）：
+- 之前把 710010702 解释成"服务端每日闸门随机开（10:20–13:44）"，**那个解释是错的** ——
+  那些时刻只是"裸请求恰好被接受"的时间，服务端对请求形状的校验在波动；
+- `checkin_bubble_show`（客户端气泡）**不能**说明我们的请求能不能过，也不该拿来校准窗口；
+- 11:00–15:00 的 30 分钟重试网格**保留**：按钮兜底也会失败（页面改版/真没开）时需要它。
+
+**守卫**：`TestBridgeClickFallback` 3 条（配方声明了兜底标签 / 只有复核确认才 SUCCESS /
+点不到按钮时返回 None 保留原结论）；**340 全绿**。
+
+**待观察**：「立即签到」是页面文案，改版就得改配方（`claim_button_labels`）。
+失败时日志会写"bridge 调接口被拒，改点页面按钮「X」兜底"，一眼能看出走的是哪条路。
+
+---
+
 ## [2026-11-08 16:10] WorkBuddy(阿拾) —— 豆包工作连续三天没自动领到：闸门随机开在 11:01/13:28/14:32，窗口太稀；改 30 分钟网格 + 推送同日去重
 
 **今日状态**：6/6 落实，但 **doubaowork 是用户手动领的**（15:00 那轮只判到 `already`）。

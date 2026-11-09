@@ -3481,6 +3481,77 @@ class TestOpenTarget(unittest.TestCase):
         self.assertTrue(users, "没有任何配方使用 open_target ⇒ 这条路径又成了死代码")
 
 
+class TestBridgeClickFallback(unittest.TestCase):
+    """bridge 被服务端拒时改点页面按钮（2026-11-09 的真修复）。
+
+    硬证据：同一分钟级，直连 `/landing/checkin`（body 只有 `{scene}`）回 710010702，
+    而点页面「立即签到」真的签上了（task_status 1→3）。翻 JS 查明页面调
+    `DailyCheckIn(e)` 时带 `{scene, biz_params, AgwCommonParam}` —— 后两个由它的
+    SDK 填（AGW 网关参数）。复刻那些参数 = 伪造设备/会话签名，属红线 ⇒ 不伪造，
+    改成让页面自己点。
+
+    守卫盯住三件事：
+      ① 配方真的声明了兜底按钮（否则代码里的分支永远走不到 = 名存实亡）；
+      ② 只有**复核到服务端已签**才报 SUCCESS（点完不报错 ≠ 领到了）；
+      ③ 页面没有按钮时返回 None（保留原结论，不劣化成假成功）。
+    """
+
+    def _recipe(self):
+        _, recipes = load_config(str(PROJECT_ROOT))
+        return next(r for r in recipes if r.id == "doubaowork")
+
+    def test_doubaowork_declares_fallback_labels(self):
+        r = self._recipe()
+        self.assertEqual(r.client.get("claim_button_labels"), ["立即签到", "签到"],
+                         "兜底按钮必须与实测文案一致（innerText 全等匹配）")
+
+    def _run(self, page_cls, status_data):
+        from checkin.drivers import client_claim as cc
+        r = self._recipe()
+        drv = cc.ClientDriver()
+        with mock.patch.object(cc, "CDPPage", page_cls), \
+                mock.patch.object(cc, "time") as fake_time, \
+                mock.patch.object(cc.ClientDriver, "_bridge_call",
+                                  return_value={"code": 0, "data": status_data}):
+            fake_time.sleep = lambda *_: None
+            return drv._claim_by_clicking_page(
+                r, {"webSocketDebuggerUrl": "ws://fake"}, ["立即签到"],
+                r.client["bridge"], r.client)
+
+    def test_success_requires_server_confirmation(self):
+        class Page:
+            def __init__(self, url): pass
+            def wake(self): pass
+            def evaluate(self, js, await_promise=True): return "dispatched"
+            def close(self): pass
+
+        res = self._run(Page, {"hasIssued": True})
+        self.assertIsNotNone(res)
+        self.assertEqual(res.outcome, Outcome.SUCCESS)
+        self.assertIn("立即签到", res.message)
+
+    def test_click_without_confirmation_is_not_success(self):
+        class Page:
+            def __init__(self, url): pass
+            def wake(self): pass
+            def evaluate(self, js, await_promise=True): return "dispatched"
+            def close(self): pass
+
+        res = self._run(Page, {"hasIssued": False})
+        self.assertIsNotNone(res)
+        self.assertEqual(res.outcome, Outcome.NO_ACTION)
+        self.assertIn("未确认", res.message)
+
+    def test_no_button_keeps_original_result(self):
+        class Page:
+            def __init__(self, url): pass
+            def wake(self): pass
+            def evaluate(self, js, await_promise=True): return "no-button"
+            def close(self): pass
+
+        self.assertIsNone(self._run(Page, {"hasIssued": True}))
+
+
 class TestClientStaleSnapshot(unittest.TestCase):
     """活动页**快照陈旧**造成的静默漏签（2026-10-06 新增）。
 

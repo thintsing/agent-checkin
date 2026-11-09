@@ -692,8 +692,18 @@ class ClientDriver(Driver):
                                          message="活动页打不开（createTarget 未就绪）",
                                          detail={"open_target": str(oc["url"])})
             try:
-                return self._claim_via_bridge(recipe, c, port, match, bridge,
-                                              target=opened)
+                res = self._claim_via_bridge(recipe, c, port, match, bridge,
+                                             target=opened)
+                # bridge 被服务端拒 / 结果未知时，用**活动页自己的按钮**再试一次。
+                # 见 `_claim_by_clicking_page` 的 docstring：这不是"补一次重试"，
+                # 而是走一条**不同的调用路径** —— 页面发的请求带 SDK 填的网关参数。
+                labels = [str(x) for x in (c.get("claim_button_labels") or [])]
+                if (opened is not None and labels
+                        and res.outcome in (Outcome.NO_ACTION, Outcome.ERROR)):
+                    alt = self._claim_by_clicking_page(recipe, opened, labels, bridge, c)
+                    if alt is not None:
+                        res = alt
+                return res
             finally:
                 if opened is not None and bool(oc.get("close_after", True)):
                     close_target(port, str(opened.get("id") or ""))
@@ -793,6 +803,63 @@ class ClientDriver(Driver):
             return CheckinResult(sid, Outcome.NO_ACTION,
                                  message="已点击领取，但未读到确认文案，请人工核对",
                                  detail=detail)
+        finally:
+            page.close()
+
+    # ------------------------------------------------------ 按钮兜底（bridge 被拒时）
+
+    def _claim_by_clicking_page(self, recipe: Recipe, target: Dict[str, Any],
+                                labels: List[str], bridge: Dict[str, Any],
+                                c: Dict[str, Any]) -> Optional[CheckinResult]:
+        """bridge 调接口被服务端拒绝时，改用**活动页自己的按钮**再试一次。
+
+        **为什么这不是"再点一次碰运气"，而是必须有（2026-11-09 抓到的硬证据）：**
+
+        同一分钟、同一账号、同一个页面：
+          · 我们直连 `POST /alice/ug/campaign/landing/checkin`，body 只有 `{scene}`
+            → `code:710010702`（message 还写着极具误导性的 `system error`）；
+          · 点页面自己的「立即签到」→ **真的签上了**（`task_status` 1→3，
+            `continuous_days:20`，界面弹"签到成功"）。
+
+        翻活动页的 JS 找到原因 —— 页面的领取函数是：
+            DailyCheckIn(e) → data: { scene, biz_params, AgwCommonParam }
+        后两个字段由它的 SDK 自动填充（AGW 网关参数，含会话/风控上下文）。
+        我们的裸 fetch 只带 `scene` ⇒ 服务端按"非法请求"拒。
+        **复刻 AgwCommonParam 等于伪造设备/会话签名，是红线，坚决不做。**
+        正确解法：让**页面自己**去发这个请求 —— 也就是点它自己的按钮。
+
+        判定仍然只认服务端：点完必须重新读一次 status，确认已签才报 SUCCESS；
+        读不到就老实说"不确定"，绝不因为"点了没报错"就报成功。
+        """
+        sid = recipe.id
+        timeout = int(c.get("bridge_timeout_sec", 25))
+        page = CDPPage(target["webSocketDebuggerUrl"])
+        try:
+            page.wake()
+            clicked = None
+            for label in labels:
+                js = _JS_CLICK.replace("__LABEL__", json.dumps(label))
+                if page.evaluate(js, await_promise=False) == "dispatched":
+                    clicked = label
+                    break
+            if clicked is None:
+                log.debug("[%s] 按钮兜底：页面里找不到候选按钮 %s（可能已签到/改版）",
+                          sid, labels)
+                return None
+            log.info("[%s] bridge 调接口被拒，改点页面按钮「%s」兜底", sid, clicked)
+
+            # 点击后服务端要落账，给它几秒并轮询复核（3 次 × 2s）。
+            for _ in range(3):
+                time.sleep(2.0)
+                st = self._bridge_call(page, str(bridge["status_js"]), timeout)
+                data = (st or {}).get("data")
+                if isinstance(data, dict) and recipe.verdict.already_checked_in(data):
+                    return CheckinResult(sid, Outcome.SUCCESS,
+                                         message="已点击页面「%s」并确认到账" % clicked,
+                                         detail={"click": "button-fallback"})
+            return CheckinResult(sid, Outcome.NO_ACTION,
+                                 message="已点击页面「%s」，但复核未确认已签" % clicked,
+                                 detail={"click": "button-fallback"})
         finally:
             page.close()
 

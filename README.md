@@ -218,7 +218,7 @@ contextBridge 暴露的桥）—— 不伪造请求、不碰 token、不读设�
 | **Qoder 国际版**（`qoder.sh`） | `client` | 同国区，但走**英文 UI**：用户菜单（`Open user menu`）→ `Rewards center` → `Claim` | 与国区同因（活动页是宿主注入 token 的 OOPIF，独立打开收不到消息）；**判据与文案全在配方里** —— 国际版 UI 是英文，照抄国区中文入口会每天静默漏签 |
 | **Trae CN** | `client` | **CDP bridge**：调客户端自己的 IPC 通道（`window.vscode.ipcRenderer.invoke('vscode:sandbox::main-invoke-claimCheckinCredits')`） | 签到入口藏在新版 Solo Lite UI 的账号菜单里（点开还会落到付费页）；IPC 是**客户端自己点签到按钮时走的同一条路**，不碰 token / 设备身份文件 |
 | **DuMate**（百度搭子） | `client` | **CDP bridge**：调 preload 暴露的 `window.electronAPI.bceConsoleRequest`（客户端自己的请求通道） | 前端是 `file://` origin，页面里直接 `fetch` 会被 **CORS 拦掉**，必须走它自己的桥；判据是 `loginBonusInfo` 的 `hasIssued`，500 分/天 |
-| **豆包工作**（DoubaoWork） | `client` | **CDP bridge + 自建页面**：`Target.createTarget` 在客户端同一个 profile 里开活动页（`doubao.com/pc/agent-explore`），在页面里 `fetch` 活动接口，用完关掉 | 签到入口是内置浏览器里的一个**活动页**，平时根本不存在（点菜单「免费领额度」才打开）；判据是 `daily_signin` 任务的 `task_status==3`，200 额度/天 |
+| **豆包工作**（DoubaoWork） | `client` | **CDP bridge + 自建页面**：`Target.createTarget` 在客户端同一个 profile 里开活动页（`doubao.com/pc/agent-explore`），在页面里 `fetch` 活动接口；**接口被拒时改点页面自己的按钮**，用完关掉 | 签到入口是内置浏览器里的一个**活动页**，平时根本不存在（点菜单「免费领额度」才打开）；判据是 `daily_signin` 任务的 `task_status==3`，200 额度/天（周一翻倍 400）。⚠ 直连接口必须带 SDK 生成的 `AgwCommonParam`/`biz_params`，我们**不伪造**签名 ⇒ 用按钮兜底 |
 
 新增站点**不需要改一行代码** —— 在 `recipes/` 放一个 YAML 即可。
 
