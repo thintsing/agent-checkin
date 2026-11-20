@@ -57,7 +57,11 @@
 1. **误装的第三方技能**：查详情时点技能名命中了行内热区，**装了**「TeleAgent自动领取积分」（`teleagent-points-claimer`，`source: creator`）。实现干净（5 个本地脚本，纯 UIA + 截图，**无网络上传、不读 token**，验证失败如实报 `failed_verify`），但硬编码作者环境（窗口名 `TeleAgent`、用户名 `肖洋`、输出 `D:\TeleClaw的工作空间`），**本机跑不通**。大哥要求卸载；客户端里 `已添加` 是 **TextControl**（不可 Invoke，控件级点击不可靠），**未卸载**，待他手动点一下（技能页 → 该技能 → 移除）。
 2. 任务列表多了一条 **10:42 的 `TeleAgent积...` 会话**（疑随安装生成，状态"需介入"），待确认去留。
 3. 上轮遗留未动：Qoder 100 Credits 资格收紧的 A/B/C 降噪决策、`_reserve_clean_port` 换端口不刷启动入口、用户桌面重复的 `TeleAgent.lnk` 副本。
-4. **未提交未推送**：`M HANDOFF.md` / `M recipes/qoder.yaml`（9345，驱动自动改）/ `M requirements.txt` / `M src/checkin/core/models.py` / `M src/checkin/drivers/__init__.py` / `M tests/test_architecture.py` / `M tests/test_core.py` / `M tools/win_shortcut_args.py` + `?? recipes/minimax-code.yaml` / `?? recipes/teleagent.yaml` / `?? src/checkin/drivers/uia_client.py` / `?? tests/test_new_sites.py`。推送属对外动作，等大哥确认。
+4. **已提交并推送**：`7f5e46e feat(sites): 新增 MiniMax Code（client+bridge）与 TeleAgent（mode: uia），合计 8 站`
+   （12 files / +1154 −4）。推送后 `fetch --prune` 复核：`HEAD == origin/main == 7f5e46e`，
+   ahead/behind `0/0`，工作树干净。
+   （同一个 commit 带上了 11-19 那轮的 MiniMax 接入、`recipes/qoder.yaml` 的 9345 与 `tools/win_shortcut_args.py`；
+   之所以合成一个：`tests/test_new_sites.py` 同时含两站断言，拆开会让中间态测试变红。）
 
 ---
 
