@@ -119,7 +119,7 @@ class TestEntrypoint(unittest.TestCase):
     def test_driver_table_resolves(self):
         """driver_for 惰性导入的各驱动必须都拿得到 —— 这是历史上最容易断的地方。"""
         from checkin.drivers import driver_for
-        for mode in ("auto", "manual", "client"):
+        for mode in ("auto", "manual", "client", "uia"):
             drv = driver_for(mode)
             self.assertIsNotNone(drv, f"driver_for({mode!r}) 返回了 None")
             self.assertEqual(drv.mode, mode)

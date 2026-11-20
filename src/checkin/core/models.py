@@ -94,7 +94,7 @@ class Recipe:
     id: str
     name: str
     enabled: bool = True
-    mode: str = "auto"                       # auto | manual | client | disabled
+    mode: str = "auto"                       # auto | manual | client | uia | disabled
     origin: str = ""
     session: Session = field(default_factory=Session)
     actions: Dict[str, Action] = field(default_factory=dict)
@@ -104,6 +104,11 @@ class Recipe:
     # 与 reminder 分开是因为语义不同 —— reminder 是"给人看的话"，
     # client 是"给程序执行的步骤"。混在一起以后必然有人把 toast 文案改坏自动化。
     client: Dict[str, Any] = field(default_factory=dict)
+    # mode=uia 专用（2026-11-20 新增）：用 Windows UI Automation 操作客户端原生控件。
+    # 为什么不并进 client 段：client 的语义围绕"调试端口 + CDP"，
+    # 而 uia 恰恰是**客户端把端口堵死**时才走的路（见 recipes/teleagent.yaml）。
+    # 两段混用会让 client 的对称守卫（端口/自愈/忙闲）对 uia 站点提出无意义的强制要求。
+    uia: Dict[str, Any] = field(default_factory=dict)
     safety_overrides: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -130,6 +135,7 @@ class Recipe:
             verdict=Verdict(**(d.get("verdict") or {})),
             reminder=d.get("reminder") or {},
             client=d.get("client") or {},
+            uia=d.get("uia") or {},
             safety_overrides=d.get("safety_overrides") or {},
         )
 

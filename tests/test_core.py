@@ -2800,7 +2800,9 @@ class TestCollectGaps(unittest.TestCase):
         漏判会让它静默落在"不报"那一侧，又是一次看不见的失效。"""
         _, recipes = load_config(str(PROJECT_ROOT))
         for r in recipes:
-            self.assertIn(r.mode, {"auto", "client", "manual", "disabled"},
+            # uia（2026-11-20 新增）：与 client 同侧 —— 它也是"程序自己签到"，
+            # 昨该签没签必须报缺口，不能静默落在"不报"那一侧。
+            self.assertIn(r.mode, {"auto", "client", "uia", "manual", "disabled"},
                           f"新 mode={r.mode} 必须显式决定是否参与缺口回溯")
 
 

@@ -1,0 +1,77 @@
+# ============================================================
+#  站点配方 · TeleAgent（中国电信 TeleAI 超级智能体桌面端）
+#  状态：**已接入自动化**（mode: uia）—— 2026-11-20 定案，取代 11-19 的 disabled。
+#
+#  ---- 为什么不用 client/CDP（这条路被应用自己堵死，别再试）----
+#  ① 调试端口被主动摘掉 —— /dist-electron/main-runtime-*.js：
+#        const Thr = ["remote-debugging-port", "inspect", "inspect-brk",
+#                     "inspect-port", "disable-web-security", "no-sandbox", ...];
+#        if (Ee.isPackaged) for (const t of Thr) Ee.commandLine.removeSwitch(t);
+#     实测：带 `--remote-debugging-port=9347` 启动后主进程命令行确实带该参数，
+#     但 9347 始终无监听、netstat 无记录（对照 MiniMax 同法 9346 秒级就绪）。
+#  ② 反调试 —— 同文件：node:inspector.url() 命中即 app.exit(1)，5s 巡检；
+#     日志三次启动均打印 `[AntiDebug] Anti-debug protection enabled (Inspector monitoring every 5s)`。
+#  ③ 还有签名自校验（VerifySignature，命中 tampered 也 exit）。
+#  ⇒ 绕过 = patch asar / 注入 / 伪造设备身份，违反铁律 1「不读不复刻鉴权」，
+#    也不属于用户授权的自愈窄口。**不做**。
+#
+#  ---- 为什么 uia 能行（2026-11-20 真机验证，别凭直觉推翻）----
+#  · 客户端**没有**禁用 Chromium 辅助功能（asar 内搜不到 disable-renderer-accessibility）
+#  · `AutomationElement.FromHandle(hwnd)` 只拿到 13 个空壳节点（命名控件 0 个）；
+#    必须从 GetRootControl() 逐层 GetChildren() **才会激活**辅助功能树
+#    （同一窗口实测变成 127 节点 / 68 个命名控件）
+#  · 账号入口 = `TextControl 'user_98008872'`（正则 ^user_\d+$ 适配换账号）
+#  · 签到按钮 = `ButtonControl '立即领取'`；已领时 = `ButtonControl '今日已领'`
+#  · **坐标点击无效**：mouse_event 打不动 Electron 窗口；
+#    只有控件级 `ctrl.Click()` 有效 ⇒ 驱动不提供坐标兜底，宁可失败也不假装点过
+#  · 点完菜单会关闭 ⇒ 驱动会重开菜单复核；复核不到就报 no_action，**不假成功**
+#
+#  ---- 签到体系取证（保留，供将来核对）----
+#  渲染层 file://app.asar/dist/assets/main-*.js 的 zustand store：
+#        dailySignData / setDailySignData / userPointData / taskList
+#  接口：/user/portal/companyStore/checkDayTask（含 v2 / v3）、.../checkTask、/points/detail
+#  服务端基址：https://agent.teleai.com.cn/superCowork/sapi/api/v1
+#  文案（i18n index-*.js）：cardTitle=积分福利社，claimNow=立即领取，
+#        claimedToday=今日已领，dailyClaimTip=每日可领 {{points}} 积分
+#
+#  ---- 已知代价（写在这里免得以后当成 bug）----
+#  签到要抢一次前台（SetForegroundWindow）—— UIA 的前提是窗口可交互。
+#  CDP 那种"后台静默"在这里不存在，这是端口被堵死后的必然代价。
+# ============================================================
+id: teleagent
+name: TeleAgent 每日签到
+enabled: true
+mode: uia
+
+uia:
+  # 本机实测窗口标题是「TeleAgent 星辰超级智能体」，所以用子串而不是全等
+  window_title_contains: 'TeleAgent'
+  window_class: 'Chrome_WidgetWin_1'
+  # 账号入口：左下角那行用户名。用正则而不是写死 user_98008872，换账号也能命中
+  account_entry_pattern: '^user_\d+$'
+  # 菜单里的模块名（只用于日志与人工核对，不参与判定）
+  menu_entry_text: '积分福利社'
+  # 按钮名必须精确 —— 侧边栏真实存在一个叫「TeleAgent积分自动领取」的任务/会话，
+  # 模糊匹配"含领取"会点到它（社区同名技能也记着这个坑）
+  claim_button_names: ['立即领取', '今日已领']
+  claimable_name: '立即领取'
+  claimed_name: '今日已领'
+  max_depth: 32
+  settle_sec: 1.6
+  verify_settle_sec: 2.0
+  timeout_sec: 90
+  timeout_cap_pass1_sec: 60
+  search_timeout_sec: 8
+
+verdict:
+  # UIA 不读响应体：判据完全来自控件状态（驱动内部处理），这里只保留默认兜底
+  transport: body_code
+  rules: []
+  http_401_result: need_login
+  unknown_result: no_action
+
+reminder:
+  not_before: '00:00'
+  toast_title: 'TeleAgent 每日签到提醒'
+  toast_body: 'UIA 自动签到未成功，请在客户端左下角账号菜单 → 积分福利社 → 立即领取。'
+  note: '入口在左下角账号菜单里的「积分福利社」；「立即领取」按钮支持控件级 UIA 点击。'

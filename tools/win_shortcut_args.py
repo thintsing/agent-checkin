@@ -167,7 +167,28 @@ APPS = {
         # 原值带 `--launch_from=auto_run`，必须保留（见 _other_args_of 的注释）。
         "run_key": "doubaowork",
     },
+    "minimax-code": {
+        # 2026-11-19 新接入。electron-builder 用户级安装（Local\Programs），
+        # 桌面 + 开始菜单各一个 lnk；公共桌面没有。
+        "label": "MiniMax Code",
+        "recipe": "minimax-code.yaml",
+        "lnks": [
+            r"%USERPROFILE%\Desktop\MiniMax Code.lnk",
+            r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\MiniMax Code.lnk",
+        ],
+        # 未观察到客户端回写快捷方式；没有实测依据就不加只读锁。
+        "lock": None,
+        # 2026-11-19 实地核查 HKCU\...\Run：**有**自启动项（值名 com.minimax.agent），
+        # 原值只有 exe 路径、不带端口 ⇒ 必须与 .lnk 一起改，否则开机自启实例接管不了。
+        "run_key": "com.minimax.agent",
+    },
+    # ⚠ TeleAgent **不要**加进本表（2026-11-19 已核查，见 recipes/teleagent.yaml）：
+    #   它打包版启动时会 app.commandLine.removeSwitch('remote-debugging-port')，
+    #   外加 node:inspector 反调试（命中即 app.exit(1)）⇒ 改启动入口也拿不到 CDP 端口，
+    #   加了只会每天空转重启用户客户端。该配方 mode: disabled、没有 client 段，
+    #   本表若留条目，recipe_debug_port 会回落到误导性的默认 9337。
 }
+
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "shortcut_backup")
 
 

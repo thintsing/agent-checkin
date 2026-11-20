@@ -1,3 +1,5 @@
 # 依赖（脚本首次运行由 run_checkin.bat 自动装进本地 venv）
 websocket-client==1.8.0   # 通过 Chrome DevTools Protocol 驱动已登录浏览器
 PyYAML==6.0.2             # 解析 recipes / config
+uiautomation>=2.0.18      # mode: uia —— 走 Windows 辅助功能通道操作客户端原生控件
+                          # （客户端把调试端口堵死时的唯一自动化路径，见 recipes/teleagent.yaml）

@@ -1,0 +1,184 @@
+# ============================================================
+#  站点配方 · MiniMax Code（MiniMax Agent 桌面端）
+#  形态：client + bridge —— 调客户端自己的 http 通道完成每日签到，不点 DOM。
+#
+#  ---- 2026-11-19 静态取证（只读 app.asar / 客户端日志，未逆向鉴权文件）----
+#  安装：%LOCALAPPDATA%\Programs\MiniMax Code\MiniMax Code.exe
+#        Electron 42.1.16 / 3.1.16 / app-user-model-id=com.minimax.agent
+#  userData：%APPDATA%\MiniMax Agent（注意目录名不是 "MiniMax Code"）
+#  渲染层：**本地 app://./archon 页面**（Next.js 静态包，不是 https 远程页）。
+#        HTTP 由主进程 `[IPC Proxy]` 代理并注入签名（yy / x-timestamp /
+#        x-signature / Authorization），日志 api-*.log 可佐证。
+#
+#  签到接口（/out/_next/static/chunks/69780-7a9d492a17386985.js 内封装）：
+#        GET  /minimax-cloud/api/v1/signin/config
+#        GET  /minimax-cloud/api/v1/signin/status   → getSigninPanel()
+#        POST /minimax-cloud/api/v1/signin/claim    → claimSignin()
+#        响应解包 y(e)：base_resp.status_code===0 且 e.data 存在才算成功。
+#
+#  ---- 2026-11-19 13:0x 真机 CDP 取证（端口 9346，端到端只读跑通）----
+#  · /json/list 主窗口 = `app://./archon`（另有截图窗口 file:///.../electron.html，
+#    用精确串匹配即可排除）⇒ target_match 必须是这个实测值。
+#  · 裸 `window.electronAPI.proxyFetch({url:'https://agent.minimax.io/...'})`
+#    会回 `base_resp.status_code:1406010011 / invalid timezone_id` —— 因为它绕过
+#    了页面 axios 拦截器，缺 SDK 公共参数与签名头。**不伪造签名**（铁律）。
+#  · 正道 = 复用**客户端自己的 axios 实例**：`webpackChunk_N_E` push 一个空 chunk
+#    拿到 __webpack_require__，再取 `req(98304).ZP`（实测导出 `{ZP}`，含完整
+#    interceptors）。它的 `get/post` 会自动补齐公共参数与签名。
+#  · status 真实返回（今天）：
+#      {"data":{"scene":2,"days":[{"day_no":1,"points":400,"status":3,
+#       "is_today":true}, ... ]},"base_resp":{"status_code":0,"status_msg":"ok"}}
+#
+#  ---- 判据来自客户端自己的代码，零推断 ----
+#  /out/_next/static/chunks/69780-*.js：
+#      function s(e){ return !!e?.days.some(e => e.is_today && 3===e.status) }  // 今日已签
+#      function o(e){ return !!e?.days.some(e => 2===e.status) }               // 今日可签
+#      status 枚举：1=upcoming / 2=claimable / 3=claimed / 4=disabled
+#  ⇒ status_js 里把 `days.some(d => d.is_today===true && d.status===3)` 算成布尔
+#    `checked_in` 放进 data，供 verdict.checked_in_flag 收手；claim 后驱动会**再读
+#    一次 status 复核**，所以不存在"假成功"。
+#
+#  2026-11-19 11:48:10 客户端日志已出现一次 POST signin/claim（200 /
+#  baseRespStatusCode 0）⇒ 今天已领过；接入当天按幂等**未重复触发 claim**，
+#  只跑了 status 只读（实地返回 checked_in:true）。真正的 success 由明天
+#  10:05 主窗口 + 网格触发验证。
+#
+#  ⚠ `req(98304)` 是 3.1.16 实测的 webpack 模块号；客户端升级后若变，bridge 会
+#    返回 code=-1 → no_action（**安全降级，不会假成功**），需重新 CDP 校准。
+# ============================================================
+id: minimax-code
+name: MiniMax Code 每日签到
+enabled: true               # 2026-11-19 CDP 端到端只读验证通过（status 结构 + 判据）
+mode: client
+
+# 判定：业务码只认**顶层** code（bridge 已把 base_resp.status_code 提上来）。
+# 只配 code=0→success；claim 之后驱动必再读一次 status 复核 checked_in，
+# 复核不通过会降级 no_action ⇒ 不会报没有证据的"成功"。
+verdict:
+  transport: body_code
+  rules:
+    - { code: 0, result: success }
+  http_401_result: need_login
+  unknown_result: no_action
+  # status_js 会把客户端自己的 `s(panel)` 判据算成这个布尔字段
+  checked_in_flag: checked_in
+
+client:
+  exe: '%LOCALAPPDATA%\Programs\MiniMax Code\MiniMax Code.exe'
+  exe_glob: ''
+  # 端口台账：9333=网页 / 9336=WorkBuddy / 9338=Trae / 9341=DuMate / 9342=豆包工作 /
+  #           9343=僵尸 / 9344=Qoder 国际版 / 9345=Qoder CN / **9346=本应用**
+  debug_port: 9346
+  process_match: 'MiniMax Code.exe'
+  data_dir: '%APPDATA%\MiniMax Agent'
+  # 用户全天在用的桌面应用 ⇒ 签完绝不关闭（代码默认 close_after=true，必须显式关掉）
+  close_after: false
+  wait_port_sec: 120
+  launch_timeout_sec: 90
+  target_timeout_sec: 25
+  # 主窗口 renderer 的 URL 特征 —— 2026-11-19 真机实测值，写错 = 永不命中
+  target_match: 'app://./archon'
+  main_target_match: 'app://./archon'
+
+  # ---- bridge：调客户端自己的 axios 实例，签名/公共参数全由它自己的拦截器生成 ----
+  # 表达式**必须返回 JSON 字符串**（跨 CDP 边界用 returnByValue，字符串最稳），
+  # 驱动侧只认**顶层 code**；data 原样带出，供 verdict.checked_in_flag 读取。
+  bridge:
+    status_js: |
+      (async () => {
+        const name = Object.keys(window).find(k => k.startsWith('webpackChunk'));
+        let req = null;
+        if (name) { try { window[name].push([[Symbol('ck')], {}, r => { req = r; }]); } catch (e) {} }
+        let axios = null;
+        if (req) { try { const m = req(98304); if (m && m.ZP && typeof m.ZP.get === 'function') axios = m.ZP; } catch (e) {} }
+        if (!axios) return JSON.stringify({code: -1, data: {error: 'client http channel unavailable'}});
+        try {
+          const r = await axios.get('/minimax-cloud/api/v1/signin/status', {showToast: false});
+          const body = (r && r.data) || {};
+          const code = (body.base_resp && typeof body.base_resp.status_code === 'number') ? body.base_resp.status_code : -1;
+          const data = body.data || {};
+          const days = Array.isArray(data.days) ? data.days : [];
+          const checked_in = days.some(d => d && d.is_today === true && d.status === 3);
+          return JSON.stringify({code: code, data: Object.assign({}, data, {checked_in: checked_in})});
+        } catch (e) { return JSON.stringify({code: -1, data: {error: String(e)}}); }
+      })()
+    claim_js: |
+      (async () => {
+        const name = Object.keys(window).find(k => k.startsWith('webpackChunk'));
+        let req = null;
+        if (name) { try { window[name].push([[Symbol('ck')], {}, r => { req = r; }]); } catch (e) {} }
+        let axios = null;
+        if (req) { try { const m = req(98304); if (m && m.ZP && typeof m.ZP.post === 'function') axios = m.ZP; } catch (e) {} }
+        if (!axios) return JSON.stringify({code: -1, data: {error: 'client http channel unavailable'}});
+        try {
+          const r = await axios.post('/minimax-cloud/api/v1/signin/claim', {}, {showToast: false});
+          const body = (r && r.data) || {};
+          const code = (body.base_resp && typeof body.base_resp.status_code === 'number') ? body.base_resp.status_code : -1;
+          return JSON.stringify({code: code, data: body.data || {}});
+        } catch (e) { return JSON.stringify({code: -1, data: {error: String(e)}}); }
+      })()
+    bridge_timeout_sec: 25
+
+  # 领取后刷新界面：客户端签到面板的状态是页面加载时拉的，我们在 bridge 里
+  # 调完接口它的 store 不知道 ⇒ 用户会看到"签到得 400"还在原地，以为没签上。
+  # reload 只在**真的新领取**且客户端空闲时做（驱动已实现，忙/不明则跳过）。
+  refresh_ui_after_claim: true
+
+  # ---- 端口的三种坏法，各自的自愈手段（与其它 client 配方对称）----
+  # ① 僵尸 socket（LISTENING 记在已死 PID 名下）⇒ 自动换端口写回本文件。
+  # ② 命令行完全没有端口参数 ⇒ repair_launch_entry 只改启动入口（影响下次启动）；
+  #    restart_when_portless 授权在"确认空闲"后自行重启并当场补领。
+  # ③ 命令行带了端口却连不上（bind 失败，不会自愈）⇒ restart_on_bind_failure。
+  # 三者全部要过下面的忙闲关；看不清同样不动手。
+  restart_on_bind_failure: true
+  repair_launch_entry: true
+  restart_when_portless: true
+
+  # ---- 重启前的"忙闲"把关 ----
+  # ⚠ 本站是 2026-11-19 新接入，尚未拿到"忙时"的真实 UI 特征 ⇒ 用**保守通用版**：
+  #    判据词刻意避开 loading / spinner（Electron 常驻，含了会永远判忙），
+  #    也避开 execution / progress（项目里 Trae 空闲就带这两个词，栽过）。
+  #    端口不通时 busy_js 必然取不到结论 ⇒ 退到进程 CPU 旁证；idle_cpu_sec 留大，
+  #    宁可多等一会儿，也不能把正在干活的实例干掉。将来拿到真实忙时特征再收紧。
+  busy_probe:
+    busy_js: |
+      (() => {
+        const vis = el => { try { const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0; } catch (e) { return false; } };
+        const cn = el => { const c = el.className;
+          return typeof c === 'string' ? c : (c && c.baseVal) || ''; };
+        const txt = el => ((el.innerText || el.textContent || '') + '').trim();
+        const deepAll = (root, sel, out, depth) => {
+          out = out || []; depth = depth || 0; if (depth > 12) return out;
+          let list = []; try { list = root.querySelectorAll(sel); } catch (e) { return out; }
+          for (const el of list) out.push(el);
+          let kids = []; try { kids = root.querySelectorAll('*'); } catch (e) { return out; }
+          for (const el of kids) if (el.shadowRoot) deepAll(el.shadowRoot, sel, out, depth + 1);
+          return out;
+        };
+        const CLS = /running|processing|generating|streaming|busy/i;
+        const TXT = /执行中|运行中|进行中|生成中|处理中|排队中|等待中/;
+        for (const el of deepAll(document, '*')) {
+          if (!vis(el)) continue;
+          const c = cn(el);
+          if (c && CLS.test(c)) return true;
+          const a = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+          if (a && (CLS.test(a) || TXT.test(a))) return true;
+          const t = txt(el);
+          if (t && t.length < 24 && TXT.test(t)) return true;
+        }
+        return false;
+      })()
+    wait_busy_sec: 1800
+    cpu_window_sec: 5.0
+    idle_cpu_sec: 3.0
+
+reminder:
+  not_before: '00:00'
+  toast_title: 'MiniMax Code 每日签到提醒'
+  toast_body: '今日签到未自动完成，请检查客户端是否从带调试端口的快捷方式启动。'
+  note: '签到积分 30 天有效，仅限 MiniMax Code 使用；连续签到有额外奖励。'
+
+schedule_hint:
+  timezone: Asia/Shanghai
+  refresh_hour_utc8: 0
