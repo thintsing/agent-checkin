@@ -7,6 +7,39 @@
 
 ---
 
+## [2026-11-21 14:05] WorkBuddy(阿拾) —— 修死「换端口不同步启动入口」的老缺陷（两天漂两次的根因）；验证门 363 全绿
+
+**背景**：`_reserve_clean_port` 换端口时**只写配方**、不动启动入口；而 `_repair_launch_entry` 带
+「同一天同一站点只做一次」的戳 —— 漂移恰恰常发生在**当天已经修过入口之后**。
+11-18（10:44 修入口 → 10:53 换端口）和 11-21（9345→9347）各踩一次，每次都要手工跑
+`win_shortcut_args.py --app qoder` 补救，次日才好。
+
+### 改动
+| 文件 | 动作 |
+|---|---|
+| `src/checkin/drivers/client_claim.py` | 新增 `_sync_launch_entry_port()`（**不受"一天一次"戳约束**，但仍守配方 `repair_launch_entry` 窄口）；把原 `_repair_launch_entry` 的子进程调用抽成 `_call_shortcut_tool()`（保留 utf-8 注入与"用退出码不用中文子串"的判据）；僵尸换端口成功后**立刻**同步 |
+| `tests/test_core.py` | 4 条守卫：① 戳存在也必须同步（钉死本次事故）② 配方没开就不许动用户入口 ③ 同步失败必须留**可照做**的日志（带补救命令）④ `_repair_launch_entry` 的"一天一次"闸门不能被重构弄丢 |
+
+### 验证
+- 验证门 **Ran 363 tests / OK**（359 + 4）。
+- **故意给 `_sync_launch_entry_port` 加回戳检查，测试变红**（`AssertionError: False is not true`），改回全绿。
+- 真机调用链：`_sync_launch_entry_port('qoder', client, cfg, 9347)` → 日志
+  `[qoder] 启动入口已同步到新端口 9347（换端口后必须同步…）`，`stamp=True`（子进程 + 退出码判定走通）。
+
+### 设计取舍（别顺手改回去）
+- **不把同步塞进 `_reserve_clean_port`**：它拿不到 `c`（client 段配置），改签名会牵动既有 mock 测试；
+  放在调用点（`_rebind_failure_path` 里 `alt` 命中之后）语义更清楚：「换了端口 → 立刻同步」。
+- **同步失败不阻断换端口**：端口已换好并写回配方，入口同步失败只记 warning + 给人工命令；
+  反过来（不换端口）当天必然继续漏签。
+- 仍守窄口：只有配方开了 `repair_launch_entry` 才动用户入口。
+
+### 遗留
+- 本机无法主动制造"僵尸端口 → 漂移"来端到端验这条新路径（qoder 现在 9347、端口干净）。
+  下次真实漂移时看日志有没有 `启动入口已同步到新端口` 即可确认。
+- 其他遗留同上一条（误装技能待大哥手点移除、10:42 的 `TeleAgent积...` 会话、Qoder A/B/C 降噪决策、桌面重复 `TeleAgent.lnk`）。
+
+---
+
 ## [2026-11-21 14:00] WorkBuddy(阿拾) —— TeleAgent 全天 `no_window` 真因：主窗口被关掉（进程在托盘），驱动补「唤起窗口」窄口；当天已补签 `success`；验证门 359 全绿
 
 **现象**：大哥报「teleagent 没签到成功」。`logs/checkin-2026-11-21.log` 全天 **10+ 次**

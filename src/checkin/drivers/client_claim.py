@@ -359,6 +359,12 @@ class ClientDriver(Driver):
                 if alt:
                     log.warning("[%s] 端口 %s 已被僵尸 socket 占死，换用 %s", sid, port, alt)
                     use = alt
+                    # 换端口 = 配置真的变了 ⇒ **立刻**同步启动入口。
+                    # 不能只靠 `_repair_launch_entry`：它带"同一天只做一次"的戳，而漂移
+                    # 恰恰可能发生在当天已修过入口之后（11-18：10:44 修入口 → 10:53 换端口
+                    # ⇒ 三处 lnk 停在旧端口，次日从桌面启动重演"带端口但连不上"）。
+                    # 11-21 又漂一次（9345→9347），同一个坑第二次踩，故在此处补死。
+                    self._sync_launch_entry_port(sid, c, cfg, alt)
             if self._restart_client(c, use):
                 log.info("[%s] 已自动重启客户端且端口 %s 就绪，接管补领", sid, use)
                 return self._claim(recipe, c, use, match)
@@ -600,15 +606,50 @@ class ClientDriver(Driver):
         root = str(getattr(cfg, "root", "") or "")
         if not root or self._repair_done_today(root, sid):
             return None
+        ok = self._call_shortcut_tool(root, sid, c)
+        if ok:
+            log.warning("[%s] 已修好启动入口 —— 客户端下次启动即带调试端口 %s，届时自动接管",
+                        sid, c.get("debug_port"))
+        self._mark_repair_today(root, sid)
+        return ok
+
+    def _sync_launch_entry_port(self, sid: str, c: Dict[str, Any], cfg,
+                                port: int) -> bool:
+        """换过端口之后**立刻**把启动入口同步到新端口（**不受"一天一次"戳限制**）。
+
+        为什么不能只靠 `_repair_launch_entry`（2026-11-21 第二次踩同一条）：
+        它带 `_repair_done_today` 的戳，而端口漂移恰恰可能发生在**当天已经修过入口之后** ——
+        11-18 就是 10:44 修入口、10:53 换端口，于是三处 lnk 停在旧值，
+        次日从桌面启动重演"带端口但连不上"。换端口是"配置真的变了"，
+        必须立刻同步一次，否则修了等于没修。
+
+        仍然遵守同一条窄口：**只有配方开了 `repair_launch_entry` 才动用户入口**。
+        """
+        root = str(getattr(cfg, "root", "") or "")
+        if not root or not bool(c.get("repair_launch_entry")):
+            return False
+        if self._call_shortcut_tool(root, sid, c):
+            log.warning("[%s] 启动入口已同步到新端口 %s（换端口后必须同步，"
+                        "否则下次从桌面启动仍带旧端口）", sid, port)
+            # 刚同步过 ⇒ 把当天的修复戳打上，免得后面再白跑一次。
+            self._mark_repair_today(root, sid)
+            return True
+        log.warning("[%s] 换端口 %s 后同步启动入口失败 —— 下次启动可能仍带旧端口，"
+                    "需人工跑 `tools/win_shortcut_args.py --app %s`", sid, port, sid)
+        return False
+
+    def _call_shortcut_tool(self, root: str, sid: str,
+                            c: Dict[str, Any]) -> bool:
+        """调 `tools/win_shortcut_args.py` 同步该站点的启动入口，返回是否成功。"""
         tool = os.path.join(root, "tools", "win_shortcut_args.py")
         if not os.path.isfile(tool):
             log.debug("[%s] 找不到启动入口修复工具，跳过", sid)
-            return None
+            return False
         cmds: List[List[str]] = [[sys.executable, tool, "--app", sid]]
         if bool(c.get("repair_autostart")):
             cmds.append([sys.executable, tool, "--app", sid, "--autostart"])
         # 子进程 stdout 走管道时 Python 会退回 **locale 编码**（本机 cp936/GBK）。
-        # 父进程按 utf-8 解 ⇒ 全部降级成 U+FFFD ⇒ ① 日志不可读 ② 下面那道
+        # 父进程按 utf-8 解 ⇒ 全部降级成 U+FFFD ⇒ ① 日志不可读 ② 早先那道
         # 「自检通过」子串判定**恒为 False**（2026-10-18 日志里就是乱码，且当天
         # 从未打出过"已修好启动入口"）。强制让子进程用 utf-8，管道两端才对得上。
         env = dict(os.environ)
@@ -628,10 +669,6 @@ class ClientDriver(Driver):
             ok = ok or (p.returncode == 0)
             log.info("[%s] 启动入口修复（exit=%s）：%s", sid, p.returncode,
                      line[:200])
-        if ok:
-            log.warning("[%s] 已修好启动入口 —— 客户端下次启动即带调试端口 %s，届时自动接管",
-                        sid, c.get("debug_port"))
-        self._mark_repair_today(root, sid)
         return ok
 
     @classmethod

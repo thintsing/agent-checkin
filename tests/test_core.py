@@ -4016,6 +4016,66 @@ class TestClientSelfHealGroundwork(unittest.TestCase):
         self.assertIn("# 注释里也写了 debug_port: 9330，别改我", text)
         self.assertIn("debug_port: 9351", text)
 
+    # ------------------------------------- 换端口后同步启动入口（2026-11-21 补死）
+
+    def test_port_change_syncs_launch_entry_even_if_already_repaired_today(self):
+        """换端口后必须**立刻**同步入口，哪怕当天已经修过一次（戳已存在）。
+
+        11-18 事故链：10:44 `_repair_launch_entry` 修入口（打戳）→ 10:53 端口被僵尸
+        占死换成 9345 → 三处 lnk 仍停在 9343 → 次日从桌面启动「带端口但连不上」。
+        11-21 又漂一次（9345→9347）。所以这条断言钉的是「戳挡不住换端口」。
+        """
+        from checkin.drivers.client_claim import ClientDriver
+
+        root = self._root()
+        cfg = mock.Mock(root=root)
+        ClientDriver._mark_repair_today(root, "demo")       # 当天戳已存在
+        self.assertTrue(ClientDriver._repair_done_today(root, "demo"))
+
+        calls = []
+        with mock.patch.object(self.d, "_call_shortcut_tool",
+                               side_effect=lambda r, s, c: calls.append(s) or True):
+            ok = self.d._sync_launch_entry_port(
+                "demo", {"repair_launch_entry": True}, cfg, 9347)
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["demo"], "戳存在也必须同步 —— 端口变了就是变了")
+
+    def test_port_sync_respects_the_recipe_gate(self):
+        """配方没开 `repair_launch_entry` ⇒ 一个字节的启动入口都不许动。"""
+        root = self._root()
+        cfg = mock.Mock(root=root)
+        calls = []
+        with mock.patch.object(self.d, "_call_shortcut_tool",
+                               side_effect=lambda r, s, c: calls.append(s) or True):
+            ok = self.d._sync_launch_entry_port("demo", {}, cfg, 9347)
+        self.assertFalse(ok)
+        self.assertEqual(calls, [], "窄口没开就不许碰用户入口")
+
+    def test_port_sync_failure_is_loud_not_silent(self):
+        """同步失败要留一句能照做的日志（告诉下一个人该跑哪条命令）。"""
+        root = self._root()
+        cfg = mock.Mock(root=root)
+        with mock.patch.object(self.d, "_call_shortcut_tool", return_value=False), \
+             self.assertLogs("checkin.driver.client", level="WARNING") as cm:
+            ok = self.d._sync_launch_entry_port(
+                "demo", {"repair_launch_entry": True}, cfg, 9347)
+        self.assertFalse(ok)
+        self.assertTrue(any("win_shortcut_args" in m for m in cm.output),
+                        "失败日志必须给出补救命令，否则下一个人只能猜")
+
+    def test_repair_still_only_runs_once_a_day(self):
+        """原「一天一次」的闸门不能被这次重构弄丢（否则每轮都去改用户入口）。"""
+        root = self._root()
+        cfg = mock.Mock(root=root)
+        calls = []
+        with mock.patch.object(self.d, "_call_shortcut_tool",
+                               side_effect=lambda r, s, c: calls.append(s) or True):
+            first = self.d._repair_launch_entry("demo", {"repair_launch_entry": True}, cfg)
+            second = self.d._repair_launch_entry("demo", {"repair_launch_entry": True}, cfg)
+        self.assertTrue(first)
+        self.assertIsNone(second, "当天第二次必须直接跳过")
+        self.assertEqual(calls, ["demo"], "一天只许动一次用户入口")
+
     # ------------------------------------------------ 忙闲关的 CPU 旁证
 
     def test_busy_gate_accepts_cpu_evidence_when_probe_is_blind(self):
