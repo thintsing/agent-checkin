@@ -209,6 +209,53 @@ class TestUiaDriverMatching(unittest.TestCase):
         self.assertIsNone(ctrl)
 
 
+class TestUiaLaunchGuard(unittest.TestCase):
+    """窗口不在时要能自己唤起主窗口 —— 但 **probe 绝不许启动客户端**。
+
+    2026-11-21 的事故：客户端进程一直在跑，但主窗口被关掉（缩托盘），UIA 顶层枚举里
+    没有它 ⇒ 全天 10 次 `no_action / 客户端窗口未找到`，一次都没签上。
+    修法是"再启动一次 exe 唤起窗口"，不是重启进程。
+    """
+
+    class _FakeAuto:
+        def SetGlobalSearchTimeout(self, *_a, **_k):
+            pass
+
+    def test_recipe_enables_launch_with_a_real_path(self):
+        r = _recipe("teleagent")
+        self.assertIs(r.uia.get("launch_if_window_missing"), True)
+        self.assertTrue(str(r.uia.get("app_path") or "").lower().endswith("teleagent.exe"),
+                        "app_path 必须指向客户端 exe，否则唤起就是一纸空文")
+        self.assertGreater(int(r.uia.get("launch_wait_sec") or 0), 0)
+
+    def _driver(self):
+        from checkin.drivers.uia_client import UiaClientDriver
+        drv = UiaClientDriver()
+        drv._import_auto = lambda: self._FakeAuto()
+        drv._find_window = lambda auto, u: None
+        return drv
+
+    def test_probe_never_launches_client(self):
+        """probe/dry-run 只读：宁可报"窗口不在"，也不许动用户的进程。"""
+        drv = self._driver()
+        calls = []
+        drv._launch = lambda u: calls.append(1) or True
+        res = drv.run(_recipe("teleagent"), None, dry_run=False, probe=True)
+        self.assertEqual(calls, [], "probe 下不许启动客户端")
+        self.assertEqual(res.outcome.value, "no_action")
+        self.assertEqual(res.detail.get("reason"), "no_window")
+
+    def test_missing_window_triggers_launch_and_reports_it(self):
+        drv = self._driver()
+        calls = []
+        drv._launch = lambda u: calls.append(1) or True
+        drv._wait_window = lambda auto, u: None
+        res = drv.run(_recipe("teleagent"), None, dry_run=False, probe=False)
+        self.assertEqual(len(calls), 1, "窗口不在且配方开启时必须尝试唤起")
+        self.assertTrue(res.detail.get("launched"), "detail 要能看出「已经试过启动」")
+        self.assertIn("已尝试启动", res.message)
+
+
 class TestShortcutPortIsSingleSourceOfTruth(unittest.TestCase):
     def test_every_app_reads_the_port_from_its_own_recipe(self):
         """工具读到的端口 == 配方解析出的端口（防 9343/9345 那种错配重演）。"""

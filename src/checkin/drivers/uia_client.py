@@ -22,14 +22,21 @@
 - `success` 的唯一依据是**复核时按钮变成 `今日已领`**；复核不到就 `no_action`，
   绝不假成功（与 client bridge 的二次复核同一原则）。
 
+## 窗口不在时怎么办（2026-11-21 真因）
+11-21 全天 10 次 `no_action / 客户端窗口未找到`，但进程**一直在跑** —— 是主窗口被关掉
+（缩到托盘），UIA 的顶层窗口枚举里确实没有它。实测：再启动一次 exe 会**唤起已有实例的窗口**
+（1.5s 出现，不产生第二个实例）。所以配方显式开启 `launch_if_window_missing` 时，驱动先唤起
+主窗口再继续 —— 只"启动 exe"，不杀进程、不重启。
+
 ## 它不做的事
-- 不重启客户端（UIA 没有"端口绑不上"这个概念；启动/拉起不属于本驱动职责）。
+- **不杀进程、不重启**客户端（只会按配方开关启动 exe 以唤起窗口）。
 - 不读任何鉴权文件、不伪造身份、不改客户端二进制 —— 只用系统辅助功能通道。
 """
 from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -64,11 +71,20 @@ class UiaClientDriver(Driver):
         auto.SetGlobalSearchTimeout(float(u.get("search_timeout_sec") or 8))
 
         win = self._find_window(auto, u)
+        launched = False
+        if win is None and not (probe or dry_run) \
+                and bool(u.get("launch_if_window_missing")):
+            launched = self._launch(u)
+            if launched:
+                log.info("[%s] 主窗口不在，已启动客户端待其唤起窗口（最多 %.0fs）",
+                         recipe.id, float(u.get("launch_wait_sec") or 15))
+                win = self._wait_window(auto, u)
         if win is None:
             return CheckinResult(
                 recipe.id, Outcome.NO_ACTION,
-                message=f"{recipe.name} 的客户端窗口未找到（可能未启动）",
-                detail={"reason": "no_window"})
+                message=f"{recipe.name} 的客户端窗口未找到"
+                        + ("（已尝试启动客户端仍未出现）" if launched else "（可能未启动）"),
+                detail={"reason": "no_window", "launched": launched})
 
         max_depth = int(u.get("max_depth") or _DEFAULT_MAX_DEPTH)
         settle = float(u.get("settle_sec") or _DEFAULT_SETTLE)
@@ -210,6 +226,39 @@ class UiaClientDriver(Driver):
                 continue
             return w
         return None
+
+    def _wait_window(self, auto, u: Dict[str, Any]):
+        """启动客户端后等主窗口出现（单实例机制会唤起已有实例的窗口）。"""
+        end = time.monotonic() + float(u.get("launch_wait_sec") or 15)
+        while time.monotonic() < end:
+            time.sleep(1.0)
+            win = self._find_window(auto, u)
+            if win is not None:
+                return win
+        return None
+
+    @staticmethod
+    def _launch(u: Dict[str, Any]) -> bool:
+        """按配方 `app_path` 启动客户端 —— **只启动，不杀进程、不重启**。
+
+        为什么需要：客户端常驻托盘时主窗口可能已被关掉，UIA 的顶层窗口枚举里就没有它
+        （2026-11-21 全天 `no_window` 的真因）。再启动一次 exe 会唤起已有实例的窗口，
+        实测 1.5s 出现且不产生第二个实例。
+        """
+        app = str(u.get("app_path") or "").strip()
+        if not app:
+            log.warning("launch_if_window_missing 已开启但没配 app_path，跳过启动")
+            return False
+        if not os.path.isfile(app):
+            log.warning("app_path 不存在：%s", app)
+            return False
+        try:
+            from ..core import procenv
+            procenv.spawn([app])
+            return True
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("启动客户端失败：%s", exc)
+            return False
 
     @staticmethod
     def _walk(el, max_depth: int = _DEFAULT_MAX_DEPTH,

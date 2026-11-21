@@ -62,6 +62,12 @@ uia:
   timeout_sec: 90
   timeout_cap_pass1_sec: 60
   search_timeout_sec: 8
+  # 2026-11-21 真因：客户端常驻托盘、主窗口被关掉时，UIA 顶层窗口枚举里根本没有它
+  # （那天 10 次全是 no_window，但进程一直在跑）。再启动一次 exe 会唤起已有实例的窗口
+  # —— 实测 1.5s 出现、不产生第二个实例。只启动，不杀进程、不重启。
+  launch_if_window_missing: true
+  app_path: 'C:\Program Files\TeleAgent\TeleAgent.exe'
+  launch_wait_sec: 15
 
 verdict:
   # UIA 不读响应体：判据完全来自控件状态（驱动内部处理），这里只保留默认兜底

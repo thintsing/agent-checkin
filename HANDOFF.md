@@ -7,6 +7,47 @@
 
 ---
 
+## [2026-11-21 14:00] WorkBuddy(阿拾) —— TeleAgent 全天 `no_window` 真因：主窗口被关掉（进程在托盘），驱动补「唤起窗口」窄口；当天已补签 `success`；验证门 359 全绿
+
+**现象**：大哥报「teleagent 没签到成功」。`logs/checkin-2026-11-21.log` 全天 **10+ 次**
+`no_action | 客户端窗口未找到（可能未启动）`（10:47 / 10:54 / 11:06 / 11:11 / 11:37 / 11:42 / 12:05 / 12:10 / 12:35 / 12:41 / 13:06 / 13:11 / 13:35），
+`state.json` 停在 `last_done_date=2026-11-20`。
+
+### 真因（既不是判据失灵，也不是客户端没启动）
+- `tasklist`：TeleAgent **10 个进程一直在跑**（PID 44640 自 11-19 13:06 起没重启），`HKCU Run` 自启键也在，exe 版本 `3.1.1-rc.1`。
+- UIA 顶层窗口枚举，**`python` 与 `pythonw` 两个环境结果一致**（都是 `session=1` / `Desktop=Default`）：
+  14 个顶层窗口里**没有 TeleAgent**（WorkBuddy / 豆包 / ChatGPT / Edge / 资源管理器都在）。
+  ⇒ **主窗口被关掉、缩在托盘**，`no_window` 是**正确判断**，不是驱动读不到。
+- 所以缺的是能力：窗口不在时**先把它唤起来**。
+
+### 修复（窄口，配方显式开启）
+- 实测：再启动一次 `TeleAgent.exe` 会**唤起已有实例的窗口**（1.5s 出现、**不产生第二个实例** —— 它有 instance-marker/lockfile 单实例机制）。
+- `uia_client.py`：新增 `_launch()` / `_wait_window()` 与 `launch_if_window_missing` 分支。
+  **只启动 exe，不杀进程、不重启**；`probe`/`dry_run` **一律不启动**（宁可报 `no_window` 也不动用户进程）。
+- `recipes/teleagent.yaml`：加 `launch_if_window_missing: true` / `app_path` / `launch_wait_sec: 15`。
+- 守卫 `TestUiaLaunchGuard`：① 配方 app_path 必须真指向 exe；② probe 下 `_launch` 一次都不许调；
+  ③ 窗口缺失时必须尝试唤起且 `detail.launched=True`、message 带「已尝试启动」。
+
+### 验证
+- **端到端真机**：`PostMessage(WM_CLOSE)` 关掉主窗口 → 窗口消失 → 调 driver →
+  **2.2s 完成「启动 exe 唤起窗口 + 读到今日已领 + 返回 `already`（未重复点击）」**，`window now: True`。
+- **当天补签**：`--only-site teleagent --now` → `13:55:41 => success | 已点击领取并复核到账（今日已领）`。
+- 验证门 **Ran 359 tests / OK**（356 + 3 条新守卫）。
+
+### 教训（别再犯）
+- 昨天只验了"窗口在时能签"，**没验"窗口不在时会怎样"** ⇒ 今天空转一整天。
+  写驱动要把**每个前置条件不满足的分支**都当主路径验一遍（本项目老话：判据要按真实数据写）。
+- **进程活着 ≠ 窗口存在**：UIA 只看顶层可见窗口，托盘常驻的客户端随时可能没有窗口。
+  同理，下次遇到别的 `mode: uia` 站点，先问"它的窗口会不会被用户关掉"。
+
+### 遗留
+- `launch_wait_sec: 15` 对"唤起已有实例"够（实测 1.5s）；若某天是**冷启动**（进程不在），
+  可能不够 → 会落 `no_action`（不假成功），下一轮触发器（11 个）自然重试。
+- 上轮遗留未动：误装技能 `teleagent-points-claimer` 待大哥手点移除、10:42 那条 `TeleAgent积...` 会话、
+  Qoder A/B/C 降噪决策、`_reserve_clean_port` 缺陷、桌面重复 `TeleAgent.lnk`。
+
+---
+
 ## [2026-11-20 10:55] WorkBuddy(阿拾) —— TeleAgent 从 disabled 改为 **mode: uia**（新增第 4 种驱动）；真机 probe 读到「立即领取」；验证门 356 全绿
 
 **需求**：大哥报「今天 teleagent 没有签到成功」。核实后先纠正一个前提：**它不是签到失败，是压根没进调度** ——
